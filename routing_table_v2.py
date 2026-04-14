@@ -1,236 +1,213 @@
-```python
 """
-routing_table_analyzer.py - Network Device Routing Table Analyzer
+routing_table.py - Retrieve and parse routing tables from network devices via SSH.
 
 Purpose:
-    Connects to network devices via SSH, retrieves the routing table,
-    parses routes by protocol, and exports structured data to JSON/CSV.
-    Supports filtering by protocol or destination prefix, and baseline
-    comparison to detect route changes over time.
+    Connects to one or more network devices over SSH using Paramiko, retrieves
+    the IP routing table, parses the output into structured records, and exports
+    results as JSON, CSV, or plain text.
 
 Usage:
-    python routing_table_analyzer.py -d 192.168.1.1 -u admin -p secret
-    python routing_table_analyzer.py -d 10.0.0.1 -u admin --protocol ospf --export routes.json
-    python routing_table_analyzer.py -d 10.0.0.1 -u admin --baseline baseline.json --compare
+    python routing_table.py -d 192.168.1.1 -u admin -p secret
+    python routing_table.py -d 192.168.1.1 192.168.1.2 -u admin --ask-pass
+    python routing_table.py -d 192.168.1.1 -u admin -p secret --vrf MGMT --format json
 
 Prerequisites:
     pip install paramiko
-    SSH access to target device (Cisco IOS/IOS-XE/NX-OS)
+    Target devices must have SSH enabled and the user must have privilege level
+    sufficient to run 'show ip route' (Cisco IOS/IOS-XE assumed; adjust
+    SHOW_CMD for other platforms).
 """
 
 import argparse
 import csv
+import getpass
 import json
 import logging
 import re
 import sys
-from dataclasses import asdict, dataclass
-from datetime import datetime
-from typing import Optional
+from io import StringIO
 
 import paramiko
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger(__name__)
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+logging.basicConfig(format=LOG_FORMAT, level=logging.INFO)
+log = logging.getLogger(__name__)
 
-PROTOCOL_MAP = {
-    "C": "connected", "S": "static", "R": "rip",
-    "O": "ospf", "B": "bgp", "D": "eigrp",
-    "i": "isis", "E": "eigrp-external", "IA": "ospf-inter-area",
-    "E1": "ospf-ext1", "E2": "ospf-ext2", "N1": "nssa1", "N2": "nssa2",
-}
+SHOW_CMD = "show ip route"
+CONNECT_TIMEOUT = 15
+RECV_BUFFER = 65535
 
-ROUTE_PATTERN = re.compile(
-    r"^([A-Z]{1,2}[*\s]?)\s+"
-    r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?:/\d{1,2})?)"
-    r"(?:\s+\[(\d+)/(\d+)\])?"
-    r"(?:\s+via\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}))?"
-    r"(?:,\s+[\w:]+)?"
-    r"(?:,\s+(\S+))?",
+# Cisco IOS route line pattern
+# e.g. "O     10.0.0.0/8 [110/20] via 192.168.1.1, 00:01:02, GigabitEthernet0/1"
+ROUTE_RE = re.compile(
+    r"^(?P<proto>[OSBDREICL*+]\s*\S*)\s+"
+    r"(?P<network>\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?)"
+    r"(?:\s+\[(?P<ad>\d+)/(?P<metric>\d+)\])?"
+    r"(?:\s+via\s+(?P<nexthop>\d{1,3}(?:\.\d{1,3}){3}))?"
+    r"(?:,\s+(?P<age>\S+))?"
+    r"(?:,\s+(?P<interface>\S+))?",
     re.MULTILINE,
 )
 
 
-@dataclass
-class Route:
-    protocol: str
-    prefix: str
-    admin_distance: Optional[int]
-    metric: Optional[int]
-    next_hop: Optional[str]
-    interface: Optional[str]
-
-
-def ssh_connect(host: str, username: str, password: str, port: int = 22) -> paramiko.Channel:
+def ssh_connect(host, username, password, port=22):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    logger.info("Connecting to %s:%d", host, port)
-    client.connect(host, port=port, username=username, password=password,
-                   look_for_keys=False, allow_agent=False, timeout=15)
-    channel = client.invoke_shell()
-    channel.settimeout(20)
-    _flush(channel)
-    return channel
-
-
-def _flush(channel: paramiko.Channel, wait: float = 1.5) -> str:
-    import time
-    time.sleep(wait)
-    output = ""
-    while channel.recv_ready():
-        output += channel.recv(65535).decode("utf-8", errors="replace")
-    return output
-
-
-def send_command(channel: paramiko.Channel, command: str) -> str:
-    channel.send(command + "\n")
-    output = _flush(channel, wait=2.0)
-    # Handle --More-- pagination
-    while "More" in output or "--more--" in output.lower():
-        channel.send(" ")
-        chunk = _flush(channel, wait=1.0)
-        output = output.replace("--More--", "").replace("--more--", "") + chunk
-    return output
-
-
-def parse_routes(raw_output: str) -> list[Route]:
-    routes = []
-    for match in ROUTE_PATTERN.finditer(raw_output):
-        proto_code = match.group(1).strip().rstrip("*").strip()
-        protocol = PROTOCOL_MAP.get(proto_code, proto_code.lower() or "unknown")
-        prefix = match.group(2)
-        ad = int(match.group(3)) if match.group(3) else None
-        metric = int(match.group(4)) if match.group(4) else None
-        next_hop = match.group(5)
-        interface = match.group(6)
-        routes.append(Route(protocol, prefix, ad, metric, next_hop, interface))
-    return routes
-
-
-def filter_routes(routes: list[Route], protocol: Optional[str], prefix: Optional[str]) -> list[Route]:
-    if protocol:
-        routes = [r for r in routes if protocol.lower() in r.protocol.lower()]
-    if prefix:
-        routes = [r for r in routes if r.prefix.startswith(prefix)]
-    return routes
-
-
-def compare_to_baseline(current: list[Route], baseline_path: str) -> None:
-    try:
-        with open(baseline_path) as f:
-            baseline_data = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.error("Failed to load baseline: %s", exc)
-        return
-
-    baseline_prefixes = {r["prefix"] for r in baseline_data.get("routes", [])}
-    current_prefixes = {r.prefix for r in current}
-
-    added = current_prefixes - baseline_prefixes
-    removed = baseline_prefixes - current_prefixes
-
-    if not added and not removed:
-        logger.info("No route changes detected vs baseline.")
-    else:
-        if added:
-            logger.warning("NEW routes not in baseline: %s", ", ".join(sorted(added)))
-        if removed:
-            logger.warning("MISSING routes from baseline: %s", ", ".join(sorted(removed)))
-
-
-def export_routes(routes: list[Route], path: str, host: str) -> None:
-    payload = {
-        "host": host,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "route_count": len(routes),
-        "routes": [asdict(r) for r in routes],
-    }
-    if path.endswith(".csv"):
-        with open(path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(asdict(routes[0]).keys()) if routes else [])
-            writer.writeheader()
-            writer.writerows(asdict(r) for r in routes)
-    else:
-        with open(path, "w") as f:
-            json.dump(payload, f, indent=2)
-    logger.info("Exported %d routes to %s", len(routes), path)
-
-
-def print_summary(routes: list[Route]) -> None:
-    from collections import Counter
-    counts = Counter(r.protocol for r in routes)
-    print(f"\n{'Protocol':<20} {'Count':>6}")
-    print("-" * 28)
-    for proto, count in sorted(counts.items(), key=lambda x: -x[1]):
-        print(f"{proto:<20} {count:>6}")
-    print(f"\nTotal routes: {len(routes)}\n")
-
-    for route in routes[:20]:
-        nh = route.next_hop or "directly connected"
-        intf = f" ({route.interface})" if route.interface else ""
-        print(f"  [{route.protocol:<12}] {route.prefix:<22} via {nh}{intf}")
-    if len(routes) > 20:
-        print(f"  ... and {len(routes) - 20} more routes")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Retrieve and analyze routing tables from network devices."
+    client.connect(
+        hostname=host,
+        port=port,
+        username=username,
+        password=password,
+        timeout=CONNECT_TIMEOUT,
+        look_for_keys=False,
+        allow_agent=False,
     )
-    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--protocol", help="Filter routes by protocol (e.g. ospf, bgp, static)")
-    parser.add_argument("--prefix", help="Filter routes by destination prefix (e.g. 10.0)")
-    parser.add_argument("--export", metavar="FILE", help="Export results to JSON or CSV file")
-    parser.add_argument("--baseline", metavar="FILE", help="Baseline JSON file for change comparison")
-    parser.add_argument("--compare", action="store_true", help="Compare current table to baseline")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    args = parser.parse_args()
+    return client
 
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
 
-    if args.password is None:
-        import getpass
-        args.password = getpass.getpass(f"Password for {args.username}@{args.device}: ")
+def run_command(client, command):
+    channel = client.invoke_shell()
+    channel.settimeout(CONNECT_TIMEOUT)
+    # Drain banner
+    while channel.recv_ready():
+        channel.recv(RECV_BUFFER)
+    channel.send(command + "\n")
+    output = []
+    while True:
+        chunk = channel.recv(RECV_BUFFER).decode("utf-8", errors="replace")
+        output.append(chunk)
+        if re.search(r"[>#]\s*$", chunk):
+            break
+    channel.close()
+    return "".join(output)
+
+
+def parse_routes(raw_output):
+    routes = []
+    for match in ROUTE_RE.finditer(raw_output):
+        routes.append({
+            "protocol": match.group("proto").strip(),
+            "network": match.group("network"),
+            "admin_distance": match.group("ad") or "",
+            "metric": match.group("metric") or "",
+            "nexthop": match.group("nexthop") or "",
+            "age": match.group("age") or "",
+            "interface": match.group("interface") or "",
+        })
+    return routes
+
+
+def fetch_routing_table(host, username, password, port, vrf=None):
+    cmd = SHOW_CMD
+    if vrf:
+        cmd = f"show ip route vrf {vrf}"
+    log.info("Connecting to %s:%s", host, port)
+    try:
+        client = ssh_connect(host, username, password, port)
+    except paramiko.AuthenticationException:
+        log.error("Authentication failed for %s", host)
+        return host, None
+    except Exception as exc:
+        log.error("Cannot connect to %s: %s", host, exc)
+        return host, None
 
     try:
-        channel = ssh_connect(args.device, args.username, args.password, args.port)
-        send_command(channel, "terminal length 0")
-        raw = send_command(channel, "show ip route")
-        channel.close()
-    except paramiko.AuthenticationException:
-        logger.error("Authentication failed for %s@%s", args.username, args.device)
-        sys.exit(1)
-    except (paramiko.SSHException, OSError) as exc:
-        logger.error("Connection error: %s", exc)
-        sys.exit(1)
+        raw = run_command(client, cmd)
+        routes = parse_routes(raw)
+        log.info("Retrieved %d route entries from %s", len(routes), host)
+        return host, routes
+    except Exception as exc:
+        log.error("Command execution failed on %s: %s", host, exc)
+        return host, None
+    finally:
+        client.close()
 
-    routes = parse_routes(raw)
-    if not routes:
-        logger.warning("No routes parsed. Check device output format.")
 
-    routes = filter_routes(routes, args.protocol, args.prefix)
-    logger.info("Found %d routes after filtering", len(routes))
+def output_json(results):
+    print(json.dumps(results, indent=2))
 
-    print_summary(routes)
 
-    if args.export and routes:
-        export_routes(routes, args.export, args.device)
+def output_csv(results):
+    fields = ["host", "protocol", "network", "admin_distance",
+              "metric", "nexthop", "age", "interface"]
+    writer = csv.DictWriter(sys.stdout, fieldnames=fields)
+    writer.writeheader()
+    for host, routes in results.items():
+        if routes is None:
+            continue
+        for r in routes:
+            r["host"] = host
+            writer.writerow(r)
 
-    if args.compare and args.baseline:
-        compare_to_baseline(routes, args.baseline)
-    elif args.compare and not args.baseline:
-        logger.error("--compare requires --baseline <file>")
-        sys.exit(1)
+
+def output_text(results):
+    for host, routes in results.items():
+        print(f"\n{'='*60}")
+        print(f"  Host: {host}")
+        print(f"{'='*60}")
+        if routes is None:
+            print("  ERROR: Could not retrieve routing table.")
+            continue
+        fmt = "{:<10} {:<20} {:<6} {:<8} {:<16} {:<10} {}"
+        print(fmt.format("Proto", "Network", "AD", "Metric",
+                         "Next-Hop", "Age", "Interface"))
+        print("-" * 80)
+        for r in routes:
+            print(fmt.format(
+                r["protocol"][:10], r["network"], r["admin_distance"],
+                r["metric"], r["nexthop"], r["age"], r["interface"],
+            ))
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Retrieve IP routing tables from network devices via SSH."
+    )
+    parser.add_argument("-d", "--devices", nargs="+", required=True,
+                        metavar="HOST", help="Device hostname(s) or IP address(es)")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", help="SSH password")
+    parser.add_argument("--ask-pass", action="store_true",
+                        help="Prompt for password interactively")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--vrf", metavar="NAME", help="VRF name for VRF-specific table")
+    parser.add_argument("--format", choices=["text", "json", "csv"],
+                        default="text", dest="output_format",
+                        help="Output format (default: text)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    main()
-```
+    args = parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger("paramiko").setLevel(logging.DEBUG)
+
+    if args.ask_pass:
+        password = getpass.getpass("SSH Password: ")
+    elif args.password:
+        password = args.password
+    else:
+        log.error("Provide --password or --ask-pass")
+        sys.exit(1)
+
+    results = {}
+    for device in args.devices:
+        host, routes = fetch_routing_table(
+            device, args.username, password, args.port, vrf=args.vrf
+        )
+        results[host] = routes
+
+    if args.output_format == "json":
+        output_json(results)
+    elif args.output_format == "csv":
+        output_csv(results)
+    else:
+        output_text(results)
+
+    failed = [h for h, r in results.items() if r is None]
+    if failed:
+        log.warning("Failed to retrieve data from: %s", ", ".join(failed))
+        sys.exit(1)
