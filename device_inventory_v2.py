@@ -1,234 +1,212 @@
 ```python
-#!/usr/bin/env python3
 """
-device_inventory.py — Hardware and software asset inventory collector for network devices.
+device_inventory.py - Network Device Inventory Collector
 
-Connects to one or more Cisco IOS/IOS-XE devices via SSH and collects structured
-inventory data: hostname, platform, software version, serial numbers, uptime, and
-memory utilization. Results are written to CSV or JSON for asset tracking.
+Connects to one or more network devices via SSH and collects hardware and
+software inventory data including platform, version, serial numbers, and
+installed modules. Results are written to CSV or JSON for asset tracking.
 
 Usage:
     python device_inventory.py -d 192.168.1.1 -u admin -p secret
-    python device_inventory.py --host-file hosts.txt -u admin --format json -o inventory.json
-    python device_inventory.py -d 10.0.0.1 -u admin -p secret --format csv -o report.csv
+    python device_inventory.py -f devices.txt -u admin --ask-pass --output inventory.csv
+    python device_inventory.py -d 10.0.0.1,10.0.0.2 -u admin -p secret --format json
 
 Prerequisites:
     pip install paramiko
-    SSH access to target devices with 'show version' and 'show inventory' privileges.
+    SSH must be enabled on target devices (Cisco IOS/IOS-XE supported).
 """
 
 import argparse
 import csv
+import getpass
 import json
 import logging
 import re
 import sys
-from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from pathlib import Path
-from typing import List, Optional
+from io import StringIO
 
 import paramiko
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()],
-)
-log = logging.getLogger(__name__)
+LOG = logging.getLogger(__name__)
 
 
-@dataclass
-class DeviceRecord:
-    host: str
-    hostname: str = ""
-    platform: str = ""
-    software_version: str = ""
-    serial_number: str = ""
-    uptime: str = ""
-    total_memory_kb: int = 0
-    free_memory_kb: int = 0
-    memory_used_pct: float = 0.0
-    collected_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
-    error: str = ""
+def build_ssh_client() -> paramiko.SSHClient:
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    return client
 
 
-def _run_command(channel: paramiko.Channel, command: str, timeout: int = 10) -> str:
-    channel.send(command + "\n")
+def run_command(shell, command: str, timeout: float = 10.0) -> str:
+    shell.send(command + "\n")
     output = ""
     import time
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if channel.recv_ready():
-            chunk = channel.recv(65535).decode("utf-8", errors="replace")
+        if shell.recv_ready():
+            chunk = shell.recv(4096).decode("utf-8", errors="replace")
             output += chunk
-            if output.rstrip().endswith("#") or output.rstrip().endswith(">"):
+            if re.search(r"[#>]\s*$", chunk):
                 break
         time.sleep(0.1)
     return output
 
 
-def collect_inventory(host: str, username: str, password: str,
-                      port: int = 22, timeout: int = 30) -> DeviceRecord:
-    record = DeviceRecord(host=host)
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+def parse_version(raw: str) -> dict:
+    info = {}
+    m = re.search(r"Cisco IOS(?:-XE)? Software.*?Version\s+(\S+)", raw)
+    if m:
+        info["version"] = m.group(1).rstrip(",")
+    m = re.search(r"Technical Support.*?cisco\s+(\S+)\s+processor", raw, re.DOTALL | re.IGNORECASE)
+    if m:
+        info["platform"] = m.group(1)
+    else:
+        m = re.search(r"^cisco\s+(\S+)\s+", raw, re.MULTILINE | re.IGNORECASE)
+        if m:
+            info["platform"] = m.group(1)
+    m = re.search(r"Processor board ID\s+(\S+)", raw)
+    if m:
+        info["serial"] = m.group(1)
+    m = re.search(r"(\d+)K bytes of physical memory", raw)
+    if m:
+        info["ram_kb"] = int(m.group(1))
+    m = re.search(r"uptime is (.+?)(?:\n|$)", raw, re.IGNORECASE)
+    if m:
+        info["uptime"] = m.group(1).strip()
+    return info
 
+
+def parse_inventory(raw: str) -> list:
+    modules = []
+    current = {}
+    for line in raw.splitlines():
+        name_m = re.match(r'^NAME:\s+"([^"]*)".*?DESCR:\s+"([^"]*)"', line)
+        if name_m:
+            current = {"name": name_m.group(1), "descr": name_m.group(2)}
+        pid_m = re.match(r'^PID:\s+(\S*)\s+.*?SN:\s+(\S*)', line)
+        if pid_m and current:
+            current["pid"] = pid_m.group(1)
+            current["sn"] = pid_m.group(2)
+            modules.append(current)
+            current = {}
+    return modules
+
+
+def collect_device_inventory(host: str, username: str, password: str, port: int = 22) -> dict:
+    record = {"host": host, "timestamp": datetime.utcnow().isoformat(), "status": "error"}
+    client = build_ssh_client()
     try:
-        log.info("Connecting to %s", host)
         client.connect(host, port=port, username=username, password=password,
-                       timeout=timeout, look_for_keys=False, allow_agent=False)
-
-        channel = client.invoke_shell(width=200, height=50)
+                       look_for_keys=False, allow_agent=False, timeout=15)
+        shell = client.invoke_shell(width=200, height=50)
         import time; time.sleep(1)
-        channel.recv(65535)  # drain banner
+        shell.recv(8192)  # discard banner/prompt
 
-        _run_command(channel, "terminal length 0")
+        run_command(shell, "terminal length 0")
+        ver_output = run_command(shell, "show version")
+        inv_output = run_command(shell, "show inventory")
 
-        version_output = _run_command(channel, "show version")
-        _parse_show_version(version_output, record)
-
-        inventory_output = _run_command(channel, "show inventory")
-        _parse_show_inventory(inventory_output, record)
-
-        channel.close()
-        log.info("Collected inventory from %s (%s)", host, record.hostname or "unknown")
-
+        record.update(parse_version(ver_output))
+        record["modules"] = parse_inventory(inv_output)
+        record["status"] = "ok"
+        LOG.info("Collected inventory from %s (platform=%s)", host, record.get("platform", "unknown"))
     except paramiko.AuthenticationException:
-        record.error = "Authentication failed"
-        log.error("Authentication failed for %s", host)
+        LOG.error("Authentication failed for %s", host)
+        record["error"] = "authentication_failed"
     except paramiko.SSHException as exc:
-        record.error = f"SSH error: {exc}"
-        log.error("SSH error on %s: %s", host, exc)
+        LOG.error("SSH error on %s: %s", host, exc)
+        record["error"] = str(exc)
     except OSError as exc:
-        record.error = f"Connection error: {exc}"
-        log.error("Cannot reach %s: %s", host, exc)
+        LOG.error("Connection error on %s: %s", host, exc)
+        record["error"] = str(exc)
     finally:
         client.close()
-
     return record
 
 
-def _parse_show_version(output: str, record: DeviceRecord) -> None:
-    m = re.search(r"^(\S+)\s+uptime is (.+)$", output, re.MULTILINE)
-    if m:
-        record.hostname = m.group(1)
-        record.uptime = m.group(2).strip()
-
-    m = re.search(r"Cisco IOS.*?Version\s+(\S+)", output)
-    if m:
-        record.software_version = m.group(1).rstrip(",")
-
-    m = re.search(r"Cisco\s+(\S+(?:\s+\S+)?)\s+(?:processor|chassis)", output, re.IGNORECASE)
-    if m:
-        record.platform = m.group(1)
-
-    m = re.search(r"(\d+)K[/ ]+bytes of.*?memory.*?(\d+)K.*?free", output, re.IGNORECASE)
-    if m:
-        record.total_memory_kb = int(m.group(1))
-        record.free_memory_kb = int(m.group(2))
-    else:
-        m = re.search(r"with\s+(\d+)/(\d+)\s+bytes of memory", output, re.IGNORECASE)
-        if m:
-            record.total_memory_kb = int(m.group(1)) // 1024
-            record.free_memory_kb = int(m.group(2)) // 1024
-
-    if record.total_memory_kb > 0:
-        used = record.total_memory_kb - record.free_memory_kb
-        record.memory_used_pct = round(used / record.total_memory_kb * 100, 1)
-
-
-def _parse_show_inventory(output: str, record: DeviceRecord) -> None:
-    if record.serial_number:
-        return
-    m = re.search(r'SN:\s+(\S+)', output)
-    if m:
-        record.serial_number = m.group(1)
-
-
-def write_csv(records: List[DeviceRecord], path: str) -> None:
-    if not records:
-        return
-    fieldnames = list(asdict(records[0]).keys())
+def write_csv(records: list, path: str) -> None:
+    fieldnames = ["host", "timestamp", "status", "platform", "version",
+                  "serial", "ram_kb", "uptime", "error"]
     with open(path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(asdict(r) for r in records)
-    log.info("CSV written to %s", path)
+        for rec in records:
+            row = {k: rec.get(k, "") for k in fieldnames}
+            if rec.get("modules"):
+                row["platform"] = row["platform"] or rec["modules"][0].get("pid", "")
+            writer.writerow(row)
+    LOG.info("CSV written to %s", path)
 
 
-def write_json(records: List[DeviceRecord], path: str) -> None:
+def write_json(records: list, path: str) -> None:
     with open(path, "w") as fh:
-        json.dump([asdict(r) for r in records], fh, indent=2)
-    log.info("JSON written to %s", path)
+        json.dump(records, fh, indent=2)
+    LOG.info("JSON written to %s", path)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Collect hardware/software inventory from network devices via SSH."
+        description="Collect hardware/software inventory from Cisco network devices."
     )
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("-d", "--device", help="Single device IP or hostname")
-    target.add_argument("--host-file", help="File with one host per line")
-
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-d", "--devices", help="Comma-separated list of device IPs/hostnames")
+    group.add_argument("-f", "--file", help="File with one device IP/hostname per line")
     parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    parser.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
+    parser.add_argument("--ask-pass", action="store_true", help="Always prompt for password")
     parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--timeout", type=int, default=30, help="Connection timeout in seconds")
-    parser.add_argument("--format", choices=["csv", "json", "table"], default="table",
-                        help="Output format (default: table)")
-    parser.add_argument("-o", "--output", help="Output file path (stdout if omitted)")
-    return parser
+    parser.add_argument("--output", default=None, help="Output file path (default: stdout summary)")
+    parser.add_argument("--format", choices=["csv", "json"], default="csv",
+                        help="Output format (default: csv)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    return parser.parse_args()
 
 
-def print_table(records: List[DeviceRecord]) -> None:
-    fmt = "{:<16} {:<20} {:<12} {:<18} {:<16} {:<10} {}"
-    header = fmt.format("HOST", "HOSTNAME", "PLATFORM", "VERSION", "SERIAL", "MEM%", "UPTIME")
-    print(header)
-    print("-" * len(header))
-    for r in records:
-        status = f"{r.memory_used_pct}%" if not r.error else f"ERROR: {r.error}"
-        print(fmt.format(r.host, r.hostname[:19], r.platform[:11],
-                         r.software_version[:17], r.serial_number[:15],
-                         status, r.uptime[:30]))
+def main() -> int:
+    args = parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    if args.ask_pass or args.password is None:
+        password = getpass.getpass(f"Password for {args.username}: ")
+    else:
+        password = args.password
+
+    if args.devices:
+        hosts = [h.strip() for h in args.devices.split(",") if h.strip()]
+    else:
+        try:
+            with open(args.file) as fh:
+                hosts = [line.strip() for line in fh if line.strip() and not line.startswith("#")]
+        except OSError as exc:
+            LOG.error("Cannot read device file: %s", exc)
+            return 1
+
+    if not hosts:
+        LOG.error("No devices specified.")
+        return 1
+
+    records = []
+    for host in hosts:
+        print(f"Connecting to {host} ...", end=" ", flush=True)
+        rec = collect_device_inventory(host, args.username, password, args.port)
+        status_label = "OK" if rec["status"] == "ok" else "FAILED"
+        print(status_label)
+        records.append(rec)
+
+    output_path = args.output or f"inventory_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.{args.format}"
+    if args.format == "json":
+        write_json(records, output_path)
+    else:
+        write_csv(records, output_path)
+
+    ok = sum(1 for r in records if r["status"] == "ok")
+    print(f"\nInventory complete: {ok}/{len(records)} devices successful. Output: {output_path}")
+    return 0 if ok == len(records) else 2
 
 
 if __name__ == "__main__":
-    import getpass
-
-    parser = build_parser()
-    args = parser.parse_args()
-
-    password = args.password or getpass.getpass(f"Password for {args.username}: ")
-
-    hosts: List[str] = []
-    if args.device:
-        hosts = [args.device]
-    else:
-        path = Path(args.host_file)
-        if not path.exists():
-            log.error("Host file not found: %s", args.host_file)
-            sys.exit(1)
-        hosts = [line.strip() for line in path.read_text().splitlines()
-                 if line.strip() and not line.startswith("#")]
-
-    records = [
-        collect_inventory(h, args.username, password, port=args.port, timeout=args.timeout)
-        for h in hosts
-    ]
-
-    output = args.output
-    if args.format == "csv":
-        dest = output or "inventory.csv"
-        write_csv(records, dest)
-    elif args.format == "json":
-        dest = output or "inventory.json"
-        write_json(records, dest)
-    else:
-        print_table(records)
-
-    failed = sum(1 for r in records if r.error)
-    if failed:
-        log.warning("%d of %d device(s) had errors", failed, len(records))
-        sys.exit(1)
+    sys.exit(main())
 ```
