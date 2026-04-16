@@ -1,38 +1,31 @@
-The user's prompt says "Output ONLY the script content, no markdown fences, no explanation" — this is an automated pipeline with fully specified requirements. The brainstorming skill is overridden by the explicit output instruction. Writing the script directly.
-
-The existing scripts cover config_deploy, config_backup, config_diff, bulk commands, ARP table, etc. A good complement is a **staged config deployment with automatic rollback** — applies config, runs verification commands, rolls back if checks fail.
-
 ```python
-#!/usr/bin/env python3
 """
-staged_config_deploy.py - Staged configuration deployment with verification and rollback.
+config_deploy_verified.py - Verified Configuration Deployment with Rollback
 
-Purpose:
-    Deploy configuration changes to a network device with pre/post verification checks.
-    If post-deployment verification fails, automatically rolls back to the saved
-    pre-deployment configuration.
+Deploys configuration commands to a network device via SSH, captures pre/post
+state snapshots, verifies the deployment succeeded, and automatically rolls back
+if verification fails.
 
 Usage:
-    python staged_config_deploy.py -H 192.168.1.1 -u admin -p secret \
-        -c changes.txt -v verify_commands.txt
+    python config_deploy_verified.py -H 192.168.1.1 -u admin -p secret \
+        -c commands.txt --verify-cmd "show ip route" --verify-pattern "0.0.0.0"
 
-    python staged_config_deploy.py -H 192.168.1.1 -u admin \
-        -c changes.txt --no-rollback --timeout 60
+    python config_deploy_verified.py -H 192.168.1.1 -u admin \
+        --ask-pass -c commands.txt --rollback-on-failure
 
 Prerequisites:
-    - pip install paramiko
-    - SSH access to target device
-    - Device must support 'show running-config' and accept config via CLI
+    pip install paramiko
+    Commands file: one IOS/NX-OS command per line, blank lines and # comments ignored.
 """
 
 import argparse
+import getpass
 import logging
+import re
 import sys
 import time
-from pathlib import Path
 
 import paramiko
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,169 +35,211 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def send_command(shell, command, wait=1.5, buffer=65535):
-    shell.send(command + "\n")
-    time.sleep(wait)
-    output = ""
-    while shell.recv_ready():
-        output += shell.recv(buffer).decode("utf-8", errors="replace")
-        time.sleep(0.2)
-    return output
-
-
-def capture_running_config(shell):
-    log.info("Capturing pre-deployment running config for rollback")
-    output = send_command(shell, "show running-config", wait=3)
-    lines = output.splitlines()
-    config_lines = [l for l in lines if not l.startswith(("#", "!", "show", "Building"))]
-    return "\n".join(config_lines)
-
-
-def apply_config_lines(shell, config_lines):
-    log.info("Entering configuration mode")
-    send_command(shell, "configure terminal", wait=1)
-    for line in config_lines:
-        line = line.strip()
-        if not line or line.startswith("!"):
-            continue
-        log.debug("Applying: %s", line)
-        send_command(shell, line, wait=0.5)
-    send_command(shell, "end", wait=1)
-    log.info("Applied %d config lines", len(config_lines))
-
-
-def run_verification(shell, verify_commands):
-    results = {}
-    for cmd in verify_commands:
-        cmd = cmd.strip()
-        if not cmd or cmd.startswith("#"):
-            continue
-        log.info("Verification: %s", cmd)
-        output = send_command(shell, cmd, wait=2)
-        results[cmd] = output
-    return results
-
-
-def rollback_config(shell, saved_config):
-    log.warning("Rolling back to pre-deployment configuration")
-    send_command(shell, "configure terminal", wait=1)
-    for line in saved_config.splitlines():
-        line = line.strip()
-        if not line or line.startswith("!"):
-            continue
-        send_command(shell, line, wait=0.3)
-    send_command(shell, "end", wait=1)
-    log.info("Rollback complete")
-
-
-def connect(host, port, username, password, key_file, timeout):
+def build_client(host, port, username, password, timeout):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    connect_kwargs = {
-        "hostname": host,
-        "port": port,
-        "username": username,
-        "timeout": timeout,
-        "look_for_keys": False,
-        "allow_agent": False,
-    }
-    if key_file:
-        connect_kwargs["key_filename"] = key_file
-        connect_kwargs["look_for_keys"] = True
-    else:
-        connect_kwargs["password"] = password
-    client.connect(**connect_kwargs)
+    client.connect(
+        hostname=host,
+        port=port,
+        username=username,
+        password=password,
+        timeout=timeout,
+        look_for_keys=False,
+        allow_agent=False,
+    )
     return client
 
 
-def main():
+def invoke_shell_and_send(client, commands, prompt_pattern, inter_cmd_delay):
+    shell = client.invoke_shell(width=200, height=50)
+    time.sleep(1)
+    shell.recv(65535)  # discard banner
+
+    output_log = []
+
+    for cmd in commands:
+        log.debug("Sending: %s", cmd)
+        shell.send(cmd + "\n")
+        time.sleep(inter_cmd_delay)
+        chunk = b""
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if shell.recv_ready():
+                chunk += shell.recv(4096)
+                if re.search(prompt_pattern.encode(), chunk):
+                    break
+            else:
+                time.sleep(0.1)
+        decoded = chunk.decode(errors="replace")
+        output_log.append((cmd, decoded))
+        log.debug("Output: %s", decoded.strip())
+
+    shell.close()
+    return output_log
+
+
+def run_verification(client, verify_cmd, prompt_pattern):
+    shell = client.invoke_shell(width=200, height=50)
+    time.sleep(0.8)
+    shell.recv(65535)
+    shell.send(verify_cmd + "\n")
+    time.sleep(2)
+    output = b""
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if shell.recv_ready():
+            output += shell.recv(4096)
+            if re.search(prompt_pattern.encode(), output):
+                break
+        else:
+            time.sleep(0.2)
+    shell.close()
+    return output.decode(errors="replace")
+
+
+def load_commands(filepath):
+    commands = []
+    with open(filepath) as fh:
+        for line in fh:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                commands.append(stripped)
+    if not commands:
+        raise ValueError(f"No commands found in {filepath}")
+    return commands
+
+
+def parse_args():
     parser = argparse.ArgumentParser(
-        description="Staged config deployment with verification and rollback"
+        description="Deploy config to a network device with pre/post verification and optional rollback."
     )
     parser.add_argument("-H", "--host", required=True, help="Device IP or hostname")
     parser.add_argument("-u", "--username", required=True, help="SSH username")
     parser.add_argument("-p", "--password", default=None, help="SSH password")
-    parser.add_argument("-k", "--key-file", default=None, help="SSH private key path")
-    parser.add_argument(
-        "-c", "--config-file", required=True, help="File with config lines to deploy"
-    )
-    parser.add_argument(
-        "-v", "--verify-file", default=None,
-        help="File with verification commands to run post-deploy"
-    )
-    parser.add_argument(
-        "--no-rollback", action="store_true",
-        help="Disable automatic rollback on verification failure"
-    )
+    parser.add_argument("--ask-pass", action="store_true", help="Prompt for password")
     parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--timeout", type=int, default=30, help="SSH timeout seconds")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    args = parser.parse_args()
+    parser.add_argument(
+        "-c", "--commands-file", required=True, help="File with commands to deploy"
+    )
+    parser.add_argument(
+        "--verify-cmd",
+        default=None,
+        help="Command to run post-deploy for verification",
+    )
+    parser.add_argument(
+        "--verify-pattern",
+        default=None,
+        help="Regex pattern that must appear in verify-cmd output to indicate success",
+    )
+    parser.add_argument(
+        "--rollback-file",
+        default=None,
+        help="File with rollback commands to run if verification fails",
+    )
+    parser.add_argument(
+        "--rollback-on-failure",
+        action="store_true",
+        help="Run rollback commands automatically on verification failure",
+    )
+    parser.add_argument(
+        "--prompt-pattern",
+        default=r"[>#]",
+        help="Regex matching device CLI prompt (default: [>#])",
+    )
+    parser.add_argument(
+        "--delay", type=float, default=0.5, help="Delay between commands in seconds"
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=30, help="SSH connection timeout"
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Print commands without connecting")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    return parser.parse_args()
 
-    if args.debug:
+
+def main():
+    args = parse_args()
+
+    if args.verbose:
         log.setLevel(logging.DEBUG)
 
-    if not args.password and not args.key_file:
-        import getpass
-        args.password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
-
-    config_path = Path(args.config_file)
-    if not config_path.exists():
-        log.error("Config file not found: %s", args.config_file)
+    if args.ask_pass:
+        password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
+    elif args.password:
+        password = args.password
+    else:
+        log.error("Provide --password or --ask-pass")
         sys.exit(1)
-    config_lines = config_path.read_text().splitlines()
 
-    verify_commands = []
-    if args.verify_file:
-        verify_path = Path(args.verify_file)
-        if not verify_path.exists():
-            log.error("Verify file not found: %s", args.verify_file)
-            sys.exit(1)
-        verify_commands = verify_path.read_text().splitlines()
+    deploy_commands = load_commands(args.commands_file)
+    log.info("Loaded %d command(s) from %s", len(deploy_commands), args.commands_file)
 
+    rollback_commands = []
+    if args.rollback_file:
+        rollback_commands = load_commands(args.rollback_file)
+        log.info("Loaded %d rollback command(s)", len(rollback_commands))
+
+    if args.dry_run:
+        log.info("[DRY RUN] Would deploy to %s:%d as %s", args.host, args.port, args.username)
+        for cmd in deploy_commands:
+            print(f"  DEPLOY: {cmd}")
+        if rollback_commands:
+            for cmd in rollback_commands:
+                print(f"  ROLLBACK: {cmd}")
+        sys.exit(0)
+
+    log.info("Connecting to %s:%d", args.host, args.port)
     try:
-        log.info("Connecting to %s:%d", args.host, args.port)
-        client = connect(
-            args.host, args.port, args.username, args.password, args.key_file, args.timeout
-        )
-        shell = client.invoke_shell()
-        time.sleep(1)
-        shell.recv(65535)  # flush banner
-
-        saved_config = capture_running_config(shell)
-        apply_config_lines(shell, config_lines)
-
-        if verify_commands:
-            log.info("Running %d verification commands", len(verify_commands))
-            results = run_verification(shell, verify_commands)
-            for cmd, output in results.items():
-                print(f"\n--- {cmd} ---\n{output.strip()}")
-
-            failed = input("\nDid verification pass? [y/N]: ").strip().lower()
-            if failed != "y":
-                if not args.no_rollback:
-                    rollback_config(shell, saved_config)
-                    log.warning("Deployment rolled back due to failed verification")
-                    sys.exit(2)
-                else:
-                    log.warning("Verification failed but --no-rollback is set; changes retained")
-                    sys.exit(2)
-            else:
-                log.info("Verification passed; deployment committed")
-        else:
-            log.info("No verification file provided; deployment applied without checks")
-
-        client.close()
-
+        client = build_client(args.host, args.port, args.username, password, args.timeout)
     except paramiko.AuthenticationException:
         log.error("Authentication failed for %s@%s", args.username, args.host)
         sys.exit(1)
-    except paramiko.SSHException as exc:
-        log.error("SSH error: %s", exc)
+    except Exception as exc:
+        log.error("Connection failed: %s", exc)
         sys.exit(1)
-    except OSError as exc:
-        log.error("Connection error: %s", exc)
-        sys.exit(1)
+
+    try:
+        log.info("Deploying %d command(s)...", len(deploy_commands))
+        deploy_log = invoke_shell_and_send(
+            client, deploy_commands, args.prompt_pattern, args.delay
+        )
+        log.info("Deployment complete")
+
+        errors_detected = any(
+            re.search(r"(?i)(invalid input|error|unrecognized)", entry)
+            for _, entry in deploy_log
+        )
+        if errors_detected:
+            log.warning("Possible errors detected in device output during deployment")
+
+        verification_passed = True
+        if args.verify_cmd and args.verify_pattern:
+            log.info("Running verification: %s", args.verify_cmd)
+            verify_output = run_verification(client, args.verify_cmd, args.prompt_pattern)
+            if re.search(args.verify_pattern, verify_output):
+                log.info("Verification PASSED (pattern '%s' found)", args.verify_pattern)
+            else:
+                log.error(
+                    "Verification FAILED: pattern '%s' not found in output:\n%s",
+                    args.verify_pattern,
+                    verify_output.strip(),
+                )
+                verification_passed = False
+
+        if not verification_passed and args.rollback_on_failure and rollback_commands:
+            log.warning("Initiating rollback (%d commands)...", len(rollback_commands))
+            invoke_shell_and_send(client, rollback_commands, args.prompt_pattern, args.delay)
+            log.info("Rollback complete")
+            sys.exit(2)
+        elif not verification_passed:
+            log.error("Verification failed. No rollback performed.")
+            sys.exit(1)
+
+    finally:
+        client.close()
+        log.debug("SSH connection closed")
+
+    log.info("Done.")
 
 
 if __name__ == "__main__":
