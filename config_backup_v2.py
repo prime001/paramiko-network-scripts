@@ -1,242 +1,238 @@
 ```python
 """
-config_backup_rotate.py - Rotating Configuration Backup with Integrity Verification
+config_compliance.py - Network Device Configuration Compliance Checker
 
 Purpose:
-    Connects to network devices via SSH, retrieves running configurations,
-    saves them with timestamps, verifies integrity via SHA-256 checksums,
-    and rotates old backups to keep storage bounded.
+    Connects to a network device via SSH (paramiko), retrieves the running
+    configuration, and evaluates it against a set of compliance rules defined
+    in a JSON policy file. Produces a pass/fail report with line-level evidence.
 
 Usage:
-    # Single device
-    python config_backup_rotate.py -d 192.168.1.1 -u admin -p secret
-
-    # Multiple devices from file (one IP per line)
-    python config_backup_rotate.py -f devices.txt -u admin -p secret --keep 10
-
-    # Custom backup directory and output format
-    python config_backup_rotate.py -d 10.0.0.1 -u admin --backup-dir /mnt/backups --keep 5
+    python config_compliance.py -d 192.168.1.1 -u admin -p secret -P policy.json
+    python config_compliance.py -d 10.0.0.1 -u admin --ask-pass -P policy.json --output report.txt
 
 Prerequisites:
     pip install paramiko
-    SSH access to target devices (Cisco IOS/IOS-XE/NX-OS compatible)
+    Python 3.8+
+
+Policy file format (JSON):
+    {
+        "required": ["service password-encryption", "no ip http server"],
+        "prohibited": ["telnet", "no service password-encryption"],
+        "regex_required": ["logging \\d+\\.\\d+\\.\\d+\\.\\d+"],
+        "regex_prohibited": ["enable password (?!7)"]
+    }
 """
 
 import argparse
 import getpass
-import hashlib
+import json
 import logging
-import os
 import re
-import socket
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import paramiko
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-BACKUP_COMMANDS = [
-    "terminal length 0",
-    "show running-config",
-]
+DEFAULT_POLICY = {
+    "required": [
+        "service password-encryption",
+        "no ip http server",
+        "no ip http secure-server",
+        "logging on",
+    ],
+    "prohibited": [
+        "enable password ",
+        "no service password-encryption",
+    ],
+    "regex_required": [
+        r"ntp server \d+\.\d+\.\d+\.\d+",
+        r"logging \d+\.\d+\.\d+\.\d+",
+    ],
+    "regex_prohibited": [
+        r"username \S+ password (?!7 )\d",
+    ],
+}
 
 
-def ssh_get_config(host: str, username: str, password: str, timeout: int = 30) -> str:
-    """Open SSH session and retrieve running configuration."""
+def fetch_running_config(host, username, password, port=22, timeout=30):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
         client.connect(
             hostname=host,
+            port=port,
             username=username,
             password=password,
             timeout=timeout,
             look_for_keys=False,
             allow_agent=False,
         )
-        shell = client.invoke_shell(width=250, height=5000)
+        channel = client.invoke_shell()
         time.sleep(1)
-        shell.recv(65535)  # flush banner
+        channel.recv(4096)  # discard banner/prompt
 
-        output_parts = []
-        for cmd in BACKUP_COMMANDS:
-            shell.send(cmd + "\n")
-            time.sleep(2)
-            chunk = b""
-            while shell.recv_ready():
-                chunk += shell.recv(65535)
-                time.sleep(0.2)
-            output_parts.append(chunk.decode("utf-8", errors="replace"))
+        channel.send("terminal length 0\n")
+        time.sleep(0.5)
+        channel.recv(4096)
 
-        full_output = "\n".join(output_parts)
-        # Strip ANSI escape sequences and terminal control chars
-        clean = re.sub(r"\x1b\[[0-9;]*[mGKHF]", "", full_output)
-        return clean
+        channel.send("show running-config\n")
+        time.sleep(3)
+
+        output = ""
+        while channel.recv_ready():
+            output += channel.recv(65535).decode("utf-8", errors="replace")
+            time.sleep(0.2)
+
+        return output
     finally:
         client.close()
 
 
-def sha256_of_string(data: str) -> str:
-    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+def load_policy(policy_path):
+    if policy_path:
+        with open(policy_path) as f:
+            policy = json.load(f)
+        log.info("Loaded policy from %s", policy_path)
+        return policy
+    log.info("Using built-in default policy")
+    return DEFAULT_POLICY
 
 
-def save_backup(host: str, config_text: str, backup_dir: Path) -> Path:
-    """Write config to a timestamped file; return the file path."""
-    safe_host = host.replace(".", "_").replace(":", "_")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{safe_host}_{timestamp}.cfg"
-    device_dir = backup_dir / safe_host
-    device_dir.mkdir(parents=True, exist_ok=True)
+def check_compliance(config_text, policy):
+    results = []
 
-    filepath = device_dir / filename
-    filepath.write_text(config_text, encoding="utf-8")
+    for rule in policy.get("required", []):
+        passed = rule.lower() in config_text.lower()
+        evidence = None
+        if passed:
+            for line in config_text.splitlines():
+                if rule.lower() in line.lower():
+                    evidence = line.strip()
+                    break
+        results.append({
+            "type": "required",
+            "rule": rule,
+            "passed": passed,
+            "evidence": evidence,
+        })
 
-    checksum = sha256_of_string(config_text)
-    checksum_file = filepath.with_suffix(".sha256")
-    checksum_file.write_text(f"{checksum}  {filename}\n", encoding="utf-8")
+    for rule in policy.get("prohibited", []):
+        matches = [
+            line.strip() for line in config_text.splitlines()
+            if rule.lower() in line.lower()
+        ]
+        passed = len(matches) == 0
+        results.append({
+            "type": "prohibited",
+            "rule": rule,
+            "passed": passed,
+            "evidence": matches[0] if matches else None,
+        })
 
-    log.info("Saved: %s (SHA-256: %s...)", filepath, checksum[:16])
-    return filepath
+    for pattern in policy.get("regex_required", []):
+        match = re.search(pattern, config_text, re.MULTILINE | re.IGNORECASE)
+        results.append({
+            "type": "regex_required",
+            "rule": pattern,
+            "passed": match is not None,
+            "evidence": match.group(0) if match else None,
+        })
 
+    for pattern in policy.get("regex_prohibited", []):
+        match = re.search(pattern, config_text, re.MULTILINE | re.IGNORECASE)
+        results.append({
+            "type": "regex_prohibited",
+            "rule": pattern,
+            "passed": match is None,
+            "evidence": match.group(0) if match else None,
+        })
 
-def rotate_backups(host: str, backup_dir: Path, keep: int) -> int:
-    """Remove oldest backups beyond the keep limit. Returns count removed."""
-    safe_host = host.replace(".", "_").replace(":", "_")
-    device_dir = backup_dir / safe_host
-    if not device_dir.exists():
-        return 0
-
-    cfg_files = sorted(device_dir.glob("*.cfg"), key=lambda p: p.stat().st_mtime)
-    to_remove = cfg_files[: max(0, len(cfg_files) - keep)]
-    for old_file in to_remove:
-        old_file.unlink(missing_ok=True)
-        old_file.with_suffix(".sha256").unlink(missing_ok=True)
-        log.debug("Rotated old backup: %s", old_file.name)
-
-    return len(to_remove)
-
-
-def verify_backup(filepath: Path) -> bool:
-    """Re-read saved file and confirm checksum matches."""
-    checksum_file = filepath.with_suffix(".sha256")
-    if not checksum_file.exists():
-        log.warning("No checksum file for %s — skipping verification", filepath.name)
-        return False
-    stored = checksum_file.read_text().split()[0]
-    actual = sha256_of_string(filepath.read_text(encoding="utf-8"))
-    if stored != actual:
-        log.error("INTEGRITY FAILURE for %s", filepath.name)
-        return False
-    return True
+    return results
 
 
-def backup_device(
-    host: str, username: str, password: str, backup_dir: Path, keep: int, timeout: int
-) -> dict:
-    result = {"host": host, "success": False, "path": None, "rotated": 0, "error": None}
-    try:
-        socket.setdefaulttimeout(timeout)
-        log.info("Connecting to %s ...", host)
-        config_text = ssh_get_config(host, username, password, timeout)
+def format_report(host, results, output_path=None):
+    passed = sum(1 for r in results if r["passed"])
+    total = len(results)
+    score = f"{passed}/{total}"
 
-        if len(config_text.strip()) < 50:
-            raise ValueError("Retrieved config appears empty or truncated")
+    lines = [
+        f"Compliance Report — {host}",
+        "=" * 50,
+        f"Score: {score} ({100 * passed // total}%)" if total else "Score: N/A",
+        "",
+    ]
 
-        filepath = save_backup(host, config_text, backup_dir)
-        if not verify_backup(filepath):
-            raise IOError("Post-write integrity check failed")
+    for r in results:
+        status = "PASS" if r["passed"] else "FAIL"
+        tag = f"[{r['type'].upper()}]"
+        lines.append(f"  {status}  {tag} {r['rule']}")
+        if not r["passed"] and r["evidence"]:
+            lines.append(f"         ^ found: {r['evidence']}")
+        elif r["passed"] and r["evidence"]:
+            lines.append(f"         ^ matched: {r['evidence']}")
 
-        rotated = rotate_backups(host, backup_dir, keep)
-        result.update(success=True, path=str(filepath), rotated=rotated)
-        log.info("Backup complete for %s (rotated %d old)", host, rotated)
-    except (paramiko.AuthenticationException, paramiko.SSHException) as exc:
-        result["error"] = f"SSH error: {exc}"
-        log.error("SSH failure for %s: %s", host, exc)
-    except (socket.timeout, socket.error) as exc:
-        result["error"] = f"Network error: {exc}"
-        log.error("Network failure for %s: %s", host, exc)
-    except Exception as exc:
-        result["error"] = str(exc)
-        log.error("Unexpected error for %s: %s", host, exc)
-    return result
+    lines.append("")
+    report = "\n".join(lines)
+
+    if output_path:
+        Path(output_path).write_text(report)
+        log.info("Report saved to %s", output_path)
+    else:
+        print(report)
+
+    return passed == total
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Rotating network config backup with integrity verification"
+        description="Check network device config against compliance policy"
     )
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("-d", "--device", help="Single device IP or hostname")
-    target.add_argument("-f", "--file", help="File with one device per line")
-
+    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
     parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
-    parser.add_argument(
-        "--backup-dir",
-        default="./backups",
-        help="Root backup directory (default: ./backups)",
-    )
-    parser.add_argument(
-        "--keep",
-        type=int,
-        default=7,
-        help="Number of backups to retain per device (default: 7)",
-    )
-    parser.add_argument(
-        "--timeout", type=int, default=30, help="SSH connection timeout in seconds"
-    )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    parser.add_argument("-p", "--password", default=None, help="SSH password")
+    parser.add_argument("--ask-pass", action="store_true", help="Prompt for password")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("-P", "--policy", default=None, help="Path to JSON policy file")
+    parser.add_argument("-o", "--output", default=None, help="Save report to file")
+    parser.add_argument("--timeout", type=int, default=30, help="SSH timeout in seconds")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    if args.verbose:
-        log.setLevel(logging.DEBUG)
+    password = args.password
+    if args.ask_pass or not password:
+        password = getpass.getpass(f"Password for {args.username}@{args.device}: ")
 
-    password = args.password or getpass.getpass(f"Password for {args.username}: ")
-
-    if args.device:
-        devices = [args.device.strip()]
-    else:
-        device_file = Path(args.file)
-        if not device_file.exists():
-            log.error("Device file not found: %s", args.file)
-            sys.exit(1)
-        devices = [
-            line.strip()
-            for line in device_file.read_text().splitlines()
-            if line.strip() and not line.startswith("#")
-        ]
-
-    backup_dir = Path(args.backup_dir)
-    backup_dir.mkdir(parents=True, exist_ok=True)
-
-    results = []
-    for host in devices:
-        r = backup_device(host, args.username, password, backup_dir, args.keep, args.timeout)
-        results.append(r)
-
-    passed = [r for r in results if r["success"]]
-    failed = [r for r in results if not r["success"]]
-
-    print(f"\n--- Backup Summary ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ---")
-    print(f"  Devices processed : {len(results)}")
-    print(f"  Succeeded         : {len(passed)}")
-    print(f"  Failed            : {len(failed)}")
-    if failed:
-        print("\nFailed devices:")
-        for r in failed:
-            print(f"  {r['host']}: {r['error']}")
-
-    sys.exit(0 if not failed else 1)
+    try:
+        policy = load_policy(args.policy)
+        log.info("Connecting to %s:%d", args.device, args.port)
+        config_text = fetch_running_config(
+            args.device, args.username, password, args.port, args.timeout
+        )
+        results = check_compliance(config_text, policy)
+        compliant = format_report(args.device, results, args.output)
+        sys.exit(0 if compliant else 1)
+    except FileNotFoundError as e:
+        log.error("Policy file not found: %s", e)
+        sys.exit(2)
+    except paramiko.AuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.device)
+        sys.exit(2)
+    except paramiko.SSHException as e:
+        log.error("SSH error: %s", e)
+        sys.exit(2)
+    except OSError as e:
+        log.error("Connection error: %s", e)
+        sys.exit(2)
 ```
