@@ -1,238 +1,230 @@
 ```python
 """
-config_compliance.py - Network Device Configuration Compliance Checker
+startup_config_sync.py - Detect and optionally resolve unsaved configuration changes.
 
 Purpose:
-    Connects to a network device via SSH (paramiko), retrieves the running
-    configuration, and evaluates it against a set of compliance rules defined
-    in a JSON policy file. Produces a pass/fail report with line-level evidence.
+    Compares running-config against startup-config on Cisco IOS/IOS-XE devices
+    to identify unsaved changes. Optionally saves running config to startup
+    ('write memory') and/or archives both configs locally for audit purposes.
 
 Usage:
-    python config_compliance.py -d 192.168.1.1 -u admin -p secret -P policy.json
-    python config_compliance.py -d 10.0.0.1 -u admin --ask-pass -P policy.json --output report.txt
+    python startup_config_sync.py -H 192.168.1.1 -u admin -p secret
+    python startup_config_sync.py -H 192.168.1.1 -u admin -p secret --save
+    python startup_config_sync.py -H 192.168.1.1 -u admin -p secret --save --archive ./backups
 
 Prerequisites:
-    pip install paramiko
-    Python 3.8+
-
-Policy file format (JSON):
-    {
-        "required": ["service password-encryption", "no ip http server"],
-        "prohibited": ["telnet", "no service password-encryption"],
-        "regex_required": ["logging \\d+\\.\\d+\\.\\d+\\.\\d+"],
-        "regex_prohibited": ["enable password (?!7)"]
-    }
+    - pip install paramiko
+    - SSH access to target device
+    - Account with privilege 15 (or enable capability if using --save)
 """
 
 import argparse
+import difflib
 import getpass
-import json
 import logging
+import os
 import re
 import sys
 import time
-from pathlib import Path
+from datetime import datetime
 
 import paramiko
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-DEFAULT_POLICY = {
-    "required": [
-        "service password-encryption",
-        "no ip http server",
-        "no ip http secure-server",
-        "logging on",
-    ],
-    "prohibited": [
-        "enable password ",
-        "no service password-encryption",
-    ],
-    "regex_required": [
-        r"ntp server \d+\.\d+\.\d+\.\d+",
-        r"logging \d+\.\d+\.\d+\.\d+",
-    ],
-    "regex_prohibited": [
-        r"username \S+ password (?!7 )\d",
-    ],
-}
 
-
-def fetch_running_config(host, username, password, port=22, timeout=30):
+def ssh_connect(host, username, password, port=22, timeout=30):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(
-            hostname=host,
-            port=port,
-            username=username,
-            password=password,
-            timeout=timeout,
-            look_for_keys=False,
-            allow_agent=False,
-        )
-        channel = client.invoke_shell()
-        time.sleep(1)
-        channel.recv(4096)  # discard banner/prompt
-
-        channel.send("terminal length 0\n")
-        time.sleep(0.5)
-        channel.recv(4096)
-
-        channel.send("show running-config\n")
-        time.sleep(3)
-
-        output = ""
-        while channel.recv_ready():
-            output += channel.recv(65535).decode("utf-8", errors="replace")
-            time.sleep(0.2)
-
-        return output
-    finally:
-        client.close()
+    client.connect(
+        hostname=host,
+        port=port,
+        username=username,
+        password=password,
+        timeout=timeout,
+        allow_agent=False,
+        look_for_keys=False,
+    )
+    return client
 
 
-def load_policy(policy_path):
-    if policy_path:
-        with open(policy_path) as f:
-            policy = json.load(f)
-        log.info("Loaded policy from %s", policy_path)
-        return policy
-    log.info("Using built-in default policy")
-    return DEFAULT_POLICY
+def run_command(shell, command, wait=2.0, buffer_size=65535):
+    shell.send(command + "\n")
+    time.sleep(wait)
+    output = ""
+    while shell.recv_ready():
+        chunk = shell.recv(buffer_size).decode("utf-8", errors="replace")
+        output += chunk
+        if chunk:
+            time.sleep(0.3)
+    return output
 
 
-def check_compliance(config_text, policy):
-    results = []
-
-    for rule in policy.get("required", []):
-        passed = rule.lower() in config_text.lower()
-        evidence = None
-        if passed:
-            for line in config_text.splitlines():
-                if rule.lower() in line.lower():
-                    evidence = line.strip()
-                    break
-        results.append({
-            "type": "required",
-            "rule": rule,
-            "passed": passed,
-            "evidence": evidence,
-        })
-
-    for rule in policy.get("prohibited", []):
-        matches = [
-            line.strip() for line in config_text.splitlines()
-            if rule.lower() in line.lower()
-        ]
-        passed = len(matches) == 0
-        results.append({
-            "type": "prohibited",
-            "rule": rule,
-            "passed": passed,
-            "evidence": matches[0] if matches else None,
-        })
-
-    for pattern in policy.get("regex_required", []):
-        match = re.search(pattern, config_text, re.MULTILINE | re.IGNORECASE)
-        results.append({
-            "type": "regex_required",
-            "rule": pattern,
-            "passed": match is not None,
-            "evidence": match.group(0) if match else None,
-        })
-
-    for pattern in policy.get("regex_prohibited", []):
-        match = re.search(pattern, config_text, re.MULTILINE | re.IGNORECASE)
-        results.append({
-            "type": "regex_prohibited",
-            "rule": pattern,
-            "passed": match is None,
-            "evidence": match.group(0) if match else None,
-        })
-
-    return results
+def strip_preamble(config_text):
+    """Remove timestamp/header lines that differ between running and startup."""
+    lines = config_text.splitlines()
+    cleaned = []
+    for line in lines:
+        if re.match(r"^(Building configuration|Current configuration|!.*Last configuration)", line):
+            continue
+        if re.match(r"^! Last configuration change", line):
+            continue
+        if re.match(r"^! NVRAM config last updated", line):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned)
 
 
-def format_report(host, results, output_path=None):
-    passed = sum(1 for r in results if r["passed"])
-    total = len(results)
-    score = f"{passed}/{total}"
+def fetch_config(shell, config_type="running"):
+    """Fetch running or startup config, handling --More-- pagination."""
+    cmd = f"show {config_type}-config"
+    shell.send("terminal length 0\n")
+    time.sleep(1)
+    shell.recv(65535)
 
-    lines = [
-        f"Compliance Report — {host}",
-        "=" * 50,
-        f"Score: {score} ({100 * passed // total}%)" if total else "Score: N/A",
-        "",
-    ]
+    shell.send(cmd + "\n")
+    time.sleep(3)
 
-    for r in results:
-        status = "PASS" if r["passed"] else "FAIL"
-        tag = f"[{r['type'].upper()}]"
-        lines.append(f"  {status}  {tag} {r['rule']}")
-        if not r["passed"] and r["evidence"]:
-            lines.append(f"         ^ found: {r['evidence']}")
-        elif r["passed"] and r["evidence"]:
-            lines.append(f"         ^ matched: {r['evidence']}")
+    output = ""
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if shell.recv_ready():
+            chunk = shell.recv(65535).decode("utf-8", errors="replace")
+            output += chunk
+            time.sleep(0.5)
+        else:
+            if output and re.search(r"#\s*$", output.splitlines()[-1] if output.splitlines() else ""):
+                break
+            time.sleep(0.5)
 
-    lines.append("")
-    report = "\n".join(lines)
+    return strip_preamble(output)
 
-    if output_path:
-        Path(output_path).write_text(report)
-        log.info("Report saved to %s", output_path)
-    else:
-        print(report)
 
-    return passed == total
+def write_memory(shell):
+    log.info("Saving running config to startup (write memory)...")
+    shell.send("write memory\n")
+    time.sleep(4)
+    response = ""
+    while shell.recv_ready():
+        response += shell.recv(65535).decode("utf-8", errors="replace")
+        time.sleep(0.3)
+    if "OK" in response or "success" in response.lower() or "[OK]" in response:
+        log.info("Configuration saved successfully.")
+        return True
+    log.warning("Save may have failed. Response: %s", response.strip())
+    return False
+
+
+def archive_config(config_text, host, config_type, archive_dir):
+    os.makedirs(archive_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{host}_{config_type}_{timestamp}.txt"
+    filepath = os.path.join(archive_dir, filename)
+    with open(filepath, "w") as fh:
+        fh.write(config_text)
+    log.info("Archived %s-config to %s", config_type, filepath)
+    return filepath
+
+
+def compare_configs(running, startup):
+    run_lines = running.splitlines(keepends=True)
+    start_lines = startup.splitlines(keepends=True)
+    diff = list(difflib.unified_diff(
+        start_lines, run_lines,
+        fromfile="startup-config",
+        tofile="running-config",
+        n=3,
+    ))
+    return diff
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Check network device config against compliance policy"
+        description="Detect unsaved config changes on Cisco IOS/IOS-XE devices."
     )
-    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    parser.add_argument("-H", "--host", required=True, help="Device IP or hostname")
     parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", default=None, help="SSH password")
-    parser.add_argument("--ask-pass", action="store_true", help="Prompt for password")
+    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
     parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("-P", "--policy", default=None, help="Path to JSON policy file")
-    parser.add_argument("-o", "--output", default=None, help="Save report to file")
-    parser.add_argument("--timeout", type=int, default=30, help="SSH timeout in seconds")
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Write running-config to startup-config if differences found",
+    )
+    parser.add_argument(
+        "--archive",
+        metavar="DIR",
+        help="Directory to archive both configs (e.g. ./backups)",
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=30, help="SSH connection timeout in seconds"
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     return parser.parse_args()
 
 
-if __name__ == "__main__":
+def main():
     args = parse_args()
 
-    password = args.password
-    if args.ask_pass or not password:
-        password = getpass.getpass(f"Password for {args.username}@{args.device}: ")
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    password = args.password or getpass.getpass(f"Password for {args.username}@{args.host}: ")
+
+    log.info("Connecting to %s:%d", args.host, args.port)
+    try:
+        client = ssh_connect(args.host, args.username, password, args.port, args.timeout)
+    except paramiko.AuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.host)
+        sys.exit(1)
+    except (paramiko.SSHException, OSError) as exc:
+        log.error("Connection error: %s", exc)
+        sys.exit(1)
 
     try:
-        policy = load_policy(args.policy)
-        log.info("Connecting to %s:%d", args.device, args.port)
-        config_text = fetch_running_config(
-            args.device, args.username, password, args.port, args.timeout
-        )
-        results = check_compliance(config_text, policy)
-        compliant = format_report(args.device, results, args.output)
-        sys.exit(0 if compliant else 1)
-    except FileNotFoundError as e:
-        log.error("Policy file not found: %s", e)
-        sys.exit(2)
-    except paramiko.AuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.device)
-        sys.exit(2)
-    except paramiko.SSHException as e:
-        log.error("SSH error: %s", e)
-        sys.exit(2)
-    except OSError as e:
-        log.error("Connection error: %s", e)
-        sys.exit(2)
+        shell = client.invoke_shell(width=200, height=200)
+        time.sleep(1.5)
+        shell.recv(65535)  # drain banner
+
+        log.info("Fetching running-config...")
+        running = fetch_config(shell, "running")
+
+        log.info("Fetching startup-config...")
+        startup = fetch_config(shell, "startup")
+
+        if args.archive:
+            archive_config(running, args.host, "running", args.archive)
+            archive_config(startup, args.host, "startup", args.archive)
+
+        diff = compare_configs(running, startup)
+
+        if not diff:
+            print(f"\n[OK] {args.host}: running-config matches startup-config. No unsaved changes.")
+        else:
+            added = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
+            removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
+            print(f"\n[WARN] {args.host}: Unsaved changes detected (+{added} lines / -{removed} lines)\n")
+            print("".join(diff[:80]))
+            if len(diff) > 80:
+                print(f"... ({len(diff) - 80} more diff lines)")
+
+            if args.save:
+                saved = write_memory(shell)
+                if not saved:
+                    sys.exit(2)
+            else:
+                print("\nRun with --save to persist changes to startup-config.")
+                sys.exit(1)
+
+    finally:
+        client.close()
+
+
+if __name__ == "__main__":
+    main()
 ```
