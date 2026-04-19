@@ -1,223 +1,211 @@
-The user instruction "Output ONLY the script content" takes precedence over brainstorming. Writing the script now.
-
 ```python
-#!/usr/bin/env python3
 """
-bulk_command_runner.py — Parallel bulk command execution across network devices.
+device_health_monitor.py — SSH-based device health checker using Paramiko.
 
 Purpose:
-    Connect to multiple network devices concurrently and run a list of show
-    commands on each one.  Results are written to per-device log files and a
-    consolidated CSV summary, making it easy to audit fleet-wide state in one
-    pass.
+    Polls CPU utilization, memory usage, and uptime from one or more network
+    devices over SSH and flags any resources that exceed configurable thresholds.
+    Useful for quick NOC spot-checks or pre/post-change health validation.
 
 Usage:
-    python bulk_command_runner.py \\
-        --inventory devices.txt \\
-        --commands commands.txt \\
-        --username admin \\
-        --output-dir ./results \\
-        [--password]          # prompted if omitted \\
-        [--threads 10]        # default: 5 \\
-        [--timeout 30]        # SSH timeout in seconds \\
-        [--port 22]
-
-Inventory file format (one host per line, lines starting with # ignored):
-    192.168.1.1
-    192.168.1.2
-    sw-core-01.example.com
-
-Commands file format (one IOS/NX-OS show command per line):
-    show version
-    show ip interface brief
-    show logging last 20
+    python device_health_monitor.py -H 192.168.1.1 -u admin -p secret
+    python device_health_monitor.py --hosts-file devices.txt -u admin \
+        --cpu-threshold 70 --mem-threshold 80 --output report.txt
 
 Prerequisites:
     pip install paramiko
+    Target devices must allow SSH and support IOS/IOS-XE show commands.
+    devices.txt format: one IP or hostname per line (# lines are comments).
 """
 
 import argparse
-import csv
 import getpass
 import logging
-import os
-import socket
+import re
 import sys
-import threading
 from datetime import datetime
-from pathlib import Path
 
 import paramiko
 
-LOG_FORMAT = "%(asctime)s [%(levelname)s] %(threadName)s — %(message)s"
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 log = logging.getLogger(__name__)
 
-_results_lock = threading.Lock()
+COMMANDS = {
+    "cpu": "show processes cpu | include CPU utilization",
+    "memory": "show processes memory | include Processor",
+    "uptime": "show version | include uptime",
+}
 
 
-def load_lines(path: str) -> list[str]:
-    """Return non-empty, non-comment lines from a text file."""
-    lines = []
-    with open(path) as fh:
-        for line in fh:
-            stripped = line.strip()
-            if stripped and not stripped.startswith("#"):
-                lines.append(stripped)
-    return lines
+def parse_cpu(output: str) -> float | None:
+    match = re.search(r"five minutes:\s+(\d+)%", output)
+    if match:
+        return float(match.group(1))
+    match = re.search(r"CPU utilization.*?(\d+)%/", output)
+    if match:
+        return float(match.group(1))
+    return None
 
 
-def run_commands_on_device(
-    host: str,
-    username: str,
-    password: str,
-    commands: list[str],
-    output_dir: Path,
-    port: int,
-    timeout: int,
-) -> dict:
-    """SSH to *host*, run each command, return a result dict."""
-    result = {
-        "host": host,
-        "status": "error",
-        "commands_run": 0,
-        "error": "",
-    }
+def parse_memory(output: str) -> tuple[int, int] | tuple[None, None]:
+    match = re.search(r"Processor\s+\d+\s+(\d+)\s+(\d+)", output)
+    if match:
+        used = int(match.group(1))
+        free = int(match.group(2))
+        return used, free
+    return None, None
+
+
+def run_command(channel: paramiko.Channel, command: str, timeout: int = 15) -> str:
+    channel.send(command + "\n")
+    output = ""
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if channel.recv_ready():
+            chunk = channel.recv(4096).decode("utf-8", errors="replace")
+            output += chunk
+            if re.search(r"[>#]", chunk.split("\n")[-1]):
+                break
+        time.sleep(0.1)
+    return output
+
+
+def check_device(host: str, username: str, password: str,
+                 port: int, timeout: int) -> dict:
+    result = {"host": host, "status": "unreachable", "cpu": None,
+              "mem_used": None, "mem_free": None, "mem_pct": None,
+              "uptime": None, "error": None}
 
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
     try:
-        client.connect(
-            hostname=host,
-            port=port,
-            username=username,
-            password=password,
-            timeout=timeout,
-            look_for_keys=False,
-            allow_agent=False,
-        )
+        client.connect(host, port=port, username=username, password=password,
+                       timeout=timeout, look_for_keys=False,
+                       allow_agent=False)
+        shell = client.invoke_shell(width=200, height=50)
+        import time
+        time.sleep(1)
+        if shell.recv_ready():
+            shell.recv(4096)
+        shell.send("terminal length 0\n")
+        time.sleep(0.5)
+        if shell.recv_ready():
+            shell.recv(4096)
 
-        device_file = output_dir / f"{host.replace('.', '_')}.txt"
-        with open(device_file, "w") as out:
-            out.write(f"# Device: {host}\n")
-            out.write(f"# Captured: {datetime.utcnow().isoformat()}Z\n\n")
+        cpu_out = run_command(shell, COMMANDS["cpu"])
+        mem_out = run_command(shell, COMMANDS["memory"])
+        up_out = run_command(shell, COMMANDS["uptime"])
 
-            for cmd in commands:
-                out.write(f"{'=' * 60}\n")
-                out.write(f"# {cmd}\n")
-                out.write(f"{'=' * 60}\n")
+        result["cpu"] = parse_cpu(cpu_out)
+        used, free = parse_memory(mem_out)
+        result["mem_used"] = used
+        result["mem_free"] = free
+        if used is not None and free is not None and (used + free) > 0:
+            result["mem_pct"] = round(used / (used + free) * 100, 1)
 
-                _, stdout, stderr = client.exec_command(cmd, timeout=timeout)
-                output = stdout.read().decode(errors="replace")
-                error_output = stderr.read().decode(errors="replace")
-
-                out.write(output)
-                if error_output.strip():
-                    out.write(f"\n[STDERR] {error_output}")
-                out.write("\n")
-
+        up_match = re.search(r"uptime is (.+)", up_out)
+        result["uptime"] = up_match.group(1).strip() if up_match else "unknown"
         result["status"] = "ok"
-        result["commands_run"] = len(commands)
-        log.info("%s — completed %d commands → %s", host, len(commands), device_file.name)
-
-    except (paramiko.AuthenticationException,) as exc:
-        result["error"] = f"auth error: {exc}"
-        log.error("%s — %s", host, result["error"])
-    except (paramiko.SSHException, socket.error, OSError) as exc:
+        shell.close()
+    except paramiko.AuthenticationException:
+        result["error"] = "authentication failed"
+        log.warning("%s: authentication failed", host)
+    except Exception as exc:
         result["error"] = str(exc)
-        log.error("%s — connection error: %s", host, exc)
+        log.warning("%s: %s", host, exc)
     finally:
         client.close()
-
     return result
 
 
-def worker(host, username, password, commands, output_dir, port, timeout, all_results):
-    result = run_commands_on_device(
-        host, username, password, commands, output_dir, port, timeout
-    )
-    with _results_lock:
-        all_results.append(result)
+def format_report(results: list[dict], cpu_thresh: int, mem_thresh: int) -> str:
+    lines = [
+        f"Device Health Report — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Thresholds: CPU >{cpu_thresh}%  Memory >{mem_thresh}%",
+        "=" * 72,
+    ]
+    for r in results:
+        lines.append(f"\nHost: {r['host']}")
+        if r["status"] != "ok":
+            lines.append(f"  STATUS : UNREACHABLE ({r['error']})")
+            continue
+        cpu_flag = " [ALERT]" if r["cpu"] and r["cpu"] > cpu_thresh else ""
+        mem_flag = " [ALERT]" if r["mem_pct"] and r["mem_pct"] > mem_thresh else ""
+        lines.append(f"  Uptime : {r['uptime']}")
+        lines.append(f"  CPU    : {r['cpu']}% (5-min avg){cpu_flag}")
+        lines.append(f"  Memory : {r['mem_pct']}% used "
+                     f"({r['mem_used']} / {r['mem_free']} bytes free){mem_flag}")
+    lines.append("\n" + "=" * 72)
+    return "\n".join(lines)
 
 
-def write_summary(results: list[dict], output_dir: Path) -> None:
-    summary_path = output_dir / "summary.csv"
-    fieldnames = ["host", "status", "commands_run", "error"]
-    with open(summary_path, "w", newline="") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(results)
-    log.info("Summary written to %s", summary_path)
-
-
-def parse_args() -> argparse.Namespace:
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run show commands on multiple devices in parallel via SSH."
+        description="SSH device health monitor — CPU, memory, uptime")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-H", "--host", help="Single device IP or hostname")
+    group.add_argument("--hosts-file", help="File with one host per line")
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", help="Omit to prompt securely")
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument("--timeout", type=int, default=15, metavar="SEC")
+    parser.add_argument("--cpu-threshold", type=int, default=80, metavar="PCT")
+    parser.add_argument("--mem-threshold", type=int, default=85, metavar="PCT")
+    parser.add_argument("--output", help="Write report to file instead of stdout")
+    args = parser.parse_args()
+
+    password = args.password or getpass.getpass("Password: ")
+
+    if args.host:
+        hosts = [args.host]
+    else:
+        try:
+            with open(args.hosts_file) as fh:
+                hosts = [l.strip() for l in fh
+                         if l.strip() and not l.startswith("#")]
+        except OSError as exc:
+            log.error("Cannot read hosts file: %s", exc)
+            sys.exit(1)
+
+    if not hosts:
+        log.error("No hosts to check.")
+        sys.exit(1)
+
+    results = []
+    for host in hosts:
+        log.info("Checking %s …", host)
+        results.append(check_device(host, args.username, password,
+                                    args.port, args.timeout))
+
+    report = format_report(results, args.cpu_threshold, args.mem_threshold)
+    if args.output:
+        try:
+            with open(args.output, "w") as fh:
+                fh.write(report + "\n")
+            log.info("Report written to %s", args.output)
+        except OSError as exc:
+            log.error("Cannot write output file: %s", exc)
+            sys.exit(1)
+    else:
+        print(report)
+
+    alerts = sum(
+        1 for r in results
+        if r["status"] == "ok" and (
+            (r["cpu"] and r["cpu"] > args.cpu_threshold) or
+            (r["mem_pct"] and r["mem_pct"] > args.mem_threshold)
+        )
     )
-    parser.add_argument("--inventory", required=True, help="File with one host per line")
-    parser.add_argument("--commands", required=True, help="File with one command per line")
-    parser.add_argument("--username", required=True, help="SSH username")
-    parser.add_argument("--password", default=None, help="SSH password (prompted if omitted)")
-    parser.add_argument("--output-dir", default="results", help="Directory for output files")
-    parser.add_argument("--threads", type=int, default=5, help="Concurrent SSH sessions")
-    parser.add_argument("--timeout", type=int, default=30, help="SSH connect/exec timeout (s)")
-    parser.add_argument("--port", type=int, default=22, help="SSH port")
-    return parser.parse_args()
+    if alerts:
+        log.warning("%d device(s) exceeded thresholds.", alerts)
+        sys.exit(2)
 
 
 if __name__ == "__main__":
-    args = parse_args()
-
-    password = args.password or getpass.getpass(f"Password for {args.username}: ")
-
-    hosts = load_lines(args.inventory)
-    commands = load_lines(args.commands)
-
-    if not hosts:
-        log.error("No hosts found in %s", args.inventory)
-        sys.exit(1)
-    if not commands:
-        log.error("No commands found in %s", args.commands)
-        sys.exit(1)
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    log.info(
-        "Starting: %d hosts × %d commands using %d threads",
-        len(hosts),
-        len(commands),
-        args.threads,
-    )
-
-    all_results: list[dict] = []
-    semaphore = threading.Semaphore(args.threads)
-    threads = []
-
-    def throttled_worker(host):
-        with semaphore:
-            worker(host, password, commands, output_dir, args.port, args.timeout, all_results)
-
-    # Fix closure over loop variable
-    def make_target(h):
-        def target():
-            with semaphore:
-                worker(h, args.username, password, commands, output_dir, args.port, args.timeout, all_results)
-        return target
-
-    for host in hosts:
-        t = threading.Thread(target=make_target(host), name=host, daemon=True)
-        threads.append(t)
-        t.start()
-
-    for t in threads:
-        t.join()
-
-    write_summary(all_results, output_dir)
-
-    ok = sum(1 for r in all_results if r["status"] == "ok")
-    failed = len(all_results) - ok
-    print(f"\nDone: {ok} succeeded, {failed} failed. Results in: {output_dir}/")
-    sys.exit(0 if failed == 0 else 1)
+    main()
 ```
