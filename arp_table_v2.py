@@ -1,19 +1,22 @@
 ```python
 """
-arp_table_collector.py - ARP Table Collector with MAC Vendor Lookup
+arp_table_analysis.py - ARP Table Analysis and Anomaly Detection
 
 Purpose:
-    Retrieve the ARP table from a Cisco IOS/IOS-XE device via SSH, enrich
-    each entry with the IEEE OUI vendor name, flag duplicate IP/MAC anomalies,
-    and optionally export results to CSV.
+    Retrieves ARP tables from network devices via SSH and performs analysis
+    to detect duplicate IP addresses, duplicate MAC addresses (potential MAC
+    spoofing), and stale or incomplete entries. Results can be exported to CSV.
 
 Usage:
-    python arp_table_collector.py -d 192.168.1.1 -u admin -p secret
-    python arp_table_collector.py -d 192.168.1.1 -u admin --vlan 10 --csv arp_out.csv
-    python arp_table_collector.py -d 192.168.1.1 -u admin --subnet 10.0.0.0/24 --anomalies
+    python arp_table_analysis.py -d 192.168.1.1 -u admin -p secret
+    python arp_table_analysis.py -d 192.168.1.1 -u admin --key ~/.ssh/id_rsa
+    python arp_table_analysis.py -d 192.168.1.1 -u admin -p secret --subnet 10.0.0.0/24
+    python arp_table_analysis.py -d 192.168.1.1 -u admin -p secret --csv arp_out.csv
+    python arp_table_analysis.py -d 192.168.1.1 -u admin -p secret --anomalies-only
 
 Prerequisites:
-    pip install paramiko requests
+    pip install paramiko
+    Device must support: show ip arp (Cisco IOS/NX-OS)
 """
 
 import argparse
@@ -22,202 +25,219 @@ import ipaddress
 import logging
 import re
 import sys
-import time
 from collections import defaultdict
+from getpass import getpass
 
 import paramiko
-import requests
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-OUI_API = "https://api.macvendors.com/{}"
-OUI_CACHE: dict[str, str] = {}
+ARP_PATTERN = re.compile(
+    r"(?P<protocol>\S+)\s+"
+    r"(?P<ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+"
+    r"(?P<age>[-\d]+)\s+"
+    r"(?P<mac>[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}|Incomplete)\s+"
+    r"(?P<encap>\S+)\s+"
+    r"(?P<interface>\S+)",
+    re.IGNORECASE,
+)
 
 
-def ssh_connect(host: str, username: str, password: str, port: int = 22) -> paramiko.SSHClient:
+def ssh_connect(host, username, password=None, key_path=None, port=22, timeout=15):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(host, port=port, username=username, password=password, timeout=15)
-    log.info("Connected to %s", host)
+    connect_kwargs = dict(
+        hostname=host,
+        port=port,
+        username=username,
+        timeout=timeout,
+        look_for_keys=False,
+        allow_agent=False,
+    )
+    if key_path:
+        connect_kwargs["key_filename"] = key_path
+        connect_kwargs["look_for_keys"] = True
+    elif password:
+        connect_kwargs["password"] = password
+    else:
+        raise ValueError("Provide either password or key_path")
+    client.connect(**connect_kwargs)
     return client
 
 
-def run_command(client: paramiko.SSHClient, command: str, timeout: int = 15) -> str:
+def run_command(client, command, timeout=30):
     stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-    output = stdout.read().decode(errors="replace")
-    err = stderr.read().decode(errors="replace").strip()
-    if err:
-        log.debug("stderr: %s", err)
+    output = stdout.read().decode("utf-8", errors="replace")
+    error = stderr.read().decode("utf-8", errors="replace")
+    if error.strip():
+        log.debug("stderr: %s", error.strip())
     return output
 
 
-def parse_arp_table(raw: str) -> list[dict]:
-    """Parse 'show ip arp' output into structured records."""
-    pattern = re.compile(
-        r"^(?P<protocol>\S+)\s+(?P<ip>\d+\.\d+\.\d+\.\d+)\s+(?P<age>\S+)\s+"
-        r"(?P<mac>[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+(?P<encap>\S+)\s+(?P<iface>\S+)",
-        re.IGNORECASE | re.MULTILINE,
-    )
+def parse_arp_table(raw_output):
     entries = []
-    for m in pattern.finditer(raw):
-        entries.append({
-            "protocol": m.group("protocol"),
-            "ip": m.group("ip"),
-            "age": m.group("age"),
-            "mac": m.group("mac").lower(),
-            "encap": m.group("encap"),
-            "interface": m.group("iface"),
-        })
+    for line in raw_output.splitlines():
+        match = ARP_PATTERN.search(line)
+        if match:
+            entries.append(match.groupdict())
     return entries
 
 
-def cisco_mac_to_ieee(cisco_mac: str) -> str:
-    """Convert Cisco dotted-hex (aabb.ccdd.eeff) to IEEE colon format."""
-    flat = cisco_mac.replace(".", "")
-    return ":".join(flat[i:i+2] for i in range(0, 12, 2))
-
-
-def lookup_vendor(cisco_mac: str) -> str:
-    ieee = cisco_mac_to_ieee(cisco_mac)
-    oui = ieee[:8].upper()
-    if oui in OUI_CACHE:
-        return OUI_CACHE[oui]
+def filter_by_subnet(entries, subnet_str):
     try:
-        resp = requests.get(OUI_API.format(ieee), timeout=5)
-        if resp.status_code == 200:
-            vendor = resp.text.strip()
-        elif resp.status_code == 404:
-            vendor = "Unknown"
-        else:
-            vendor = "Lookup failed"
-        time.sleep(0.4)  # respect rate limit
-    except requests.RequestException as exc:
-        log.debug("OUI lookup failed for %s: %s", ieee, exc)
-        vendor = "Lookup error"
-    OUI_CACHE[oui] = vendor
-    return vendor
+        network = ipaddress.ip_network(subnet_str, strict=False)
+    except ValueError as exc:
+        log.error("Invalid subnet %s: %s", subnet_str, exc)
+        return entries
+    return [e for e in entries if ipaddress.ip_address(e["ip"]) in network]
 
 
-def detect_anomalies(entries: list[dict]) -> list[str]:
-    """Return a list of anomaly descriptions."""
-    anomalies = []
-    ip_to_macs: dict[str, list[str]] = defaultdict(list)
-    mac_to_ips: dict[str, list[str]] = defaultdict(list)
-    for e in entries:
-        ip_to_macs[e["ip"]].append(e["mac"])
-        mac_to_ips[e["mac"]].append(e["ip"])
-    for ip, macs in ip_to_macs.items():
-        if len(macs) > 1:
-            anomalies.append(f"Duplicate IP {ip} maps to MACs: {', '.join(macs)}")
-    for mac, ips in mac_to_ips.items():
-        if len(ips) > 1:
-            anomalies.append(f"Duplicate MAC {mac} maps to IPs: {', '.join(ips)}")
-    return anomalies
+def detect_anomalies(entries):
+    ip_to_macs = defaultdict(list)
+    mac_to_ips = defaultdict(list)
+    incomplete = []
+
+    for entry in entries:
+        ip = entry["ip"]
+        mac = entry["mac"]
+        if mac.lower() == "incomplete":
+            incomplete.append(entry)
+            continue
+        ip_to_macs[ip].append(mac)
+        mac_to_ips[mac].append(ip)
+
+    duplicate_ips = {ip: macs for ip, macs in ip_to_macs.items() if len(macs) > 1}
+    duplicate_macs = {mac: ips for mac, ips in mac_to_ips.items() if len(ips) > 1}
+
+    return {
+        "duplicate_ips": duplicate_ips,
+        "duplicate_macs": duplicate_macs,
+        "incomplete": incomplete,
+    }
 
 
-def filter_entries(
-    entries: list[dict],
-    vlan: str | None,
-    subnet: str | None,
-) -> list[dict]:
-    result = entries
-    if vlan:
-        result = [e for e in result if e["interface"].endswith(vlan)]
-    if subnet:
-        try:
-            network = ipaddress.ip_network(subnet, strict=False)
-            result = [e for e in result if ipaddress.ip_address(e["ip"]) in network]
-        except ValueError as exc:
-            log.error("Invalid subnet %s: %s", subnet, exc)
-    return result
-
-
-def print_table(entries: list[dict]) -> None:
-    header = f"{'IP':<18} {'MAC':<20} {'Age':<6} {'Interface':<22} {'Vendor'}"
+def print_table(entries):
+    if not entries:
+        print("No ARP entries found.")
+        return
+    header = f"{'IP':<18} {'MAC':<18} {'Interface':<20} {'Age':>6} {'Protocol':<10}"
     print(header)
     print("-" * len(header))
     for e in entries:
         print(
-            f"{e['ip']:<18} {e['mac']:<20} {e['age']:<6} "
-            f"{e['interface']:<22} {e.get('vendor', '')}"
+            f"{e['ip']:<18} {e['mac']:<18} {e['interface']:<20} "
+            f"{e['age']:>6} {e['protocol']:<10}"
         )
 
 
-def write_csv(entries: list[dict], path: str) -> None:
-    fields = ["ip", "mac", "age", "encap", "interface", "vendor"]
+def print_anomalies(anomalies):
+    dup_ips = anomalies["duplicate_ips"]
+    dup_macs = anomalies["duplicate_macs"]
+    incomplete = anomalies["incomplete"]
+
+    if dup_ips:
+        print("\n[!] Duplicate IPs (possible IP conflict):")
+        for ip, macs in dup_ips.items():
+            print(f"    {ip} -> {', '.join(macs)}")
+    if dup_macs:
+        print("\n[!] Duplicate MACs (possible MAC spoofing or HSRP/VRRP):")
+        for mac, ips in dup_macs.items():
+            print(f"    {mac} -> {', '.join(ips)}")
+    if incomplete:
+        print(f"\n[!] Incomplete entries: {len(incomplete)}")
+        for e in incomplete:
+            print(f"    {e['ip']} on {e['interface']}")
+    if not dup_ips and not dup_macs and not incomplete:
+        print("\n[+] No anomalies detected.")
+
+
+def export_csv(entries, path):
+    if not entries:
+        log.warning("No entries to export.")
+        return
+    fields = ["ip", "mac", "interface", "age", "protocol", "encap"]
     with open(path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+        writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
         writer.writerows(entries)
-    log.info("Saved %d entries to %s", len(entries), path)
+    log.info("Exported %d entries to %s", len(entries), path)
 
 
-def build_args() -> argparse.Namespace:
+def build_parser():
     parser = argparse.ArgumentParser(
-        description="Retrieve ARP table with MAC vendor enrichment"
+        description="Retrieve and analyze ARP table from a network device."
     )
     parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
     parser.add_argument("-u", "--username", required=True, help="SSH username")
     parser.add_argument("-p", "--password", default=None, help="SSH password")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default 22)")
-    parser.add_argument("--vlan", help="Filter by VLAN ID (matches interface suffix)")
-    parser.add_argument("--subnet", help="Filter by subnet in CIDR notation")
-    parser.add_argument("--no-vendor", action="store_true", help="Skip MAC vendor lookup")
-    parser.add_argument("--anomalies", action="store_true", help="Report ARP anomalies")
-    parser.add_argument("--csv", metavar="FILE", help="Export results to CSV file")
-    return parser.parse_args()
+    parser.add_argument("--key", dest="key_path", default=None, help="SSH private key path")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--subnet", default=None, help="Filter results to subnet (e.g. 10.0.0.0/24)")
+    parser.add_argument("--csv", dest="csv_path", default=None, help="Export results to CSV file")
+    parser.add_argument("--anomalies-only", action="store_true", help="Only print anomaly report")
+    parser.add_argument("--vrf", default=None, help="VRF name for ARP lookup")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    return parser
 
 
 if __name__ == "__main__":
-    args = build_args()
+    args = build_parser().parse_args()
 
-    if args.password is None:
-        import getpass
-        args.password = getpass.getpass(f"Password for {args.username}@{args.device}: ")
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if not args.password and not args.key_path:
+        args.password = getpass(f"Password for {args.username}@{args.device}: ")
+
+    command = "show ip arp"
+    if args.vrf:
+        command = f"show ip arp vrf {args.vrf}"
+
+    log.info("Connecting to %s:%d", args.device, args.port)
+    try:
+        client = ssh_connect(
+            host=args.device,
+            username=args.username,
+            password=args.password,
+            key_path=args.key_path,
+            port=args.port,
+        )
+    except Exception as exc:
+        log.error("Connection failed: %s", exc)
+        sys.exit(1)
 
     try:
-        client = ssh_connect(args.device, args.username, args.password, args.port)
-        raw = run_command(client, "show ip arp")
+        log.info("Running: %s", command)
+        raw = run_command(client, command)
+    except Exception as exc:
+        log.error("Command execution failed: %s", exc)
+        sys.exit(1)
+    finally:
         client.close()
-    except paramiko.AuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.device)
-        sys.exit(1)
-    except (paramiko.SSHException, OSError) as exc:
-        log.error("Connection error: %s", exc)
-        sys.exit(1)
 
     entries = parse_arp_table(raw)
     if not entries:
-        log.warning("No ARP entries parsed — check device output format")
+        log.warning("No ARP entries parsed. Check device output format.")
         sys.exit(0)
 
-    entries = filter_entries(entries, args.vlan, args.subnet)
-    log.info("Entries after filtering: %d", len(entries))
+    log.info("Parsed %d ARP entries", len(entries))
 
-    if not args.no_vendor:
-        log.info("Resolving MAC vendors (may take a moment)...")
-        for e in entries:
-            e["vendor"] = lookup_vendor(e["mac"])
-    else:
-        for e in entries:
-            e["vendor"] = ""
+    if args.subnet:
+        entries = filter_by_subnet(entries, args.subnet)
+        log.info("%d entries after subnet filter (%s)", len(entries), args.subnet)
 
-    print_table(entries)
+    anomalies = detect_anomalies(entries)
 
-    if args.anomalies:
-        problems = detect_anomalies(entries)
-        if problems:
-            print("\n[ANOMALIES]")
-            for p in problems:
-                print(f"  ! {p}")
-        else:
-            print("\n[ANOMALIES] None detected")
+    if not args.anomalies_only:
+        print_table(entries)
 
-    if args.csv:
-        write_csv(entries, args.csv)
+    print_anomalies(anomalies)
+
+    if args.csv_path:
+        export_csv(entries, args.csv_path)
 ```
