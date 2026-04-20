@@ -1,274 +1,228 @@
 ```python
-#!/usr/bin/env python3
 """
-SSH Key Deployment Tool for Network Devices
+ssh_key_deployer.py - Deploy SSH public keys to network devices for key-based authentication.
 
 Purpose:
-    Deploys SSH public keys to network devices to enable key-based
-    authentication, reducing reliance on password-based logins.
-    Connects initially via password auth, then installs the provided
-    public key into the device's authorized keys or local key store.
+    Automates the deployment of SSH public keys to Cisco IOS/IOS-XE/NX-OS devices,
+    enabling passwordless authentication. Reads an existing public key file and
+    configures it on target devices via paramiko using initial password auth.
 
 Usage:
-    python ssh_key_deploy.py -d 192.168.1.1 -u admin -p secret \
-        -k ~/.ssh/id_rsa.pub --device-type ios
-
-    python ssh_key_deploy.py -d 192.168.1.1 -u admin \
-        --ask-pass -k ~/.ssh/id_rsa.pub --verify
+    python ssh_key_deployer.py -d 192.168.1.1 -u admin -p secret --key ~/.ssh/id_rsa.pub
+    python ssh_key_deployer.py --hosts hosts.txt -u admin --key ~/.ssh/id_rsa.pub --verify
+    python ssh_key_deployer.py -d 10.0.0.1 -u admin -p secret --key ~/.ssh/id_rsa.pub --dry-run
 
 Prerequisites:
     - pip install paramiko
-    - SSH access to target device with password credentials
-    - A generated RSA/ECDSA public key (ssh-keygen)
-    - Device must support SSH key authentication (IOS 15.4+, EOS, NX-OS)
+    - SSH access to target devices with password authentication enabled
+    - Devices must support crypto key import (IOS 12.3+, NX-OS 5.x+)
+    - RSA or ECDSA public key in OpenSSH format
 """
 
 import argparse
-import getpass
+import base64
 import logging
 import sys
 import time
+from pathlib import Path
 
 import paramiko
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s %(levelname)-8s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-DEPLOY_COMMANDS = {
-    "ios": [
-        "ip ssh pubkey-chain",
-        "username {username}",
-        "key-string",
-        "{key_body}",
-        "exit",
-        "exit",
-    ],
-    "eos": [
-        "enable",
-        "configure terminal",
-        "management ssh",
-        "no shutdown",
-        "exit",
-    ],
-    "nxos": [
-        "configure terminal",
-        "username {username} sshkey {pub_key}",
-        "end",
-        "copy running-config startup-config",
-    ],
-    "linux": [],
-}
+
+def load_public_key(key_path: str) -> tuple[str, str]:
+    path = Path(key_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"Public key not found: {path}")
+    raw = path.read_text().strip()
+    parts = raw.split()
+    if len(parts) < 2:
+        raise ValueError(f"Invalid public key format in {path}")
+    key_type, key_data = parts[0], parts[1]
+    return key_type, key_data
 
 
-def load_public_key(path: str) -> str:
-    try:
-        with open(path, "r") as f:
-            key_data = f.read().strip()
-        if not key_data.startswith(("ssh-rsa", "ssh-ed25519", "ecdsa-sha2")):
-            raise ValueError("File does not appear to be a valid SSH public key")
-        return key_data
-    except FileNotFoundError:
-        log.error("Public key file not found: %s", path)
-        sys.exit(1)
-    except ValueError as exc:
-        log.error("Invalid public key: %s", exc)
-        sys.exit(1)
-
-
-def connect(host: str, port: int, username: str, password: str,
-            timeout: int = 15) -> paramiko.SSHClient:
+def connect(host: str, username: str, password: str, port: int = 22) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(
-            hostname=host,
-            port=port,
-            username=username,
-            password=password,
-            timeout=timeout,
-            allow_agent=False,
-            look_for_keys=False,
-        )
-        log.info("Connected to %s:%d as %s", host, port, username)
-        return client
-    except paramiko.AuthenticationException:
-        log.error("Authentication failed for %s@%s", username, host)
-        sys.exit(1)
-    except paramiko.SSHException as exc:
-        log.error("SSH negotiation failed: %s", exc)
-        sys.exit(1)
-    except OSError as exc:
-        log.error("Connection to %s failed: %s", host, exc)
-        sys.exit(1)
-
-
-def run_interactive(client: paramiko.SSHClient, commands: list,
-                    prompt_timeout: float = 3.0) -> str:
-    shell = client.invoke_shell(width=200, height=50)
-    time.sleep(1.0)
-    shell.recv(65535)
-
-    output_parts = []
-    for cmd in commands:
-        shell.send(cmd + "\n")
-        time.sleep(prompt_timeout)
-        if shell.recv_ready():
-            chunk = shell.recv(65535).decode("utf-8", errors="replace")
-            output_parts.append(chunk)
-
-    shell.close()
-    return "\n".join(output_parts)
-
-
-def deploy_ios(client: paramiko.SSHClient, username: str, pub_key: str) -> bool:
-    key_type, key_body = pub_key.split(" ", 2)[:2]
-    chunk_size = 72
-    key_chunks = [key_body[i:i + chunk_size]
-                  for i in range(0, len(key_body), chunk_size)]
-
-    commands = ["ip ssh pubkey-chain", f"username {username}", "key-string"]
-    commands.extend(key_chunks)
-    commands.extend(["exit", "exit", "end", "write memory"])
-
-    log.info("Deploying SSH public key for user '%s' (IOS mode)", username)
-    output = run_interactive(client, commands, prompt_timeout=2.0)
-    log.debug("Device output:\n%s", output)
-
-    if "Invalid" in output or "Error" in output:
-        log.error("Device reported an error during key deployment")
-        return False
-    return True
-
-
-def deploy_nxos(client: paramiko.SSHClient, username: str, pub_key: str) -> bool:
-    commands = [
-        "configure terminal",
-        f"username {username} sshkey {pub_key}",
-        "end",
-        "copy running-config startup-config",
-    ]
-    log.info("Deploying SSH public key for user '%s' (NX-OS mode)", username)
-    output = run_interactive(client, commands, prompt_timeout=3.0)
-    log.debug("Device output:\n%s", output)
-    return "Error" not in output
-
-
-def deploy_linux(client: paramiko.SSHClient, pub_key: str) -> bool:
-    setup_cmds = (
-        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && "
-        "touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+    client.connect(
+        hostname=host,
+        port=port,
+        username=username,
+        password=password,
+        timeout=15,
+        allow_agent=False,
+        look_for_keys=False,
     )
-    inject_cmd = f"echo '{pub_key}' >> ~/.ssh/authorized_keys"
-    dedup_cmd = "sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys"
+    return client
 
-    for cmd in (setup_cmds, inject_cmd, dedup_cmd):
-        stdin, stdout, stderr = client.exec_command(cmd)
-        exit_code = stdout.channel.recv_exit_status()
-        err = stderr.read().decode().strip()
-        if exit_code != 0:
-            log.error("Command failed (exit %d): %s — %s", exit_code, cmd, err)
+
+def send_command(shell, command: str, wait: float = 1.5) -> str:
+    shell.send(command + "\n")
+    time.sleep(wait)
+    output = ""
+    while shell.recv_ready():
+        output += shell.recv(4096).decode("utf-8", errors="replace")
+    return output
+
+
+def deploy_key_ios(shell, username: str, key_type: str, key_data: str, dry_run: bool) -> bool:
+    label = f"{username}-pubkey"
+    commands = [
+        f"ip ssh pubkey-chain",
+        f"username {username}",
+        f"key-string",
+    ]
+    chunk_size = 72
+    key_chunks = [key_data[i:i + chunk_size] for i in range(0, len(key_data), chunk_size)]
+    commands.extend(key_chunks)
+    commands.extend(["exit", "exit", "exit"])
+
+    if dry_run:
+        log.info("[DRY-RUN] Would send %d config lines for key label '%s'", len(commands), label)
+        return True
+
+    send_command(shell, "conf t", wait=0.5)
+    for cmd in commands:
+        out = send_command(shell, cmd, wait=0.3)
+        if "Invalid" in out or "Error" in out:
+            log.error("Device rejected command '%s': %s", cmd.strip(), out.strip())
+            send_command(shell, "end", wait=0.5)
             return False
-    log.info("SSH public key appended to ~/.ssh/authorized_keys")
+
+    send_command(shell, "end", wait=0.5)
     return True
 
 
-def verify_key_auth(host: str, port: int, username: str,
-                    key_path: str) -> bool:
-    private_key_path = key_path.replace(".pub", "")
-    try:
-        pkey = paramiko.RSAKey.from_private_key_file(private_key_path)
-    except (paramiko.SSHException, FileNotFoundError):
-        try:
-            pkey = paramiko.Ed25519Key.from_private_key_file(private_key_path)
-        except Exception:
-            log.warning("Could not load private key for verification; skipping")
-            return False
+def verify_key_ios(shell, username: str) -> bool:
+    out = send_command(shell, f"show ip ssh", wait=1.0)
+    out += send_command(shell, f"show run | section ip ssh pubkey-chain", wait=1.5)
+    return username in out
 
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+def deploy_to_device(
+    host: str,
+    username: str,
+    password: str,
+    key_type: str,
+    key_data: str,
+    port: int = 22,
+    dry_run: bool = False,
+    verify: bool = False,
+) -> dict:
+    result = {"host": host, "status": "unknown", "message": ""}
+
     try:
-        client.connect(hostname=host, port=port, username=username,
-                       pkey=pkey, timeout=10, allow_agent=False,
-                       look_for_keys=False)
+        log.info("Connecting to %s:%d", host, port)
+        client = connect(host, username, password, port)
+        shell = client.invoke_shell(width=200, height=50)
+        time.sleep(1.0)
+        shell.recv(4096)
+
+        deployed = deploy_key_ios(shell, username, key_type, key_data, dry_run)
+
+        if not deployed:
+            result["status"] = "failed"
+            result["message"] = "Key deployment commands rejected by device"
+        elif dry_run:
+            result["status"] = "dry-run"
+            result["message"] = "Dry run completed, no changes made"
+        elif verify:
+            confirmed = verify_key_ios(shell, username)
+            result["status"] = "verified" if confirmed else "unverified"
+            result["message"] = (
+                "Key confirmed in running config"
+                if confirmed
+                else "Could not confirm key in running config"
+            )
+        else:
+            result["status"] = "deployed"
+            result["message"] = "Key deployment commands sent successfully"
+
         client.close()
-        log.info("Verification successful — key-based auth works for %s@%s",
-                 username, host)
-        return True
+
     except paramiko.AuthenticationException:
-        log.error("Verification failed — key auth not accepted by device")
-        return False
-    except Exception as exc:
-        log.warning("Verification connection error: %s", exc)
-        return False
+        result["status"] = "auth-failed"
+        result["message"] = "Authentication failed — check credentials"
+    except paramiko.SSHException as exc:
+        result["status"] = "ssh-error"
+        result["message"] = str(exc)
+    except OSError as exc:
+        result["status"] = "unreachable"
+        result["message"] = str(exc)
+
+    icon = {"deployed": "OK", "verified": "OK", "dry-run": "--"}.get(result["status"], "FAIL")
+    log.info("[%s] %s — %s: %s", icon, host, result["status"], result["message"])
+    return result
 
 
-def parse_args():
+def parse_hosts_file(path: str) -> list[str]:
+    lines = Path(path).read_text().splitlines()
+    return [ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")]
+
+
+def main():
     parser = argparse.ArgumentParser(
         description="Deploy SSH public keys to network devices"
     )
-    parser.add_argument("-d", "--device", required=True,
-                        help="Device IP or hostname")
-    parser.add_argument("-u", "--username", required=True,
-                        help="Login username")
-    parser.add_argument("-p", "--password", default=None,
-                        help="Login password (prompted if omitted)")
-    parser.add_argument("--ask-pass", action="store_true",
-                        help="Prompt for password interactively")
-    parser.add_argument("-k", "--key-file", required=True,
-                        help="Path to SSH public key file (.pub)")
-    parser.add_argument("--device-type",
-                        choices=["ios", "nxos", "linux"],
-                        default="ios",
-                        help="Target device OS type (default: ios)")
-    parser.add_argument("--port", type=int, default=22,
-                        help="SSH port (default: 22)")
-    parser.add_argument("--verify", action="store_true",
-                        help="Verify key auth works after deployment")
-    parser.add_argument("--debug", action="store_true",
-                        help="Enable debug logging")
-    return parser.parse_args()
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-d", "--device", help="Single device IP or hostname")
+    group.add_argument("--hosts", metavar="FILE", help="File with one host per line")
+
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    parser.add_argument("--key", required=True, metavar="PUB_KEY", help="Path to public key file")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--verify", action="store_true", help="Verify key appears in running config")
+    parser.add_argument("--dry-run", action="store_true", help="Show commands without applying")
+    parser.add_argument("--debug", action="store_true", help="Enable paramiko debug logging")
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger("paramiko").setLevel(logging.DEBUG)
+
+    if args.password is None:
+        import getpass
+        args.password = getpass.getpass(f"Password for {args.username}: ")
+
+    try:
+        key_type, key_data = load_public_key(args.key)
+        log.info("Loaded %s public key from %s", key_type, args.key)
+    except (FileNotFoundError, ValueError) as exc:
+        log.error("%s", exc)
+        sys.exit(1)
+
+    hosts = [args.device] if args.device else parse_hosts_file(args.hosts)
+    if not hosts:
+        log.error("No hosts to process")
+        sys.exit(1)
+
+    results = []
+    for host in hosts:
+        r = deploy_to_device(
+            host=host,
+            username=args.username,
+            password=args.password,
+            key_type=key_type,
+            key_data=key_data,
+            port=args.port,
+            dry_run=args.dry_run,
+            verify=args.verify,
+        )
+        results.append(r)
+
+    ok = sum(1 for r in results if r["status"] in ("deployed", "verified", "dry-run"))
+    fail = len(results) - ok
+    log.info("Summary: %d/%d succeeded, %d failed", ok, len(results), fail)
+    sys.exit(0 if fail == 0 else 1)
 
 
 if __name__ == "__main__":
-    args = parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    password = args.password
-    if args.ask_pass or not password:
-        password = getpass.getpass(f"Password for {args.username}@{args.device}: ")
-
-    pub_key = load_public_key(args.key_file)
-    log.info("Loaded public key from %s", args.key_file)
-
-    client = connect(args.device, args.port, args.username, password)
-
-    try:
-        if args.device_type == "ios":
-            success = deploy_ios(client, args.username, pub_key)
-        elif args.device_type == "nxos":
-            success = deploy_nxos(client, args.username, pub_key)
-        elif args.device_type == "linux":
-            success = deploy_linux(client, pub_key)
-        else:
-            log.error("Unsupported device type: %s", args.device_type)
-            sys.exit(1)
-    finally:
-        client.close()
-
-    if not success:
-        log.error("Key deployment failed")
-        sys.exit(1)
-
-    log.info("SSH public key deployed successfully to %s", args.device)
-
-    if args.verify:
-        verified = verify_key_auth(args.device, args.port,
-                                   args.username, args.key_file)
-        sys.exit(0 if verified else 1)
+    main()
 ```
