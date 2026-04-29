@@ -1,226 +1,213 @@
 ```python
+#!/usr/bin/env python3
 """
-ssh_key_deployer.py - Deploy SSH public keys to network devices for key-based authentication.
+Encrypted Network Device Credential Vault Manager
 
-Purpose:
-    Automates the deployment of SSH public keys to Cisco IOS/IOS-XE/NX-OS devices,
-    enabling passwordless authentication. Reads an existing public key file and
-    configures it on target devices via paramiko using initial password auth.
+Securely stores and manages SSH credentials for network devices using AES-256
+encryption. Provides CLI interface to add, list, retrieve, delete, and test
+credentials against live devices using paramiko.
 
 Usage:
-    python ssh_key_deployer.py -d 192.168.1.1 -u admin -p secret --key ~/.ssh/id_rsa.pub
-    python ssh_key_deployer.py --hosts hosts.txt -u admin --key ~/.ssh/id_rsa.pub --verify
-    python ssh_key_deployer.py -d 10.0.0.1 -u admin -p secret --key ~/.ssh/id_rsa.pub --dry-run
+    python credential_vault_manager.py add --device router1 --host 10.0.1.1 \\
+        --username admin --password secret123
+    python credential_vault_manager.py list
+    python credential_vault_manager.py get --device router1
+    python credential_vault_manager.py test --device router1
+    python credential_vault_manager.py delete --device router1
 
 Prerequisites:
-    - pip install paramiko
-    - SSH access to target devices with password authentication enabled
-    - Devices must support crypto key import (IOS 12.3+, NX-OS 5.x+)
-    - RSA or ECDSA public key in OpenSSH format
+    pip install paramiko cryptography
+
+The vault is stored encrypted at ./credentials.vault (binary format).
 """
 
 import argparse
-import base64
+import json
 import logging
 import sys
-import time
 from pathlib import Path
 
 import paramiko
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-def load_public_key(key_path: str) -> tuple[str, str]:
-    path = Path(key_path).expanduser()
-    if not path.exists():
-        raise FileNotFoundError(f"Public key not found: {path}")
-    raw = path.read_text().strip()
-    parts = raw.split()
-    if len(parts) < 2:
-        raise ValueError(f"Invalid public key format in {path}")
-    key_type, key_data = parts[0], parts[1]
-    return key_type, key_data
+class CredentialVault:
+    """Manages encrypted network device credentials."""
 
+    def __init__(self, vault_path="credentials.vault", password="default"):
+        self.vault_path = Path(vault_path)
+        self.cipher = self._derive_cipher(password)
+        self.credentials = self._load_vault()
 
-def connect(host: str, username: str, password: str, port: int = 22) -> paramiko.SSHClient:
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=host,
-        port=port,
-        username=username,
-        password=password,
-        timeout=15,
-        allow_agent=False,
-        look_for_keys=False,
-    )
-    return client
+    def _derive_cipher(self, password):
+        """Derive Fernet cipher from master password."""
+        salt = b"netauto_vault_salt"
+        kdf = PBKDF2(
+            algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000
+        )
+        key = kdf.derive(password.encode())
+        return Fernet(Fernet.generate_key().replace(Fernet.generate_key()[:32], key[:32] + b"=" * 2))
 
+    def _derive_cipher(self, password):
+        """Derive Fernet cipher from master password using PBKDF2."""
+        import base64
 
-def send_command(shell, command: str, wait: float = 1.5) -> str:
-    shell.send(command + "\n")
-    time.sleep(wait)
-    output = ""
-    while shell.recv_ready():
-        output += shell.recv(4096).decode("utf-8", errors="replace")
-    return output
+        salt = b"netauto_vault_salt"
+        kdf = PBKDF2(
+            algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000
+        )
+        key = kdf.derive(password.encode())
+        key_b64 = base64.urlsafe_b64encode(key)
+        return Fernet(key_b64)
 
+    def _load_vault(self):
+        """Load and decrypt credentials from vault file."""
+        if not self.vault_path.exists():
+            return {}
+        try:
+            encrypted = self.vault_path.read_bytes()
+            decrypted = self.cipher.decrypt(encrypted)
+            return json.loads(decrypted.decode())
+        except Exception as e:
+            logger.error(f"Failed to decrypt vault: {e}")
+            return {}
 
-def deploy_key_ios(shell, username: str, key_type: str, key_data: str, dry_run: bool) -> bool:
-    label = f"{username}-pubkey"
-    commands = [
-        f"ip ssh pubkey-chain",
-        f"username {username}",
-        f"key-string",
-    ]
-    chunk_size = 72
-    key_chunks = [key_data[i:i + chunk_size] for i in range(0, len(key_data), chunk_size)]
-    commands.extend(key_chunks)
-    commands.extend(["exit", "exit", "exit"])
+    def _save_vault(self):
+        """Encrypt and save credentials to vault file."""
+        try:
+            plaintext = json.dumps(self.credentials, indent=2).encode()
+            encrypted = self.cipher.encrypt(plaintext)
+            self.vault_path.write_bytes(encrypted)
+            logger.info(f"Vault saved to {self.vault_path}")
+        except Exception as e:
+            logger.error(f"Failed to save vault: {e}")
 
-    if dry_run:
-        log.info("[DRY-RUN] Would send %d config lines for key label '%s'", len(commands), label)
-        return True
+    def add_credential(self, device, host, username, password, port=22):
+        """Add or update device credential."""
+        self.credentials[device] = {
+            "host": host,
+            "username": username,
+            "password": password,
+            "port": port,
+        }
+        self._save_vault()
+        logger.info(f"Credential added for device '{device}'")
 
-    send_command(shell, "conf t", wait=0.5)
-    for cmd in commands:
-        out = send_command(shell, cmd, wait=0.3)
-        if "Invalid" in out or "Error" in out:
-            log.error("Device rejected command '%s': %s", cmd.strip(), out.strip())
-            send_command(shell, "end", wait=0.5)
+    def get_credential(self, device):
+        """Retrieve credential for a device."""
+        if device not in self.credentials:
+            logger.error(f"Device '{device}' not found in vault")
+            return None
+        return self.credentials[device]
+
+    def list_devices(self):
+        """List all devices in vault (without passwords)."""
+        if not self.credentials:
+            logger.info("Vault is empty")
+            return
+        for device, cred in self.credentials.items():
+            print(f"  {device}: {cred['username']}@{cred['host']}:{cred['port']}")
+
+    def delete_credential(self, device):
+        """Delete credential for a device."""
+        if device in self.credentials:
+            del self.credentials[device]
+            self._save_vault()
+            logger.info(f"Credential deleted for device '{device}'")
+        else:
+            logger.error(f"Device '{device}' not found")
+
+    def test_credential(self, device, timeout=5):
+        """Test SSH connectivity with stored credential."""
+        cred = self.get_credential(device)
+        if not cred:
             return False
 
-    send_command(shell, "end", wait=0.5)
-    return True
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-
-def verify_key_ios(shell, username: str) -> bool:
-    out = send_command(shell, f"show ip ssh", wait=1.0)
-    out += send_command(shell, f"show run | section ip ssh pubkey-chain", wait=1.5)
-    return username in out
-
-
-def deploy_to_device(
-    host: str,
-    username: str,
-    password: str,
-    key_type: str,
-    key_data: str,
-    port: int = 22,
-    dry_run: bool = False,
-    verify: bool = False,
-) -> dict:
-    result = {"host": host, "status": "unknown", "message": ""}
-
-    try:
-        log.info("Connecting to %s:%d", host, port)
-        client = connect(host, username, password, port)
-        shell = client.invoke_shell(width=200, height=50)
-        time.sleep(1.0)
-        shell.recv(4096)
-
-        deployed = deploy_key_ios(shell, username, key_type, key_data, dry_run)
-
-        if not deployed:
-            result["status"] = "failed"
-            result["message"] = "Key deployment commands rejected by device"
-        elif dry_run:
-            result["status"] = "dry-run"
-            result["message"] = "Dry run completed, no changes made"
-        elif verify:
-            confirmed = verify_key_ios(shell, username)
-            result["status"] = "verified" if confirmed else "unverified"
-            result["message"] = (
-                "Key confirmed in running config"
-                if confirmed
-                else "Could not confirm key in running config"
+        try:
+            ssh.connect(
+                hostname=cred["host"],
+                port=cred["port"],
+                username=cred["username"],
+                password=cred["password"],
+                timeout=timeout,
+                look_for_keys=False,
+                allow_agent=False,
             )
-        else:
-            result["status"] = "deployed"
-            result["message"] = "Key deployment commands sent successfully"
-
-        client.close()
-
-    except paramiko.AuthenticationException:
-        result["status"] = "auth-failed"
-        result["message"] = "Authentication failed — check credentials"
-    except paramiko.SSHException as exc:
-        result["status"] = "ssh-error"
-        result["message"] = str(exc)
-    except OSError as exc:
-        result["status"] = "unreachable"
-        result["message"] = str(exc)
-
-    icon = {"deployed": "OK", "verified": "OK", "dry-run": "--"}.get(result["status"], "FAIL")
-    log.info("[%s] %s — %s: %s", icon, host, result["status"], result["message"])
-    return result
-
-
-def parse_hosts_file(path: str) -> list[str]:
-    lines = Path(path).read_text().splitlines()
-    return [ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")]
+            ssh.exec_command("show version")
+            ssh.close()
+            logger.info(f"✓ Connection successful for '{device}'")
+            return True
+        except paramiko.AuthenticationException:
+            logger.error(f"✗ Authentication failed for '{device}'")
+            return False
+        except paramiko.SSHException as e:
+            logger.error(f"✗ SSH error for '{device}': {e}")
+            return False
+        except Exception as e:
+            logger.error(f"✗ Connection failed for '{device}': {e}")
+            return False
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Deploy SSH public keys to network devices"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--vault-password",
+        default="default",
+        help="Master password for vault (default: 'default')",
     )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("-d", "--device", help="Single device IP or hostname")
-    group.add_argument("--hosts", metavar="FILE", help="File with one host per line")
+    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
 
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
-    parser.add_argument("--key", required=True, metavar="PUB_KEY", help="Path to public key file")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--verify", action="store_true", help="Verify key appears in running config")
-    parser.add_argument("--dry-run", action="store_true", help="Show commands without applying")
-    parser.add_argument("--debug", action="store_true", help="Enable paramiko debug logging")
+    add_parser = subparsers.add_parser("add", help="Add device credential")
+    add_parser.add_argument("--device", required=True, help="Device name")
+    add_parser.add_argument("--host", required=True, help="Host IP or FQDN")
+    add_parser.add_argument("--username", required=True, help="SSH username")
+    add_parser.add_argument("--password", required=True, help="SSH password")
+    add_parser.add_argument("--port", type=int, default=22, help="SSH port")
+
+    get_parser = subparsers.add_parser("get", help="Retrieve device credential")
+    get_parser.add_argument("--device", required=True, help="Device name")
+
+    list_parser = subparsers.add_parser("list", help="List all devices")
+
+    delete_parser = subparsers.add_parser("delete", help="Delete device credential")
+    delete_parser.add_argument("--device", required=True, help="Device name")
+
+    test_parser = subparsers.add_parser("test", help="Test device connectivity")
+    test_parser.add_argument("--device", required=True, help="Device name")
+    test_parser.add_argument("--timeout", type=int, default=5, help="Connection timeout")
+
     args = parser.parse_args()
 
-    if args.debug:
-        logging.getLogger("paramiko").setLevel(logging.DEBUG)
+    if not args.command:
+        parser.print_help()
+        return
 
-    if args.password is None:
-        import getpass
-        args.password = getpass.getpass(f"Password for {args.username}: ")
+    vault = CredentialVault(password=args.vault_password)
 
-    try:
-        key_type, key_data = load_public_key(args.key)
-        log.info("Loaded %s public key from %s", key_type, args.key)
-    except (FileNotFoundError, ValueError) as exc:
-        log.error("%s", exc)
-        sys.exit(1)
-
-    hosts = [args.device] if args.device else parse_hosts_file(args.hosts)
-    if not hosts:
-        log.error("No hosts to process")
-        sys.exit(1)
-
-    results = []
-    for host in hosts:
-        r = deploy_to_device(
-            host=host,
-            username=args.username,
-            password=args.password,
-            key_type=key_type,
-            key_data=key_data,
-            port=args.port,
-            dry_run=args.dry_run,
-            verify=args.verify,
+    if args.command == "add":
+        vault.add_credential(
+            args.device, args.host, args.username, args.password, args.port
         )
-        results.append(r)
-
-    ok = sum(1 for r in results if r["status"] in ("deployed", "verified", "dry-run"))
-    fail = len(results) - ok
-    log.info("Summary: %d/%d succeeded, %d failed", ok, len(results), fail)
-    sys.exit(0 if fail == 0 else 1)
+    elif args.command == "get":
+        cred = vault.get_credential(args.device)
+        if cred:
+            print(json.dumps(cred, indent=2))
+    elif args.command == "list":
+        vault.list_devices()
+    elif args.command == "delete":
+        vault.delete_credential(args.device)
+    elif args.command == "test":
+        vault.test_credential(args.device, args.timeout)
 
 
 if __name__ == "__main__":
