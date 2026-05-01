@@ -1,213 +1,192 @@
 ```python
-#!/usr/bin/env python3
 """
-Encrypted Network Device Credential Vault Manager
+vlan_audit.py — VLAN membership and trunk audit via SSH (Cisco IOS/IOS-XE)
 
-Securely stores and manages SSH credentials for network devices using AES-256
-encryption. Provides CLI interface to add, list, retrieve, delete, and test
-credentials against live devices using paramiko.
+Purpose:
+    Collects VLAN database, port assignments, and trunk links from a Cisco
+    switch. Outputs a structured report to stdout and optionally to JSON.
 
 Usage:
-    python credential_vault_manager.py add --device router1 --host 10.0.1.1 \\
-        --username admin --password secret123
-    python credential_vault_manager.py list
-    python credential_vault_manager.py get --device router1
-    python credential_vault_manager.py test --device router1
-    python credential_vault_manager.py delete --device router1
+    python vlan_audit.py -d 192.168.1.1 -u admin -p secret
+    python vlan_audit.py -d 192.168.1.1 -u admin --ask-pass --json-out vlans.json
 
 Prerequisites:
-    pip install paramiko cryptography
-
-The vault is stored encrypted at ./credentials.vault (binary format).
+    pip install paramiko
+    Target device must have SSH enabled and the user needs privilege level 1+.
 """
 
 import argparse
+import getpass
 import json
 import logging
+import re
 import sys
-from pathlib import Path
 
 import paramiko
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
 
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-class CredentialVault:
-    """Manages encrypted network device credentials."""
-
-    def __init__(self, vault_path="credentials.vault", password="default"):
-        self.vault_path = Path(vault_path)
-        self.cipher = self._derive_cipher(password)
-        self.credentials = self._load_vault()
-
-    def _derive_cipher(self, password):
-        """Derive Fernet cipher from master password."""
-        salt = b"netauto_vault_salt"
-        kdf = PBKDF2(
-            algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000
-        )
-        key = kdf.derive(password.encode())
-        return Fernet(Fernet.generate_key().replace(Fernet.generate_key()[:32], key[:32] + b"=" * 2))
-
-    def _derive_cipher(self, password):
-        """Derive Fernet cipher from master password using PBKDF2."""
-        import base64
-
-        salt = b"netauto_vault_salt"
-        kdf = PBKDF2(
-            algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000
-        )
-        key = kdf.derive(password.encode())
-        key_b64 = base64.urlsafe_b64encode(key)
-        return Fernet(key_b64)
-
-    def _load_vault(self):
-        """Load and decrypt credentials from vault file."""
-        if not self.vault_path.exists():
-            return {}
-        try:
-            encrypted = self.vault_path.read_bytes()
-            decrypted = self.cipher.decrypt(encrypted)
-            return json.loads(decrypted.decode())
-        except Exception as e:
-            logger.error(f"Failed to decrypt vault: {e}")
-            return {}
-
-    def _save_vault(self):
-        """Encrypt and save credentials to vault file."""
-        try:
-            plaintext = json.dumps(self.credentials, indent=2).encode()
-            encrypted = self.cipher.encrypt(plaintext)
-            self.vault_path.write_bytes(encrypted)
-            logger.info(f"Vault saved to {self.vault_path}")
-        except Exception as e:
-            logger.error(f"Failed to save vault: {e}")
-
-    def add_credential(self, device, host, username, password, port=22):
-        """Add or update device credential."""
-        self.credentials[device] = {
-            "host": host,
-            "username": username,
-            "password": password,
-            "port": port,
-        }
-        self._save_vault()
-        logger.info(f"Credential added for device '{device}'")
-
-    def get_credential(self, device):
-        """Retrieve credential for a device."""
-        if device not in self.credentials:
-            logger.error(f"Device '{device}' not found in vault")
-            return None
-        return self.credentials[device]
-
-    def list_devices(self):
-        """List all devices in vault (without passwords)."""
-        if not self.credentials:
-            logger.info("Vault is empty")
-            return
-        for device, cred in self.credentials.items():
-            print(f"  {device}: {cred['username']}@{cred['host']}:{cred['port']}")
-
-    def delete_credential(self, device):
-        """Delete credential for a device."""
-        if device in self.credentials:
-            del self.credentials[device]
-            self._save_vault()
-            logger.info(f"Credential deleted for device '{device}'")
-        else:
-            logger.error(f"Device '{device}' not found")
-
-    def test_credential(self, device, timeout=5):
-        """Test SSH connectivity with stored credential."""
-        cred = self.get_credential(device)
-        if not cred:
-            return False
-
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        try:
-            ssh.connect(
-                hostname=cred["host"],
-                port=cred["port"],
-                username=cred["username"],
-                password=cred["password"],
-                timeout=timeout,
-                look_for_keys=False,
-                allow_agent=False,
-            )
-            ssh.exec_command("show version")
-            ssh.close()
-            logger.info(f"✓ Connection successful for '{device}'")
-            return True
-        except paramiko.AuthenticationException:
-            logger.error(f"✗ Authentication failed for '{device}'")
-            return False
-        except paramiko.SSHException as e:
-            logger.error(f"✗ SSH error for '{device}': {e}")
-            return False
-        except Exception as e:
-            logger.error(f"✗ Connection failed for '{device}': {e}")
-            return False
+def ssh_exec(client: paramiko.SSHClient, command: str, timeout: int = 15) -> str:
+    _, stdout, stderr = client.exec_command(command, timeout=timeout)
+    output = stdout.read().decode(errors="replace")
+    err = stderr.read().decode(errors="replace").strip()
+    if err:
+        log.debug("stderr for '%s': %s", command, err)
+    return output
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--vault-password",
-        default="default",
-        help="Master password for vault (default: 'default')",
+def parse_vlan_brief(raw: str) -> dict:
+    """Return {vlan_id: {'name': str, 'status': str, 'ports': [str]}}."""
+    vlans = {}
+    current_id = None
+    for line in raw.splitlines():
+        m = re.match(r"^(\d+)\s+(\S+)\s+(active|act/unsup|suspended)\s*(.*)?$", line)
+        if m:
+            vid, name, status, ports_str = m.groups()
+            current_id = vid
+            vlans[vid] = {
+                "name": name,
+                "status": status,
+                "ports": [p.strip() for p in ports_str.split(",") if p.strip()],
+            }
+        elif current_id and re.match(r"^\s{10,}", line):
+            extra = [p.strip() for p in line.split(",") if p.strip()]
+            vlans[current_id]["ports"].extend(extra)
+    return vlans
+
+
+def parse_trunk_ports(raw: str) -> dict:
+    """Return {interface: {'mode': str, 'encap': str, 'native': str, 'vlans': str}}."""
+    trunks = {}
+    section = None
+    for line in raw.splitlines():
+        if re.match(r"^Port\s+Mode\s+Encapsulation", line):
+            section = "mode"
+            continue
+        if re.match(r"^Port\s+Vlans allowed on trunk", line):
+            section = "allowed"
+            continue
+        if re.match(r"^Port\s+Vlans allowed and active", line):
+            section = "active"
+            continue
+        if not line.strip() or line.startswith("-"):
+            continue
+        parts = line.split()
+        if not parts:
+            continue
+        iface = parts[0]
+        if section == "mode" and len(parts) >= 3:
+            trunks.setdefault(iface, {})
+            trunks[iface]["mode"] = parts[1]
+            trunks[iface]["encap"] = parts[2]
+            trunks[iface]["native"] = parts[4] if len(parts) > 4 else "1"
+        elif section == "allowed" and iface in trunks:
+            trunks[iface]["vlans_allowed"] = parts[1] if len(parts) > 1 else ""
+        elif section == "active" and iface in trunks:
+            trunks[iface]["vlans_active"] = parts[1] if len(parts) > 1 else ""
+    return trunks
+
+
+def build_client(host: str, port: int, username: str, password: str,
+                 timeout: int) -> paramiko.SSHClient:
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        hostname=host,
+        port=port,
+        username=username,
+        password=password,
+        timeout=timeout,
+        look_for_keys=False,
+        allow_agent=False,
     )
-    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
+    return client
 
-    add_parser = subparsers.add_parser("add", help="Add device credential")
-    add_parser.add_argument("--device", required=True, help="Device name")
-    add_parser.add_argument("--host", required=True, help="Host IP or FQDN")
-    add_parser.add_argument("--username", required=True, help="SSH username")
-    add_parser.add_argument("--password", required=True, help="SSH password")
-    add_parser.add_argument("--port", type=int, default=22, help="SSH port")
 
-    get_parser = subparsers.add_parser("get", help="Retrieve device credential")
-    get_parser.add_argument("--device", required=True, help="Device name")
+def print_report(vlans: dict, trunks: dict, host: str) -> None:
+    print(f"\n{'=' * 60}")
+    print(f"  VLAN Audit — {host}")
+    print(f"{'=' * 60}")
+    print(f"\n{'ID':<8}{'Name':<24}{'Status':<14}Ports")
+    print("-" * 60)
+    for vid in sorted(vlans, key=lambda x: int(x)):
+        v = vlans[vid]
+        ports = ", ".join(v["ports"]) or "(none)"
+        print(f"{vid:<8}{v['name']:<24}{v['status']:<14}{ports}")
 
-    list_parser = subparsers.add_parser("list", help="List all devices")
+    if trunks:
+        print(f"\n{'Trunk Interfaces':^60}")
+        print("-" * 60)
+        print(f"{'Interface':<18}{'Mode':<12}{'Native':<10}Active VLANs")
+        print("-" * 60)
+        for iface, t in sorted(trunks.items()):
+            active = t.get("vlans_active", t.get("vlans_allowed", ""))
+            print(f"{iface:<18}{t.get('mode',''):<12}{t.get('native',''):<10}{active}")
+    print()
 
-    delete_parser = subparsers.add_parser("delete", help="Delete device credential")
-    delete_parser.add_argument("--device", required=True, help="Device name")
 
-    test_parser = subparsers.add_parser("test", help="Test device connectivity")
-    test_parser.add_argument("--device", required=True, help="Device name")
-    test_parser.add_argument("--timeout", type=int, default=5, help="Connection timeout")
-
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Audit VLANs and trunk ports on a Cisco switch via SSH."
+    )
+    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", default=None, help="SSH password")
+    parser.add_argument("--ask-pass", action="store_true", help="Prompt for password")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default 22)")
+    parser.add_argument("--timeout", type=int, default=15, help="Connection timeout")
+    parser.add_argument("--json-out", metavar="FILE", help="Write results to JSON file")
+    parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
-    if not args.command:
-        parser.print_help()
-        return
+    if args.verbose:
+        log.setLevel(logging.DEBUG)
 
-    vault = CredentialVault(password=args.vault_password)
+    password = args.password
+    if args.ask_pass or not password:
+        password = getpass.getpass(f"Password for {args.username}@{args.device}: ")
 
-    if args.command == "add":
-        vault.add_credential(
-            args.device, args.host, args.username, args.password, args.port
-        )
-    elif args.command == "get":
-        cred = vault.get_credential(args.device)
-        if cred:
-            print(json.dumps(cred, indent=2))
-    elif args.command == "list":
-        vault.list_devices()
-    elif args.command == "delete":
-        vault.delete_credential(args.device)
-    elif args.command == "test":
-        vault.test_credential(args.device, args.timeout)
+    try:
+        log.info("Connecting to %s:%d", args.device, args.port)
+        client = build_client(args.device, args.port, args.username, password,
+                               args.timeout)
+    except paramiko.AuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.device)
+        sys.exit(1)
+    except Exception as exc:
+        log.error("Connection error: %s", exc)
+        sys.exit(1)
+
+    try:
+        log.info("Collecting VLAN data")
+        raw_vlans = ssh_exec(client, "show vlan brief", args.timeout)
+        raw_trunks = ssh_exec(client, "show interfaces trunk", args.timeout)
+    except Exception as exc:
+        log.error("Command execution failed: %s", exc)
+        client.close()
+        sys.exit(1)
+    finally:
+        client.close()
+
+    vlans = parse_vlan_brief(raw_vlans)
+    trunks = parse_trunk_ports(raw_trunks)
+
+    if not vlans:
+        log.warning("No VLANs parsed — output may be in an unexpected format")
+
+    print_report(vlans, trunks, args.device)
+
+    if args.json_out:
+        payload = {"device": args.device, "vlans": vlans, "trunks": trunks}
+        with open(args.json_out, "w") as fh:
+            json.dump(payload, fh, indent=2)
+        log.info("Results written to %s", args.json_out)
 
 
 if __name__ == "__main__":
