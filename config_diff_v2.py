@@ -1,252 +1,180 @@
 ```python
-#!/usr/bin/env python3
 """
-Configuration Rollback Safety Validator
+running_vs_startup_diff.py — Compare running-config against startup-config on
+a Cisco IOS/IOS-XE device via SSH and report unsaved changes.
 
-Compares device running configuration against a baseline backup, identifies
-changes, and validates rollback safety before applying changes. Useful for
-preventing configuration drift and ensuring emergency rollback procedures work.
+Purpose:
+    Operators routinely make live changes without saving them. Any unsaved
+    change is lost on reload. This script SSHes to a device, fetches both
+    configs, and prints a unified diff — making it safe to schedule as a
+    cron check or wire into a monitoring pipeline.
 
 Usage:
-    python config_rollback_validator.py --device 192.168.1.1 --username admin \
-        --password pass --baseline-file backup.conf
-
-    python config_rollback_validator.py -d 10.0.0.5 -u admin -p pass \
-        --baseline-file baseline.conf --generate-rollback
+    python running_vs_startup_diff.py -H 192.168.1.1 -u admin
+    python running_vs_startup_diff.py -H 10.0.0.1 -u admin -p secret -n 5
+    python running_vs_startup_diff.py -H 192.168.1.1 -u admin -k ~/.ssh/id_rsa --exit-code
 
 Prerequisites:
-    - paramiko >= 2.11.0
-    - Python 3.7+
-    - SSH access to target device
-    - Read access to running-config and ability to write files
-    - Baseline configuration file from previous backup
-
-Returns:
-    0 - Configuration matches baseline
-    1 - Configuration differs from baseline or validation failed
-    2 - Connection or file error
+    pip install paramiko
+    SSH enabled on the device; user must have privilege level >= 1.
+    IOS devices: 'ip ssh version 2' recommended.
 """
 
 import argparse
-import logging
-import paramiko
-import sys
 import difflib
-from pathlib import Path
+import getpass
+import logging
+import sys
+import time
+
+import paramiko
 
 logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-class ConfigRollbackValidator:
-    """Validates configuration rollback safety."""
+def read_until_prompt(channel, timeout=45):
+    """Accumulate channel output until a device prompt (ends with '#') appears."""
+    buf = ""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if channel.recv_ready():
+            buf += channel.recv(131072).decode("utf-8", errors="replace")
+            last = buf.rstrip().splitlines()
+            if last and last[-1].rstrip().endswith("#"):
+                break
+        else:
+            time.sleep(0.05)
+    return buf
 
-    def __init__(self, host, username, password, timeout=15):
-        """Initialize SSH connection."""
-        self.host = host
-        self.username = username
-        self.timeout = timeout
-        self.client = paramiko.SSHClient()
-        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        
-        try:
-            self.client.connect(
-                self.host,
-                username=self.username,
-                password=password,
-                timeout=self.timeout,
-                look_for_keys=False,
-                allow_agent=False
-            )
-            logger.info(f"Connected to {self.host}")
-        except Exception as e:
-            logger.error(f"SSH connection failed: {e}")
-            raise
 
-    def get_running_config(self):
-        """Retrieve running configuration from device."""
-        try:
-            stdin, stdout, stderr = self.client.exec_command(
-                "show running-config",
-                timeout=self.timeout
-            )
-            config = stdout.read().decode('utf-8', errors='ignore')
-            logger.info(f"Retrieved {len(config)} bytes of running configuration")
-            return config
-        except Exception as e:
-            logger.error(f"Failed to retrieve running config: {e}")
-            return None
+def clean_output(raw, command):
+    """Strip echoed command and trailing prompt; return config body lines."""
+    lines = raw.splitlines()
+    start = 0
+    for i, line in enumerate(lines):
+        if command.split()[-1] in line:
+            start = i + 1
+            break
+    while start < len(lines) and not lines[start].strip():
+        start += 1
+    end = len(lines)
+    while end > start and (not lines[end - 1].strip() or lines[end - 1].rstrip().endswith("#")):
+        end -= 1
+    return lines[start:end]
 
-    def load_baseline_config(self, filepath):
-        """Load baseline configuration from file."""
-        try:
-            with open(filepath, 'r') as f:
-                config = f.read()
-            logger.info(f"Loaded baseline config from {filepath}")
-            return config
-        except FileNotFoundError:
-            logger.error(f"Baseline file not found: {filepath}")
-            return None
-        except Exception as e:
-            logger.error(f"Error reading baseline file: {e}")
-            return None
 
-    def compare_configs(self, current, baseline):
-        """Compare running config with baseline."""
-        current_lines = current.splitlines(keepends=True)
-        baseline_lines = baseline.splitlines(keepends=True)
-        
-        diff = list(difflib.unified_diff(
-            baseline_lines,
-            current_lines,
-            fromfile='Baseline',
-            tofile='Running Config',
-            lineterm=''
-        ))
-        
-        return diff
+def fetch_both_configs(client):
+    channel = client.invoke_shell(width=250, height=50)
+    time.sleep(1)
+    channel.recv(131072)  # drain login banner
 
-    def identify_critical_removals(self, diff):
-        """Identify if critical configuration lines were removed."""
-        critical_keywords = [
-            'ip address',
-            'router ospf',
-            'router bgp',
-            'vlan',
-            'spanning-tree',
-            'access-list',
-            'route-map'
-        ]
-        
-        removals = []
-        for line in diff:
-            if line.startswith('-') and not line.startswith('---'):
-                for keyword in critical_keywords:
-                    if keyword in line.lower():
-                        removals.append(line.strip())
-        
-        return removals
+    channel.send("terminal length 0\n")
+    read_until_prompt(channel, timeout=10)
 
-    def generate_rollback_commands(self, diff, device_type='cisco'):
-        """Generate rollback commands from diff."""
-        rollback_commands = []
-        
-        for line in diff:
-            if line.startswith('+') and not line.startswith('+++'):
-                config_line = line[1:].strip()
-                if config_line:
-                    rollback_commands.append(f"no {config_line}")
-            elif line.startswith('-') and not line.startswith('---'):
-                config_line = line[1:].strip()
-                if config_line:
-                    rollback_commands.append(config_line)
-        
-        return rollback_commands
+    log.info("Fetching running-config")
+    channel.send("show running-config\n")
+    running_raw = read_until_prompt(channel)
 
-    def save_diff_report(self, diff, filename):
-        """Save diff report to file."""
-        try:
-            with open(filename, 'w') as f:
-                f.writelines(diff)
-            logger.info(f"Diff report saved to {filename}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to save diff report: {e}")
-            return False
+    log.info("Fetching startup-config")
+    channel.send("show startup-config\n")
+    startup_raw = read_until_prompt(channel)
 
-    def validate_rollback_safety(self, current_config, baseline_config):
-        """Validate that rollback is safe."""
-        diff = self.compare_configs(current_config, baseline_config)
-        critical_removals = self.identify_critical_removals(diff)
-        
-        if not diff:
-            logger.info("Configuration matches baseline exactly")
-            return True, "No changes detected", []
-        
-        if critical_removals:
-            logger.warning(f"Found {len(critical_removals)} critical removals")
-            for removal in critical_removals:
-                logger.warning(f"  Critical removal: {removal}")
-            return False, f"Critical configuration removed: {critical_removals}", diff
-        
-        logger.info(f"Configuration differs from baseline ({len(diff)} diff lines)")
-        return True, "Configuration differs but safe to rollback", diff
+    channel.close()
+    return (
+        clean_output(running_raw, "show running-config"),
+        clean_output(startup_raw, "show startup-config"),
+    )
 
-    def close(self):
-        """Close SSH connection."""
-        self.client.close()
+
+def connect(host, port, username, password, key_path):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    kwargs = {
+        "hostname": host,
+        "port": port,
+        "username": username,
+        "timeout": 15,
+        "look_for_keys": bool(key_path),
+        "allow_agent": False,
+    }
+    if key_path:
+        kwargs["key_filename"] = key_path
+    else:
+        kwargs["password"] = password
+    try:
+        client.connect(**kwargs)
+    except paramiko.AuthenticationException:
+        log.error("Authentication failed for %s@%s", username, host)
+        sys.exit(2)
+    except paramiko.SSHException as exc:
+        log.error("SSH negotiation failed: %s", exc)
+        sys.exit(2)
+    except OSError as exc:
+        log.error("Connection refused or timed out: %s", exc)
+        sys.exit(2)
+    return client
 
 
 def main():
-    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Validate configuration rollback safety",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__
+        description=(
+            "Diff running-config vs startup-config on a Cisco device. "
+            "Exits 0 if configs match, 1 if unsaved changes exist (with --exit-code)."
+        )
     )
-    
-    parser.add_argument("--device", "-d", required=True, help="Device IP or hostname")
-    parser.add_argument("--username", "-u", required=True, help="SSH username")
-    parser.add_argument("--password", "-p", required=True, help="SSH password")
-    parser.add_argument("--baseline-file", "-b", required=True, help="Baseline config file")
-    parser.add_argument("--timeout", "-t", type=int, default=15, help="SSH timeout seconds")
-    parser.add_argument("--generate-rollback", action="store_true", help="Generate rollback commands")
-    parser.add_argument("--output-diff", help="Save diff to file")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
-    
+    parser.add_argument("-H", "--host", required=True, help="Device IP or hostname")
+    parser.add_argument("-P", "--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
+    parser.add_argument("-k", "--key", dest="key_path", default=None, help="Path to SSH private key")
+    parser.add_argument(
+        "-n", "--context", type=int, default=3, metavar="LINES",
+        help="Unified diff context lines (default: 3)",
+    )
+    parser.add_argument(
+        "--exit-code", action="store_true",
+        help="Return exit status 1 when unsaved changes are found",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
-    
+
     if args.verbose:
-        logger.setLevel(logging.DEBUG)
-    
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger("paramiko").setLevel(logging.DEBUG)
+
+    password = args.password
+    if not args.key_path and not password:
+        password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
+
+    log.info("Connecting to %s:%d", args.host, args.port)
+    client = connect(args.host, args.port, args.username, password, args.key_path)
     try:
-        validator = ConfigRollbackValidator(
-            args.device,
-            args.username,
-            args.password,
-            args.timeout
+        running_lines, startup_lines = fetch_both_configs(client)
+    finally:
+        client.close()
+
+    diff = list(
+        difflib.unified_diff(
+            [l + "\n" for l in startup_lines],
+            [l + "\n" for l in running_lines],
+            fromfile=f"{args.host}:startup-config",
+            tofile=f"{args.host}:running-config",
+            n=args.context,
         )
-        
-        current_config = validator.get_running_config()
-        if not current_config:
-            logger.error("Failed to retrieve running configuration")
-            sys.exit(2)
-        
-        baseline_config = validator.load_baseline_config(args.baseline_file)
-        if not baseline_config:
-            logger.error("Failed to load baseline configuration")
-            sys.exit(2)
-        
-        is_safe, message, diff = validator.validate_rollback_safety(
-            current_config,
-            baseline_config
-        )
-        
-        logger.info(message)
-        
-        if args.output_diff and diff:
-            validator.save_diff_report(diff, args.output_diff)
-        
-        if args.generate_rollback and diff:
-            rollback_cmds = validator.generate_rollback_commands(diff)
-            logger.info("\n=== Suggested Rollback Commands ===")
-            logger.info("enter config mode and apply these commands:")
-            for cmd in rollback_cmds:
-                logger.info(f"  {cmd}")
-        
-        validator.close()
-        
-        sys.exit(0 if is_safe else 1)
-        
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-        sys.exit(2)
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        sys.exit(2)
+    )
+
+    if not diff:
+        log.info("CLEAN — running-config matches startup-config on %s", args.host)
+        sys.exit(0)
+
+    log.warning("UNSAVED CHANGES — %d diff line(s) on %s", len(diff), args.host)
+    sys.stdout.writelines(diff)
+    sys.exit(1 if args.exit_code else 0)
 
 
 if __name__ == "__main__":
