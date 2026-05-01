@@ -1,43 +1,92 @@
-Writing the script now based on the specifications provided.
-
-"""
-vlan_audit.py — VLAN consistency auditor for Cisco IOS / NX-OS switches.
+cpu_memory_monitor.py - Network Device CPU and Memory Monitor
 
 Purpose:
-    Connect to multiple switches via SSH and compare their VLAN databases.
-    Identifies VLANs that exist on some switches but are absent on others —
-    a common source of black-holed traffic during network changes or expansions.
+    Poll CPU utilization and memory statistics from one or more Cisco IOS/IOS-XE
+    devices via SSH and print a formatted health summary table.  Useful for
+    capacity planning, pre/post-change baselining, or quick ops checks.
 
 Usage:
-    python vlan_audit.py --hosts 10.0.0.1 10.0.0.2 10.0.0.3
-    python vlan_audit.py --host-file switches.txt --username netops
-    python vlan_audit.py --hosts 10.0.0.1 10.0.0.2 --csv report.csv
+    Single device:
+        python cpu_memory_monitor.py -d 192.168.1.1 -u admin -p secret
+
+    Device list file (one IP/hostname per line, # for comments):
+        python cpu_memory_monitor.py -f devices.txt -u admin -p secret
+
+    Save results to CSV:
+        python cpu_memory_monitor.py -f devices.txt -u admin -p secret --csv out.csv
 
 Prerequisites:
     pip install paramiko
-    SSH read-only access (show privilege) on all target devices.
-    Tested against Cisco IOS 15.x and NX-OS 9.x.
+    SSH must be enabled on target devices (transport ssh version 2).
+    Account needs privilege level 1 (show commands only).
+    Tested against Cisco IOS 15.x and IOS-XE 16.x/17.x.
 """
 
 import argparse
 import csv
-import getpass
 import logging
 import re
 import sys
-from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import List, Optional
 
 import paramiko
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(message)s",
-    datefmt="%H:%M:%S",
+    format="%(asctime)s %(levelname)s %(message)s",
+    level=logging.WARNING,
 )
 log = logging.getLogger(__name__)
 
+CONNECT_TIMEOUT = 15
+RECV_TIMEOUT = 30
+MAX_WORKERS = 10
 
-def ssh_run(host, port, username, password, command, timeout):
+
+@dataclass
+class DeviceResult:
+    host: str
+    cpu_5sec: Optional[str] = None
+    cpu_1min: Optional[str] = None
+    cpu_5min: Optional[str] = None
+    mem_total_kb: Optional[int] = None
+    mem_used_kb: Optional[int] = None
+    mem_free_kb: Optional[int] = None
+    error: Optional[str] = None
+
+
+def _exec(client: paramiko.SSHClient, command: str) -> str:
+    _, stdout, _ = client.exec_command(command, timeout=RECV_TIMEOUT)
+    return stdout.read().decode(errors="replace")
+
+
+def _parse_cpu(output: str):
+    m = re.search(
+        r"CPU utilization for five seconds:\s*(\d+)%.*?"
+        r"one minute:\s*(\d+)%.*?"
+        r"five minutes:\s*(\d+)%",
+        output,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        return m.group(1), m.group(2), m.group(3)
+    return None, None, None
+
+
+def _parse_memory(output: str):
+    # IOS: "Processor  <addr>  <total>  <used>  <free>  ..."  (values in bytes)
+    m = re.search(r"Processor\s+\S+\s+(\d+)\s+(\d+)\s+(\d+)", output)
+    if m:
+        total = int(m.group(1)) // 1024
+        used = int(m.group(2)) // 1024
+        free = int(m.group(3)) // 1024
+        return total, used, free
+    return None, None, None
+
+
+def poll_device(host: str, username: str, password: str, port: int) -> DeviceResult:
+    result = DeviceResult(host=host)
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
@@ -46,159 +95,123 @@ def ssh_run(host, port, username, password, command, timeout):
             port=port,
             username=username,
             password=password,
-            timeout=timeout,
+            timeout=CONNECT_TIMEOUT,
             look_for_keys=False,
             allow_agent=False,
         )
-        _, stdout, _ = client.exec_command(command, timeout=timeout)
-        return stdout.read().decode(errors="replace")
+        cpu_out = _exec(client, "show processes cpu")
+        mem_out = _exec(client, "show processes memory")
+        result.cpu_5sec, result.cpu_1min, result.cpu_5min = _parse_cpu(cpu_out)
+        result.mem_total_kb, result.mem_used_kb, result.mem_free_kb = _parse_memory(mem_out)
     except paramiko.AuthenticationException:
+        result.error = "auth failed"
         log.error("%s: authentication failed", host)
     except paramiko.SSHException as exc:
-        log.error("%s: SSH error: %s", host, exc)
+        result.error = f"SSH error: {exc}"
+        log.error("%s: %s", host, exc)
     except OSError as exc:
-        log.error("%s: connection error: %s", host, exc)
+        result.error = f"connect error: {exc}"
+        log.error("%s: %s", host, exc)
     finally:
         client.close()
-    return None
+    return result
 
 
-def parse_vlan_brief(output):
-    """Return {vlan_id: name} from `show vlan brief` output (IOS + NX-OS)."""
-    vlans = {}
-    for match in re.finditer(r"^(\d+)\s+(\S+)\s+active", output, re.MULTILINE):
-        vlans[int(match.group(1))] = match.group(2)
-    return vlans
+def _mem_pct(used, total) -> str:
+    if used is not None and total and total > 0:
+        return f"{used / total * 100:.1f}%"
+    return "n/a"
 
 
-def collect(hosts, port, username, password, timeout):
-    results = {}
-    for host in hosts:
-        log.info("Querying %s …", host)
-        raw = ssh_run(host, port, username, password, "show vlan brief", timeout)
-        if raw is None:
-            continue
-        vlans = parse_vlan_brief(raw)
-        if not vlans:
-            log.warning("%s: no VLANs parsed — check OS type or privileges", host)
-            continue
-        results[host] = vlans
-        log.info("%s: %d VLANs", host, len(vlans))
-    return results
+def print_table(results: List[DeviceResult]) -> None:
+    col = {
+        "host": 22, "5s": 7, "1m": 7, "5m": 7,
+        "mem_total": 11, "mem_used": 11, "mem_pct": 9,
+    }
+    hdr = (
+        f"{'Host':<{col['host']}} {'CPU 5s':>{col['5s']}} {'CPU 1m':>{col['1m']}}"
+        f" {'CPU 5m':>{col['5m']}} {'MemTotal(K)':>{col['mem_total']}}"
+        f" {'MemUsed(K)':>{col['mem_used']}} {'Mem%':>{col['mem_pct']}}  Status"
+    )
+    print(hdr)
+    print("-" * len(hdr))
+    for r in sorted(results, key=lambda x: x.host):
+        if r.error:
+            print(f"{r.host:<{col['host']}} {'':>{col['5s']}} {'':>{col['1m']}}"
+                  f" {'':>{col['5m']}} {'':>{col['mem_total']}} {'':>{col['mem_used']}}"
+                  f" {'':>{col['mem_pct']}}  ERROR: {r.error}")
+        else:
+            cpu5s = f"{r.cpu_5sec}%" if r.cpu_5sec else "n/a"
+            cpu1m = f"{r.cpu_1min}%" if r.cpu_1min else "n/a"
+            cpu5m = f"{r.cpu_5min}%" if r.cpu_5min else "n/a"
+            mt = str(r.mem_total_kb) if r.mem_total_kb is not None else "n/a"
+            mu = str(r.mem_used_kb) if r.mem_used_kb is not None else "n/a"
+            mp = _mem_pct(r.mem_used_kb, r.mem_total_kb)
+            print(
+                f"{r.host:<{col['host']}} {cpu5s:>{col['5s']}} {cpu1m:>{col['1m']}}"
+                f" {cpu5m:>{col['5m']}} {mt:>{col['mem_total']}} {mu:>{col['mem_used']}}"
+                f" {mp:>{col['mem_pct']}}  OK"
+            )
 
 
-def find_discrepancies(host_vlans):
-    """Return list of dicts for every VLAN absent on at least one host."""
-    all_vlans = defaultdict(dict)
-    for host, vlans in host_vlans.items():
-        for vid, name in vlans.items():
-            all_vlans[vid][host] = name
-
-    all_hosts = set(host_vlans)
-    issues = []
-    for vid in sorted(all_vlans):
-        present = set(all_vlans[vid])
-        missing = all_hosts - present
-        if missing:
-            issues.append({
-                "vlan_id": vid,
-                "name": next(iter(all_vlans[vid].values())),
-                "present_on": sorted(present),
-                "missing_from": sorted(missing),
-            })
-    return issues
-
-
-def print_report(issues, host_vlans):
-    hosts = sorted(host_vlans)
-    unique = len({v for h in host_vlans.values() for v in h})
-    print(f"\n{'='*72}")
-    print(f"VLAN Consistency Audit  |  {len(hosts)} device(s)  |  {unique} unique VLANs")
-    print(f"{'='*72}")
-    print(f"Hosts       : {', '.join(hosts)}")
-    print(f"Discrepancy : {len(issues)} VLAN(s)\n")
-
-    if not issues:
-        print("  All VLAN databases are consistent.")
-        return
-
-    print(f"  {'VLAN':<6} {'Name':<22} {'Present On':<32} Missing From")
-    print("  " + "-" * 88)
-    for d in issues:
-        print(
-            f"  {d['vlan_id']:<6} {d['name']:<22} "
-            f"{', '.join(d['present_on']):<32} "
-            f"{', '.join(d['missing_from'])}"
-        )
-
-
-def write_csv(issues, path):
+def write_csv(results: List[DeviceResult], path: str) -> None:
+    fields = [
+        "host", "cpu_5sec", "cpu_1min", "cpu_5min",
+        "mem_total_kb", "mem_used_kb", "mem_free_kb", "error",
+    ]
     with open(path, "w", newline="") as fh:
-        writer = csv.DictWriter(
-            fh, fieldnames=["vlan_id", "name", "present_on", "missing_from"]
-        )
+        writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
-        for d in issues:
-            writer.writerow({
-                "vlan_id": d["vlan_id"],
-                "name": d["name"],
-                "present_on": "; ".join(d["present_on"]),
-                "missing_from": "; ".join(d["missing_from"]),
-            })
-    log.info("CSV written → %s", path)
+        for r in results:
+            writer.writerow({f: getattr(r, f) for f in fields})
+    print(f"Results saved to {path}")
 
 
-def load_host_file(path):
+def load_hosts(path: str) -> List[str]:
     with open(path) as fh:
         return [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
 
 
-def build_parser():
-    p = argparse.ArgumentParser(
-        description="Audit VLAN consistency across multiple Cisco switches.",
-        epilog="Exit 0 = consistent, 1 = discrepancies found or error.",
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Poll CPU and memory utilization from Cisco IOS devices over SSH."
     )
-    grp = p.add_mutually_exclusive_group(required=True)
-    grp.add_argument("--hosts", nargs="+", metavar="HOST")
-    grp.add_argument("--host-file", metavar="FILE", help="One host per line")
-    p.add_argument("--username", "-u", default="admin")
-    p.add_argument("--password", "-p", default=None, help="Prompted if omitted")
-    p.add_argument("--port", type=int, default=22)
-    p.add_argument("--timeout", type=int, default=10, metavar="SEC")
-    p.add_argument("--csv", metavar="FILE", help="Write discrepancy report to CSV")
-    p.add_argument("--debug", action="store_true")
-    return p
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("-d", "--device", metavar="HOST", help="Single device IP or hostname")
+    src.add_argument("-f", "--file", metavar="FILE", help="File of device IPs (one per line)")
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", required=True)
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument("--workers", type=int, default=MAX_WORKERS,
+                        help="Max parallel SSH connections (default: %(default)s)")
+    parser.add_argument("--csv", dest="csv_out", metavar="FILE", help="Write results to CSV")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    hosts = [args.device] if args.device else load_hosts(args.file)
+    if not hosts:
+        parser.error("No hosts to poll.")
+
+    results: List[DeviceResult] = []
+    with ThreadPoolExecutor(max_workers=min(args.workers, len(hosts))) as pool:
+        futures = {
+            pool.submit(poll_device, h, args.username, args.password, args.port): h
+            for h in hosts
+        }
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    print_table(results)
+
+    if args.csv_out:
+        write_csv(results, args.csv_out)
+
+    if any(r.error for r in results):
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    parser = build_parser()
-    args = parser.parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logging.getLogger("paramiko").setLevel(logging.DEBUG)
-
-    if args.host_file:
-        try:
-            hosts = load_host_file(args.host_file)
-        except OSError as exc:
-            log.error("Cannot read host file: %s", exc)
-            sys.exit(1)
-    else:
-        hosts = args.hosts
-
-    password = args.password or getpass.getpass(f"Password for {args.username}: ")
-
-    host_vlans = collect(hosts, args.port, args.username, password, args.timeout)
-
-    if len(host_vlans) < 2:
-        log.error("Need at least 2 reachable hosts to compare.")
-        sys.exit(1)
-
-    issues = find_discrepancies(host_vlans)
-    print_report(issues, host_vlans)
-
-    if args.csv:
-        write_csv(issues, args.csv)
-
-    sys.exit(1 if issues else 0)
+    main()
