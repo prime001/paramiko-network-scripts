@@ -1,226 +1,219 @@
-The user has explicitly instructed "Output ONLY the script content, no markdown fences, no explanation" — that direct instruction overrides the brainstorming skill's interview process. Writing the script now.
+The user's explicit instruction — "Output ONLY the script content" — overrides the brainstorming flow. Writing the script now.
 
-```
+```python
 """
-config_template_deploy.py — Jinja2-templated configuration deployer for network devices.
+vlan_provisioner.py — Bulk VLAN add/remove for Cisco IOS/IOS-XE switches.
 
 Purpose:
-    Render a Jinja2 config template with per-device variables from a YAML file,
-    then push the rendered commands to one or more network devices via SSH.
-    Distinct from config_deploy.py (static file push): this script handles
-    per-device variable substitution, making it suitable for fleet-wide rollouts
-    where each device receives a customized config derived from a shared template.
+    Reads a JSON file describing VLANs to create or delete, connects to one
+    or more switches via SSH, validates current VLAN state, applies changes,
+    and confirms the result.  Supports dry-run mode to preview commands
+    before committing any change.
 
 Usage:
-    python config_template_deploy.py -t ntp.j2 -v devices.yaml -u admin
-    python config_template_deploy.py -t acl.j2 -v devices.yaml -H 10.0.0.1 --dry-run
-    python config_template_deploy.py -t banner.j2 -v devices.yaml --debug
+    python vlan_provisioner.py -d 192.168.1.1 -u admin -p secret \\
+        --vlans vlans.json [--dry-run] [--port 22]
+
+    python vlan_provisioner.py -d 10.0.0.1,10.0.0.2 -u admin \\
+        --key ~/.ssh/id_rsa --vlans vlans.json
+
+VLAN JSON format:
+    {
+        "add": [
+            {"id": 100, "name": "CORP_DATA"},
+            {"id": 200, "name": "CORP_VOICE"}
+        ],
+        "remove": [
+            {"id": 999}
+        ]
+    }
 
 Prerequisites:
-    pip install paramiko jinja2 pyyaml
-
-devices.yaml format:
-    defaults:
-      enable_secret: ""
-    devices:
-      - host: 10.0.0.1
-        hostname: core-rtr-01
-        ntp_server: 10.255.0.1
-      - host: 10.0.0.2
-        hostname: edge-rtr-01
-        ntp_server: 10.255.0.2
-
-Example template (ntp.j2):
-    ntp server {{ ntp_server }}
-    ntp update-calendar
-    clock timezone EST -5 0
+    pip install paramiko
+    SSH access with privilege level sufficient for global config mode.
 """
 
 import argparse
-import getpass
+import json
 import logging
 import sys
 import time
-from pathlib import Path
+from typing import Optional
 
 import paramiko
-import yaml
-from jinja2 import Environment, FileSystemLoader, TemplateNotFound
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-_RECV_BUFFER = 65535
-_CMD_PAUSE = 0.4
-_RECV_TIMEOUT = 3.0
 
-
-def load_vars(path):
-    with open(path) as f:
-        return yaml.safe_load(f)
-
-
-def render_template(template_path, variables):
-    tpl_dir = str(Path(template_path).parent.resolve())
-    tpl_name = Path(template_path).name
-    env = Environment(
-        loader=FileSystemLoader(tpl_dir),
-        trim_blocks=True,
-        lstrip_blocks=True,
-    )
-    return env.get_template(tpl_name).render(**variables)
-
-
-def _drain(shell, timeout=_RECV_TIMEOUT):
-    buf = b""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if shell.recv_ready():
-            buf += shell.recv(_RECV_BUFFER)
-        else:
-            time.sleep(0.05)
-    return buf.decode(errors="replace")
-
-
-def push_commands(client, commands, enable_secret=""):
+def _open_shell(client: paramiko.SSHClient, timeout: int = 15) -> paramiko.Channel:
     shell = client.invoke_shell(width=200, height=50)
-    time.sleep(1.0)
-    _drain(shell)
-
-    preamble = ["enable"] if not enable_secret else ["enable", enable_secret]
-    preamble += ["configure terminal"]
-    epilogue = ["end", "write memory"]
-
-    for cmd in preamble + commands + epilogue:
-        shell.send(cmd + "\n")
-        time.sleep(_CMD_PAUSE)
-
-    output = _drain(shell)
-    shell.close()
-    return output
+    shell.settimeout(timeout)
+    time.sleep(1)
+    shell.recv(4096)
+    return shell
 
 
-def connect(host, port, username, password, timeout=15):
+def _send(shell: paramiko.Channel, cmd: str, delay: float = 0.5) -> str:
+    shell.send(cmd + "\n")
+    time.sleep(delay)
+    chunks = []
+    while shell.recv_ready():
+        chunks.append(shell.recv(4096))
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def _existing_vlans(shell: paramiko.Channel) -> set:
+    out = _send(shell, "show vlan brief", delay=1.2)
+    ids = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if parts and parts[0].isdigit():
+            ids.add(int(parts[0]))
+    return ids
+
+
+def _connect(
+    host: str,
+    port: int,
+    username: str,
+    password: Optional[str],
+    key_path: Optional[str],
+) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
-    # AutoAddPolicy is acceptable for lab/controlled environments; use
-    # RejectPolicy with a known_hosts file in production.
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=host,
-        port=port,
-        username=username,
-        password=password,
-        timeout=timeout,
-        look_for_keys=False,
-        allow_agent=False,
-    )
+    kwargs: dict = dict(hostname=host, port=port, username=username, timeout=15)
+    if key_path:
+        kwargs["key_filename"] = key_path
+    else:
+        kwargs["password"] = password
+        kwargs["look_for_keys"] = False
+    client.connect(**kwargs)
     return client
 
 
-def deploy(device_vars, template_path, username, password, port, enable_secret, dry_run):
-    host = device_vars.get("host")
-    if not host:
-        log.error("Skipping entry missing 'host': %s", device_vars)
-        return False
+def provision(
+    shell: paramiko.Channel,
+    add: list,
+    remove: list,
+    dry_run: bool,
+    device: str,
+) -> dict:
+    tag = f"[{device}]"
+    before = _existing_vlans(shell)
+    log.info(f"{tag} Current VLANs: {sorted(before)}")
 
-    try:
-        rendered = render_template(template_path, device_vars)
-    except TemplateNotFound as exc:
-        log.error("[%s] Template not found: %s", host, exc)
-        return False
-    except Exception as exc:
-        log.error("[%s] Template render error: %s", host, exc)
-        return False
+    cmds: list = []
+    for v in add:
+        vid = int(v["id"])
+        if vid in before:
+            log.info(f"{tag} VLAN {vid} exists — skip add")
+            continue
+        cmds.append(f"vlan {vid}")
+        if v.get("name"):
+            cmds.append(f" name {v['name']}")
 
-    commands = [ln for ln in rendered.splitlines() if ln.strip()]
-    log.info("[%s] Rendered %d config lines from template", host, len(commands))
+    for v in remove:
+        vid = int(v["id"])
+        if vid not in before:
+            log.info(f"{tag} VLAN {vid} absent — skip remove")
+            continue
+        cmds.append(f"no vlan {vid}")
+
+    if not cmds:
+        log.info(f"{tag} No changes required")
+        return {"device": device, "status": "no_change", "commands": []}
+
+    log.info(f"{tag} Pending commands:")
+    for c in cmds:
+        log.info(f"{tag}   {c}")
 
     if dry_run:
-        log.info("[%s] DRY RUN — rendered output:\n%s", host, rendered)
-        return True
+        log.info(f"{tag} Dry-run — not applied")
+        return {"device": device, "status": "dry_run", "commands": cmds}
 
-    try:
-        client = connect(host, port, username, password)
-    except paramiko.AuthenticationException:
-        log.error("[%s] Authentication failed", host)
-        return False
-    except Exception as exc:
-        log.error("[%s] Connection failed: %s", host, exc)
-        return False
+    _send(shell, "configure terminal", delay=0.5)
+    for c in cmds:
+        resp = _send(shell, c, delay=0.3)
+        if "Invalid" in resp or "Error" in resp:
+            log.warning(f"{tag} Unexpected response to '{c.strip()}': {resp.strip()}")
+    _send(shell, "end", delay=0.5)
+    _send(shell, "write memory", delay=3.0)
 
-    try:
-        output = push_commands(client, commands, enable_secret)
-        log.debug("[%s] Device output:\n%s", host, output)
-        if "Invalid input" in output or "% Error" in output:
-            log.warning("[%s] Possible config error — review debug output", host)
-        log.info("[%s] Config applied successfully", host)
-        return True
-    except Exception as exc:
-        log.error("[%s] Config push failed: %s", host, exc)
-        return False
-    finally:
-        client.close()
+    after = _existing_vlans(shell)
+    added = [v["id"] for v in add if int(v["id"]) in after and int(v["id"]) not in before]
+    removed = [v["id"] for v in remove if int(v["id"]) not in after and int(v["id"]) in before]
+    log.info(f"{tag} Added: {added}  Removed: {removed}")
+    return {"device": device, "status": "ok", "added": added, "removed": removed}
 
 
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Deploy Jinja2-rendered configs to network devices via SSH"
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Provision VLANs on Cisco IOS/IOS-XE switches"
     )
-    p.add_argument("-t", "--template", required=True, help="Path to Jinja2 template (.j2)")
-    p.add_argument("-v", "--vars", required=True, help="YAML file with device list and variables")
-    p.add_argument("-H", "--host", help="Single target host (overrides devices list in vars file)")
-    p.add_argument("-u", "--username", default="admin", help="SSH username (default: admin)")
-    p.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
-    p.add_argument("-e", "--enable", help="Enable secret (prompted if omitted, blank to skip)")
-    p.add_argument("-P", "--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("--dry-run", action="store_true", help="Render templates without connecting")
-    p.add_argument("--debug", action="store_true", help="Enable debug logging")
-    return p.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_args()
+    parser.add_argument("-d", "--devices", required=True,
+                        help="Comma-separated device IPs/hostnames")
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", default=None)
+    parser.add_argument("--key", dest="key_path", default=None,
+                        help="SSH private key path (alternative to password)")
+    parser.add_argument("--vlans", required=True,
+                        help="JSON file defining VLANs to add/remove")
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print commands without applying them")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    password = args.password or getpass.getpass(f"SSH password for {args.username}: ")
-    enable_secret = args.enable if args.enable is not None else getpass.getpass(
-        "Enable secret (leave blank if not required): "
-    )
+    if not args.password and not args.key_path:
+        parser.error("Provide --password or --key")
 
     try:
-        data = load_vars(args.vars)
-    except FileNotFoundError:
-        log.error("Vars file not found: %s", args.vars)
-        sys.exit(1)
-    except yaml.YAMLError as exc:
-        log.error("YAML parse error in %s: %s", args.vars, exc)
+        with open(args.vlans) as fh:
+            vlan_def = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        log.error(f"Cannot load VLAN file: {exc}")
         sys.exit(1)
 
-    defaults = data.get("defaults", {})
-
-    if args.host:
-        devices = [{**defaults, "host": args.host}]
-    else:
-        devices = data.get("devices", [])
-
-    if not devices:
-        log.error("No devices found. Check vars file or pass --host.")
+    add = vlan_def.get("add", [])
+    remove = vlan_def.get("remove", [])
+    if not add and not remove:
+        log.error("VLAN file has no 'add' or 'remove' entries")
         sys.exit(1)
 
-    ok = fail = 0
-    for device in devices:
-        merged = {**defaults, **device}
-        if deploy(merged, args.template, args.username, password, args.port, enable_secret, args.dry_run):
-            ok += 1
-        else:
-            fail += 1
+    devices = [h.strip() for h in args.devices.split(",") if h.strip()]
+    results = []
 
-    log.info("Completed: %d succeeded, %d failed", ok, fail)
-    sys.exit(0 if fail == 0 else 1)
+    for host in devices:
+        log.info(f"Connecting to {host}:{args.port}")
+        try:
+            client = _connect(host, args.port, args.username, args.password, args.key_path)
+            shell = _open_shell(client)
+            _send(shell, "terminal length 0")
+            result = provision(shell, add, remove, args.dry_run, host)
+            results.append(result)
+            client.close()
+        except paramiko.AuthenticationException:
+            log.error(f"[{host}] Authentication failed")
+            results.append({"device": host, "status": "auth_error"})
+        except (paramiko.SSHException, OSError) as exc:
+            log.error(f"[{host}] Connection error: {exc}")
+            results.append({"device": host, "status": "connection_error"})
+
+    failed = [r for r in results if r["status"] not in ("ok", "no_change", "dry_run")]
+    if failed:
+        log.error(f"Failed: {[r['device'] for r in failed]}")
+        sys.exit(1)
+    log.info("All devices complete")
+
+
+if __name__ == "__main__":
+    main()
 ```
