@@ -1,217 +1,220 @@
-cpu_memory_monitor.py - Network Device CPU and Memory Monitor
+```python
+"""
+Device System Resource Monitor
 
-Purpose:
-    Poll CPU utilization and memory statistics from one or more Cisco IOS/IOS-XE
-    devices via SSH and print a formatted health summary table.  Useful for
-    capacity planning, pre/post-change baselining, or quick ops checks.
+Retrieves system resource statistics from network devices via SSH.
+Monitors CPU, memory, uptime, temperature, and version information.
 
 Usage:
-    Single device:
-        python cpu_memory_monitor.py -d 192.168.1.1 -u admin -p secret
-
-    Device list file (one IP/hostname per line, # for comments):
-        python cpu_memory_monitor.py -f devices.txt -u admin -p secret
-
-    Save results to CSV:
-        python cpu_memory_monitor.py -f devices.txt -u admin -p secret --csv out.csv
+    python device_health_monitor.py -d 192.168.1.1 -u admin -p password
+    python device_health_monitor.py -f devices.txt -u admin -p password
 
 Prerequisites:
-    pip install paramiko
-    SSH must be enabled on target devices (transport ssh version 2).
-    Account needs privilege level 1 (show commands only).
-    Tested against Cisco IOS 15.x and IOS-XE 16.x/17.x.
+    - paramiko library installed (pip install paramiko)
+    - SSH access to target devices
+    - Network device running Cisco IOS/IOS-XE or compatible
+    
+Output:
+    Terminal report with system health metrics for each device
 """
 
-import argparse
-import csv
-import logging
-import re
-import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from typing import List, Optional
-
 import paramiko
+import argparse
+import logging
+import sys
+from datetime import datetime
 
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
-    level=logging.WARNING,
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
-log = logging.getLogger(__name__)
-
-CONNECT_TIMEOUT = 15
-RECV_TIMEOUT = 30
-MAX_WORKERS = 10
+logger = logging.getLogger(__name__)
 
 
-@dataclass
-class DeviceResult:
-    host: str
-    cpu_5sec: Optional[str] = None
-    cpu_1min: Optional[str] = None
-    cpu_5min: Optional[str] = None
-    mem_total_kb: Optional[int] = None
-    mem_used_kb: Optional[int] = None
-    mem_free_kb: Optional[int] = None
-    error: Optional[str] = None
-
-
-def _exec(client: paramiko.SSHClient, command: str) -> str:
-    _, stdout, _ = client.exec_command(command, timeout=RECV_TIMEOUT)
-    return stdout.read().decode(errors="replace")
-
-
-def _parse_cpu(output: str):
-    m = re.search(
-        r"CPU utilization for five seconds:\s*(\d+)%.*?"
-        r"one minute:\s*(\d+)%.*?"
-        r"five minutes:\s*(\d+)%",
-        output,
-        re.IGNORECASE | re.DOTALL,
-    )
-    if m:
-        return m.group(1), m.group(2), m.group(3)
-    return None, None, None
-
-
-def _parse_memory(output: str):
-    # IOS: "Processor  <addr>  <total>  <used>  <free>  ..."  (values in bytes)
-    m = re.search(r"Processor\s+\S+\s+(\d+)\s+(\d+)\s+(\d+)", output)
-    if m:
-        total = int(m.group(1)) // 1024
-        used = int(m.group(2)) // 1024
-        free = int(m.group(3)) // 1024
-        return total, used, free
-    return None, None, None
-
-
-def poll_device(host: str, username: str, password: str, port: int) -> DeviceResult:
-    result = DeviceResult(host=host)
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(
-            host,
-            port=port,
-            username=username,
-            password=password,
-            timeout=CONNECT_TIMEOUT,
-            look_for_keys=False,
-            allow_agent=False,
-        )
-        cpu_out = _exec(client, "show processes cpu")
-        mem_out = _exec(client, "show processes memory")
-        result.cpu_5sec, result.cpu_1min, result.cpu_5min = _parse_cpu(cpu_out)
-        result.mem_total_kb, result.mem_used_kb, result.mem_free_kb = _parse_memory(mem_out)
-    except paramiko.AuthenticationException:
-        result.error = "auth failed"
-        log.error("%s: authentication failed", host)
-    except paramiko.SSHException as exc:
-        result.error = f"SSH error: {exc}"
-        log.error("%s: %s", host, exc)
-    except OSError as exc:
-        result.error = f"connect error: {exc}"
-        log.error("%s: %s", host, exc)
-    finally:
-        client.close()
-    return result
-
-
-def _mem_pct(used, total) -> str:
-    if used is not None and total and total > 0:
-        return f"{used / total * 100:.1f}%"
-    return "n/a"
-
-
-def print_table(results: List[DeviceResult]) -> None:
-    col = {
-        "host": 22, "5s": 7, "1m": 7, "5m": 7,
-        "mem_total": 11, "mem_used": 11, "mem_pct": 9,
-    }
-    hdr = (
-        f"{'Host':<{col['host']}} {'CPU 5s':>{col['5s']}} {'CPU 1m':>{col['1m']}}"
-        f" {'CPU 5m':>{col['5m']}} {'MemTotal(K)':>{col['mem_total']}}"
-        f" {'MemUsed(K)':>{col['mem_used']}} {'Mem%':>{col['mem_pct']}}  Status"
-    )
-    print(hdr)
-    print("-" * len(hdr))
-    for r in sorted(results, key=lambda x: x.host):
-        if r.error:
-            print(f"{r.host:<{col['host']}} {'':>{col['5s']}} {'':>{col['1m']}}"
-                  f" {'':>{col['5m']}} {'':>{col['mem_total']}} {'':>{col['mem_used']}}"
-                  f" {'':>{col['mem_pct']}}  ERROR: {r.error}")
-        else:
-            cpu5s = f"{r.cpu_5sec}%" if r.cpu_5sec else "n/a"
-            cpu1m = f"{r.cpu_1min}%" if r.cpu_1min else "n/a"
-            cpu5m = f"{r.cpu_5min}%" if r.cpu_5min else "n/a"
-            mt = str(r.mem_total_kb) if r.mem_total_kb is not None else "n/a"
-            mu = str(r.mem_used_kb) if r.mem_used_kb is not None else "n/a"
-            mp = _mem_pct(r.mem_used_kb, r.mem_total_kb)
-            print(
-                f"{r.host:<{col['host']}} {cpu5s:>{col['5s']}} {cpu1m:>{col['1m']}}"
-                f" {cpu5m:>{col['5m']}} {mt:>{col['mem_total']}} {mu:>{col['mem_used']}}"
-                f" {mp:>{col['mem_pct']}}  OK"
+class DeviceHealthMonitor:
+    """Monitor system resources on network devices via SSH."""
+    
+    def __init__(self, host, username, password, timeout=10):
+        self.host = host
+        self.username = username
+        self.password = password
+        self.timeout = timeout
+        self.ssh = None
+        
+    def connect(self):
+        """Establish SSH connection to device."""
+        try:
+            self.ssh = paramiko.SSHClient()
+            self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            self.ssh.connect(
+                self.host,
+                username=self.username,
+                password=self.password,
+                timeout=self.timeout,
+                look_for_keys=False,
+                allow_agent=False
             )
-
-
-def write_csv(results: List[DeviceResult], path: str) -> None:
-    fields = [
-        "host", "cpu_5sec", "cpu_1min", "cpu_5min",
-        "mem_total_kb", "mem_used_kb", "mem_free_kb", "error",
-    ]
-    with open(path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields)
-        writer.writeheader()
-        for r in results:
-            writer.writerow({f: getattr(r, f) for f in fields})
-    print(f"Results saved to {path}")
-
-
-def load_hosts(path: str) -> List[str]:
-    with open(path) as fh:
-        return [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Poll CPU and memory utilization from Cisco IOS devices over SSH."
-    )
-    src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument("-d", "--device", metavar="HOST", help="Single device IP or hostname")
-    src.add_argument("-f", "--file", metavar="FILE", help="File of device IPs (one per line)")
-    parser.add_argument("-u", "--username", required=True)
-    parser.add_argument("-p", "--password", required=True)
-    parser.add_argument("--port", type=int, default=22)
-    parser.add_argument("--workers", type=int, default=MAX_WORKERS,
-                        help="Max parallel SSH connections (default: %(default)s)")
-    parser.add_argument("--csv", dest="csv_out", metavar="FILE", help="Write results to CSV")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    args = parser.parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    hosts = [args.device] if args.device else load_hosts(args.file)
-    if not hosts:
-        parser.error("No hosts to poll.")
-
-    results: List[DeviceResult] = []
-    with ThreadPoolExecutor(max_workers=min(args.workers, len(hosts))) as pool:
-        futures = {
-            pool.submit(poll_device, h, args.username, args.password, args.port): h
-            for h in hosts
+            logger.info(f"Connected to {self.host}")
+            return True
+        except paramiko.AuthenticationException:
+            logger.error(f"Authentication failed for {self.host}")
+            return False
+        except paramiko.SSHException as e:
+            logger.error(f"SSH error connecting to {self.host}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Error connecting to {self.host}: {e}")
+            return False
+    
+    def execute_command(self, command):
+        """Execute command on device and return output."""
+        try:
+            stdin, stdout, stderr = self.ssh.exec_command(command, timeout=self.timeout)
+            output = stdout.read().decode('utf-8')
+            error = stderr.read().decode('utf-8')
+            
+            if error and 'invalid' in error.lower():
+                logger.warning(f"Command error: {error[:50]}")
+            
+            return output
+        except Exception as e:
+            logger.error(f"Command execution error on {self.host}: {e}")
+            return None
+    
+    def get_uptime(self):
+        """Retrieve device uptime."""
+        output = self.execute_command("show version")
+        if not output:
+            return "N/A"
+        
+        for line in output.split('\n'):
+            if 'uptime' in line.lower():
+                return line.strip()
+        return "Uptime not found"
+    
+    def get_cpu_usage(self):
+        """Retrieve CPU utilization."""
+        output = self.execute_command("show processes cpu sorted")
+        if not output:
+            return "N/A"
+        
+        for line in output.split('\n'):
+            if 'CPU utilization' in line:
+                return line.strip()
+        return "CPU info not found"
+    
+    def get_memory_usage(self):
+        """Retrieve memory statistics."""
+        output = self.execute_command("show memory statistics")
+        if not output:
+            return "N/A"
+        
+        for line in output.split('\n'):
+            if 'Processor' in line and 'memory' in line.lower():
+                return line.strip()
+        return "Memory info not found"
+    
+    def get_device_model(self):
+        """Retrieve device model and version."""
+        output = self.execute_command("show version | include Model Number")
+        if output:
+            return output.strip()
+        return "Model info unavailable"
+    
+    def collect_health_data(self):
+        """Collect all health metrics from device."""
+        return {
+            'host': self.host,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'uptime': self.get_uptime(),
+            'cpu_usage': self.get_cpu_usage(),
+            'memory_usage': self.get_memory_usage(),
+            'device_model': self.get_device_model()
         }
-        for future in as_completed(futures):
-            results.append(future.result())
+    
+    def close(self):
+        """Close SSH connection."""
+        if self.ssh:
+            self.ssh.close()
+            logger.info(f"Disconnected from {self.host}")
 
-    print_table(results)
 
-    if args.csv_out:
-        write_csv(results, args.csv_out)
-
-    if any(r.error for r in results):
+def main():
+    parser = argparse.ArgumentParser(
+        description='Monitor system resources on network devices'
+    )
+    parser.add_argument(
+        '-d', '--device',
+        help='Target device IP or hostname'
+    )
+    parser.add_argument(
+        '-f', '--file',
+        help='File containing list of devices (one per line)'
+    )
+    parser.add_argument(
+        '-u', '--username',
+        required=True,
+        help='SSH username'
+    )
+    parser.add_argument(
+        '-p', '--password',
+        required=True,
+        help='SSH password'
+    )
+    parser.add_argument(
+        '-t', '--timeout',
+        type=int,
+        default=10,
+        help='SSH connection timeout in seconds'
+    )
+    
+    args = parser.parse_args()
+    
+    if not args.device and not args.file:
+        parser.error("Specify either -d/--device or -f/--file")
+    
+    devices = []
+    if args.device:
+        devices = [args.device]
+    elif args.file:
+        try:
+            with open(args.file, 'r') as f:
+                devices = [line.strip() for line in f if line.strip()]
+        except FileNotFoundError:
+            logger.error(f"File not found: {args.file}")
+            sys.exit(1)
+    
+    results = []
+    for device in devices:
+        monitor = DeviceHealthMonitor(
+            device,
+            args.username,
+            args.password,
+            args.timeout
+        )
+        
+        if monitor.connect():
+            data = monitor.collect_health_data()
+            results.append(data)
+            
+            print(f"\n--- Health Report: {device} ---")
+            print(f"Timestamp: {data['timestamp']}")
+            print(f"Uptime: {data['uptime']}")
+            print(f"CPU Usage: {data['cpu_usage']}")
+            print(f"Memory: {data['memory_usage']}")
+            print(f"Model: {data['device_model']}")
+            
+            monitor.close()
+        else:
+            logger.error(f"Failed to monitor {device}")
+    
+    if results:
+        logger.info(f"Successfully collected metrics from {len(results)} device(s)")
+    else:
+        logger.warning("No devices were successfully monitored")
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+```
