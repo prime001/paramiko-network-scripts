@@ -1,19 +1,29 @@
 ```python
 """
-BGP Neighbor Status - paramiko-network-scripts
+routing_table_monitor.py - Route change detection via SSH
 
-Connects to a Cisco IOS/IOS-XE device via SSH, retrieves the BGP neighbor
-summary, and displays peer states, AS numbers, prefix counts, and session uptime.
-
-Usage:
-    python bgp_neighbor_status.py -d 192.168.1.1 -u admin -p secret
-    python bgp_neighbor_status.py -d 192.168.1.1 -u admin --key ~/.ssh/id_rsa
-    python bgp_neighbor_status.py -d 192.168.1.1 -u admin -p secret --vrf CORP
-    python bgp_neighbor_status.py -d 192.168.1.1 -u admin -p secret --filter-state Active --json
+Connects to a Cisco IOS/IOS-XE device, captures the routing table (or a
+specific prefix), compares against a saved snapshot, and reports additions
+and withdrawals.  Useful for scheduled monitoring, post-change validation,
+or pre/post maintenance windows.
 
 Prerequisites:
     pip install paramiko
-    Device must have BGP configured and SSH enabled (ip ssh version 2).
+
+Usage:
+    # Baseline snapshot
+    python routing_table_monitor.py --host 10.0.0.1 --user admin --save
+
+    # Detect changes since last snapshot
+    python routing_table_monitor.py --host 10.0.0.1 --user admin --diff
+
+    # Monitor a specific prefix
+    python routing_table_monitor.py --host 10.0.0.1 --user admin \
+        --prefix 192.168.1.0/24 --diff
+
+    # Filter by protocol (ospf, bgp, static, connected)
+    python routing_table_monitor.py --host 10.0.0.1 --user admin \
+        --protocol ospf --save
 """
 
 import argparse
@@ -23,186 +33,184 @@ import logging
 import re
 import sys
 import time
+from datetime import datetime
+from pathlib import Path
 
 import paramiko
 
 logging.basicConfig(
-    level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(message)s",
+    level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-BGP_NEIGHBOR_RE = re.compile(
-    r"^(\d{1,3}(?:\.\d{1,3}){3})\s+"
-    r"\d+\s+"
-    r"(\d+)\s+"
-    r"(\d+)\s+"
-    r"(\d+)\s+"
-    r"\S+\s+"
-    r"\d+\s+"
-    r"\d+\s+"
-    r"(\S+)\s+"
-    r"(\S+)$",
-    re.MULTILINE,
-)
+PROTO_MAP = {
+    "ospf": r"^O",
+    "bgp": r"^B",
+    "static": r"^S",
+    "connected": r"^C",
+    "eigrp": r"^D",
+    "rip": r"^R",
+}
 
 
-def connect(host, username, password=None, key_file=None, port=22, timeout=15):
+def ssh_connect(host, user, password, port=22, timeout=15):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = dict(hostname=host, port=port, username=username, timeout=timeout)
-    if key_file:
-        kwargs["key_filename"] = key_file
-    else:
-        kwargs["password"] = password
-    client.connect(**kwargs)
+    client.connect(
+        hostname=host,
+        port=port,
+        username=user,
+        password=password,
+        timeout=timeout,
+        look_for_keys=False,
+        allow_agent=False,
+    )
     return client
 
 
-def run_command(client, command, recv_wait=2.5):
-    shell = client.invoke_shell(width=220, height=50)
-    shell.settimeout(recv_wait + 5)
-    time.sleep(0.6)
-    shell.recv(8192)  # discard login banner
-    shell.sendall("terminal length 0\n")
-    time.sleep(0.4)
-    shell.recv(8192)
-    shell.sendall(command + "\n")
-    time.sleep(recv_wait)
-    buf = b""
-    while shell.recv_ready():
-        buf += shell.recv(16384)
-    shell.close()
-    return buf.decode("utf-8", errors="replace")
+def run_command(client, command, wait=2.0):
+    chan = client.invoke_shell()
+    chan.settimeout(10)
+    time.sleep(0.5)
+    chan.recv(4096)  # drain banner
+    chan.send("terminal length 0\n")
+    time.sleep(0.3)
+    chan.recv(4096)
+    chan.send(command + "\n")
+    time.sleep(wait)
+    output = ""
+    while chan.recv_ready():
+        output += chan.recv(8192).decode("utf-8", errors="replace")
+        time.sleep(0.1)
+    chan.close()
+    return output
 
 
-def parse_bgp_summary(output):
-    local_as = None
-    router_id = None
-
-    m = re.search(r"local AS number (\d+)", output, re.IGNORECASE)
-    if m:
-        local_as = m.group(1)
-
-    m = re.search(r"BGP router identifier (\d+\.\d+\.\d+\.\d+)", output, re.IGNORECASE)
-    if m:
-        router_id = m.group(1)
-
-    neighbors = []
-    for match in BGP_NEIGHBOR_RE.finditer(output):
-        peer_ip, remote_as, msg_rcvd, msg_sent, updown, state_pfx = match.groups()
-        try:
-            prefixes = int(state_pfx)
-            state = "Established"
-        except ValueError:
-            prefixes = None
-            state = state_pfx
-
-        neighbors.append({
-            "neighbor": peer_ip,
-            "remote_as": remote_as,
-            "state": state,
-            "prefixes_received": prefixes,
-            "updown": updown,
-            "msg_rcvd": int(msg_rcvd),
-            "msg_sent": int(msg_sent),
-        })
-
-    return {"router_id": router_id, "local_as": local_as, "neighbors": neighbors}
+def parse_routes(raw, protocol_filter=None, prefix_filter=None):
+    routes = {}
+    current_prefix = None
+    proto_re = re.compile(
+        r"^([A-Z*]{1,2}(?:\s+[A-Z]+)?)\s+"
+        r"(\d{1,3}(?:\.\d{1,3}){3}/\d{1,2})"
+        r".*?via\s+(\d{1,3}(?:\.\d{1,3}){3})",
+        re.MULTILINE,
+    )
+    for m in proto_re.finditer(raw):
+        code, prefix, via = m.group(1).strip(), m.group(2), m.group(3)
+        if protocol_filter:
+            pattern = PROTO_MAP.get(protocol_filter.lower())
+            if pattern and not re.match(pattern, code, re.IGNORECASE):
+                continue
+        if prefix_filter and prefix != prefix_filter:
+            continue
+        routes.setdefault(prefix, []).append({"code": code, "via": via})
+    return routes
 
 
-def print_table(data, filter_state=None):
-    neighbors = data["neighbors"]
-    if filter_state:
-        neighbors = [n for n in neighbors if n["state"].lower() == filter_state.lower()]
+def snapshot_path(host, prefix_filter, protocol_filter):
+    tag = host.replace(".", "_")
+    if prefix_filter:
+        tag += "_" + prefix_filter.replace("/", "-")
+    if protocol_filter:
+        tag += "_" + protocol_filter
+    return Path(f".route_snapshot_{tag}.json")
 
-    if not neighbors:
-        print("No BGP neighbors matched.")
-        return
 
-    rid = data["router_id"] or "unknown"
-    las = data["local_as"] or "unknown"
-    print(f"\nBGP Router ID: {rid}   Local AS: {las}\n")
+def save_snapshot(routes, path):
+    data = {"timestamp": datetime.utcnow().isoformat(), "routes": routes}
+    path.write_text(json.dumps(data, indent=2))
+    log.info("Snapshot saved to %s (%d prefixes)", path, len(routes))
 
-    header = f"{'Neighbor':<18} {'Remote AS':<12} {'State':<14} {'Prefixes':>8}  {'Up/Down':<14} {'MsgRcvd':>8} {'MsgSent':>8}"
-    print(header)
-    print("-" * len(header))
 
-    for n in neighbors:
-        pfx = str(n["prefixes_received"]) if n["prefixes_received"] is not None else "-"
-        print(
-            f"{n['neighbor']:<18} {n['remote_as']:<12} {n['state']:<14} {pfx:>8}  "
-            f"{n['updown']:<14} {n['msg_rcvd']:>8} {n['msg_sent']:>8}"
-        )
-
-    total = len(neighbors)
-    up = sum(1 for n in neighbors if n["state"] == "Established")
-    print(f"\nTotal: {total}   Established: {up}   Not established: {total - up}\n")
+def diff_routes(old_routes, new_routes):
+    added = {k: new_routes[k] for k in new_routes if k not in old_routes}
+    removed = {k: old_routes[k] for k in old_routes if k not in new_routes}
+    changed = {}
+    for k in new_routes:
+        if k in old_routes and old_routes[k] != new_routes[k]:
+            changed[k] = {"before": old_routes[k], "after": new_routes[k]}
+    return added, removed, changed
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Retrieve BGP neighbor summary from a network device via SSH."
+        description="Monitor routing table changes on a Cisco IOS device"
     )
-    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", default=None, help="SSH password")
-    parser.add_argument("--key", dest="key_file", default=None, help="SSH private key path")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--vrf", default=None, help="VRF name for VPN BGP summary")
+    parser.add_argument("--host", required=True, help="Device IP or hostname")
+    parser.add_argument("--user", required=True, help="SSH username")
+    parser.add_argument("--password", help="SSH password (prompted if omitted)")
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument("--prefix", help="Filter to a specific prefix (e.g. 10.0.0.0/8)")
     parser.add_argument(
-        "--filter-state",
-        dest="filter_state",
-        metavar="STATE",
-        default=None,
-        help="Show only neighbors matching this state (e.g. Established, Active, Idle)",
+        "--protocol",
+        choices=list(PROTO_MAP.keys()),
+        help="Filter by routing protocol",
     )
-    parser.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON output")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--save", action="store_true", help="Save current table as baseline snapshot"
+    )
+    parser.add_argument(
+        "--diff", action="store_true", help="Compare current table against snapshot"
+    )
+    parser.add_argument("--timeout", type=int, default=15)
     args = parser.parse_args()
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+    if not args.save and not args.diff:
+        parser.error("Specify --save to capture a baseline or --diff to compare")
 
-    if not args.password and not args.key_file:
-        args.password = getpass.getpass(f"Password for {args.username}@{args.device}: ")
-
-    command = (
-        f"show ip bgp vpnv4 vrf {args.vrf} summary" if args.vrf else "show ip bgp summary"
-    )
+    password = args.password or getpass.getpass(f"Password for {args.user}@{args.host}: ")
+    snap = snapshot_path(args.host, args.prefix, args.protocol)
 
     try:
-        logger.debug("Connecting to %s:%d as %s", args.device, args.port, args.username)
-        client = connect(
-            args.device, args.username,
-            password=args.password, key_file=args.key_file, port=args.port,
-        )
+        log.info("Connecting to %s:%d", args.host, args.port)
+        client = ssh_connect(args.host, args.user, password, args.port, args.timeout)
     except paramiko.AuthenticationException:
-        logger.error("Authentication failed for %s@%s", args.username, args.device)
+        log.error("Authentication failed for %s@%s", args.user, args.host)
         sys.exit(1)
-    except (paramiko.SSHException, OSError) as exc:
-        logger.error("Connection error: %s", exc)
+    except Exception as exc:
+        log.error("Connection failed: %s", exc)
         sys.exit(1)
 
     try:
-        raw = run_command(client, command)
-        logger.debug("Raw output:\n%s", raw)
-    except Exception as exc:
-        logger.error("Command execution failed: %s", exc)
-        sys.exit(1)
+        cmd = "show ip route" + (f" {args.prefix}" if args.prefix else "")
+        log.info("Running: %s", cmd)
+        raw = run_command(client, cmd)
     finally:
         client.close()
 
-    if "Invalid input" in raw or "% BGP" in raw:
-        print(f"Device error:\n{raw}", file=sys.stderr)
-        sys.exit(1)
+    routes = parse_routes(raw, args.protocol, args.prefix)
+    log.info("Parsed %d prefixes", len(routes))
 
-    data = parse_bgp_summary(raw)
+    if args.save:
+        save_snapshot(routes, snap)
 
-    if args.as_json:
-        print(json.dumps(data, indent=2))
-    else:
-        print_table(data, filter_state=args.filter_state)
+    if args.diff:
+        if not snap.exists():
+            log.error("No snapshot found at %s — run with --save first", snap)
+            sys.exit(1)
+        stored = json.loads(snap.read_text())
+        log.info("Comparing against snapshot from %s", stored["timestamp"])
+        added, removed, changed = diff_routes(stored["routes"], routes)
+        if not added and not removed and not changed:
+            print("No route changes detected.")
+        else:
+            if added:
+                print(f"\n[+] Added ({len(added)} prefix(es)):")
+                for p, hops in added.items():
+                    print(f"    {p}  via {', '.join(h['via'] for h in hops)}")
+            if removed:
+                print(f"\n[-] Removed ({len(removed)} prefix(es)):")
+                for p, hops in removed.items():
+                    print(f"    {p}  via {', '.join(h['via'] for h in hops)}")
+            if changed:
+                print(f"\n[~] Changed next-hop ({len(changed)} prefix(es)):")
+                for p, delta in changed.items():
+                    before = ", ".join(h["via"] for h in delta["before"])
+                    after = ", ".join(h["via"] for h in delta["after"])
+                    print(f"    {p}  {before} -> {after}")
+        if args.save:
+            save_snapshot(routes, snap)
 
 
 if __name__ == "__main__":
