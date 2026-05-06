@@ -1,220 +1,219 @@
 ```python
 """
-Device System Resource Monitor
+mac_table.py — MAC Address Table Collector
 
-Retrieves system resource statistics from network devices via SSH.
-Monitors CPU, memory, uptime, temperature, and version information.
+Purpose:
+    Retrieves and displays the MAC address table from a Cisco IOS/IOS-XE switch
+    via SSH. Useful for locating endpoints by MAC address, auditing port
+    assignments, and mapping Layer-2 topology without SNMP access.
 
 Usage:
-    python device_health_monitor.py -d 192.168.1.1 -u admin -p password
-    python device_health_monitor.py -f devices.txt -u admin -p password
+    python mac_table.py -H 192.168.1.1 -u admin
+    python mac_table.py -H 10.0.0.1 -u admin -p secret --vlan 100
+    python mac_table.py -H 10.0.0.1 -u admin --mac 00:1a:2b --format json
 
 Prerequisites:
-    - paramiko library installed (pip install paramiko)
-    - SSH access to target devices
-    - Network device running Cisco IOS/IOS-XE or compatible
-    
-Output:
-    Terminal report with system health metrics for each device
+    - Python 3.9+
+    - paramiko >= 2.9.0  (pip install paramiko)
+    - SSH enabled on target device with privilege to run 'show mac address-table'
 """
 
-import paramiko
 import argparse
+import getpass
+import json
 import logging
+import re
 import sys
-from datetime import datetime
+import time
+from dataclasses import asdict, dataclass
+from typing import Optional
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+import paramiko
 
-
-class DeviceHealthMonitor:
-    """Monitor system resources on network devices via SSH."""
-    
-    def __init__(self, host, username, password, timeout=10):
-        self.host = host
-        self.username = username
-        self.password = password
-        self.timeout = timeout
-        self.ssh = None
-        
-    def connect(self):
-        """Establish SSH connection to device."""
-        try:
-            self.ssh = paramiko.SSHClient()
-            self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self.ssh.connect(
-                self.host,
-                username=self.username,
-                password=self.password,
-                timeout=self.timeout,
-                look_for_keys=False,
-                allow_agent=False
-            )
-            logger.info(f"Connected to {self.host}")
-            return True
-        except paramiko.AuthenticationException:
-            logger.error(f"Authentication failed for {self.host}")
-            return False
-        except paramiko.SSHException as e:
-            logger.error(f"SSH error connecting to {self.host}: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Error connecting to {self.host}: {e}")
-            return False
-    
-    def execute_command(self, command):
-        """Execute command on device and return output."""
-        try:
-            stdin, stdout, stderr = self.ssh.exec_command(command, timeout=self.timeout)
-            output = stdout.read().decode('utf-8')
-            error = stderr.read().decode('utf-8')
-            
-            if error and 'invalid' in error.lower():
-                logger.warning(f"Command error: {error[:50]}")
-            
-            return output
-        except Exception as e:
-            logger.error(f"Command execution error on {self.host}: {e}")
-            return None
-    
-    def get_uptime(self):
-        """Retrieve device uptime."""
-        output = self.execute_command("show version")
-        if not output:
-            return "N/A"
-        
-        for line in output.split('\n'):
-            if 'uptime' in line.lower():
-                return line.strip()
-        return "Uptime not found"
-    
-    def get_cpu_usage(self):
-        """Retrieve CPU utilization."""
-        output = self.execute_command("show processes cpu sorted")
-        if not output:
-            return "N/A"
-        
-        for line in output.split('\n'):
-            if 'CPU utilization' in line:
-                return line.strip()
-        return "CPU info not found"
-    
-    def get_memory_usage(self):
-        """Retrieve memory statistics."""
-        output = self.execute_command("show memory statistics")
-        if not output:
-            return "N/A"
-        
-        for line in output.split('\n'):
-            if 'Processor' in line and 'memory' in line.lower():
-                return line.strip()
-        return "Memory info not found"
-    
-    def get_device_model(self):
-        """Retrieve device model and version."""
-        output = self.execute_command("show version | include Model Number")
-        if output:
-            return output.strip()
-        return "Model info unavailable"
-    
-    def collect_health_data(self):
-        """Collect all health metrics from device."""
-        return {
-            'host': self.host,
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'uptime': self.get_uptime(),
-            'cpu_usage': self.get_cpu_usage(),
-            'memory_usage': self.get_memory_usage(),
-            'device_model': self.get_device_model()
-        }
-    
-    def close(self):
-        """Close SSH connection."""
-        if self.ssh:
-            self.ssh.close()
-            logger.info(f"Disconnected from {self.host}")
+LOG = logging.getLogger(__name__)
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='Monitor system resources on network devices'
-    )
-    parser.add_argument(
-        '-d', '--device',
-        help='Target device IP or hostname'
-    )
-    parser.add_argument(
-        '-f', '--file',
-        help='File containing list of devices (one per line)'
-    )
-    parser.add_argument(
-        '-u', '--username',
-        required=True,
-        help='SSH username'
-    )
-    parser.add_argument(
-        '-p', '--password',
-        required=True,
-        help='SSH password'
-    )
-    parser.add_argument(
-        '-t', '--timeout',
-        type=int,
-        default=10,
-        help='SSH connection timeout in seconds'
-    )
-    
-    args = parser.parse_args()
-    
-    if not args.device and not args.file:
-        parser.error("Specify either -d/--device or -f/--file")
-    
-    devices = []
-    if args.device:
-        devices = [args.device]
-    elif args.file:
-        try:
-            with open(args.file, 'r') as f:
-                devices = [line.strip() for line in f if line.strip()]
-        except FileNotFoundError:
-            logger.error(f"File not found: {args.file}")
-            sys.exit(1)
-    
-    results = []
-    for device in devices:
-        monitor = DeviceHealthMonitor(
-            device,
-            args.username,
-            args.password,
-            args.timeout
+@dataclass
+class MACEntry:
+    vlan: str
+    mac: str
+    mac_type: str
+    port: str
+
+
+def _ssh_connect(
+    host: str, port: int, username: str, password: str, timeout: int
+) -> paramiko.SSHClient:
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            host,
+            port=port,
+            username=username,
+            password=password,
+            timeout=timeout,
+            look_for_keys=False,
+            allow_agent=False,
         )
-        
-        if monitor.connect():
-            data = monitor.collect_health_data()
-            results.append(data)
-            
-            print(f"\n--- Health Report: {device} ---")
-            print(f"Timestamp: {data['timestamp']}")
-            print(f"Uptime: {data['uptime']}")
-            print(f"CPU Usage: {data['cpu_usage']}")
-            print(f"Memory: {data['memory_usage']}")
-            print(f"Model: {data['device_model']}")
-            
-            monitor.close()
-        else:
-            logger.error(f"Failed to monitor {device}")
-    
-    if results:
-        logger.info(f"Successfully collected metrics from {len(results)} device(s)")
+    except paramiko.AuthenticationException:
+        LOG.error("Authentication failed for %s@%s", username, host)
+        raise
+    except paramiko.SSHException as exc:
+        LOG.error("SSH negotiation failed for %s: %s", host, exc)
+        raise
+    except OSError as exc:
+        LOG.error("Cannot reach %s:%d — %s", host, port, exc)
+        raise
+    return client
+
+
+def _run_command(client: paramiko.SSHClient, command: str) -> str:
+    channel = client.invoke_shell()
+    channel.settimeout(10.0)
+    time.sleep(0.5)
+    channel.recv(4096)  # discard banner/MOTD
+
+    channel.send("terminal length 0\n")
+    time.sleep(0.5)
+    channel.recv(4096)
+
+    channel.send(command + "\n")
+    time.sleep(2.0)
+
+    output = ""
+    while channel.recv_ready():
+        output += channel.recv(65536).decode("utf-8", errors="replace")
+        time.sleep(0.2)
+
+    channel.close()
+    return output
+
+
+def parse_mac_table(raw: str) -> list[MACEntry]:
+    # Matches Cisco IOS/IOS-XE format:
+    #   10    0050.56ab.cdef    DYNAMIC     GigabitEthernet0/1
+    pattern = re.compile(
+        r"^\s*(\d+)\s+"
+        r"([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+"
+        r"(\S+)\s+"
+        r"(\S+)\s*$",
+        re.MULTILINE,
+    )
+    return [
+        MACEntry(
+            vlan=m.group(1),
+            mac=m.group(2).lower(),
+            mac_type=m.group(3),
+            port=m.group(4),
+        )
+        for m in pattern.finditer(raw)
+    ]
+
+
+def filter_entries(
+    entries: list[MACEntry],
+    vlan: Optional[str],
+    mac_prefix: Optional[str],
+) -> list[MACEntry]:
+    if vlan:
+        entries = [e for e in entries if e.vlan == vlan]
+    if mac_prefix:
+        # normalise separators so 00:1a:2b, 00-1a-2b, 0050.56 all work
+        prefix = mac_prefix.lower().replace(":", ".").replace("-", ".")
+        entries = [e for e in entries if e.mac.startswith(prefix)]
+    return entries
+
+
+def print_table(entries: list[MACEntry]) -> None:
+    if not entries:
+        print("No MAC entries matched.")
+        return
+    col_widths = (6, 18, 10, 0)
+    header = (
+        f"{'VLAN':<{col_widths[0]}} "
+        f"{'MAC Address':<{col_widths[1]}} "
+        f"{'Type':<{col_widths[2]}} "
+        f"Port"
+    )
+    print(header)
+    print("-" * max(60, len(header)))
+    for e in entries:
+        print(
+            f"{e.vlan:<{col_widths[0]}} "
+            f"{e.mac:<{col_widths[1]}} "
+            f"{e.mac_type:<{col_widths[2]}} "
+            f"{e.port}"
+        )
+    print(f"\n{len(entries)} entries.")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Retrieve the MAC address table from a Cisco switch via SSH."
+    )
+    parser.add_argument("-H", "--host", required=True, help="Switch IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--vlan", help="Filter output to a specific VLAN ID")
+    parser.add_argument(
+        "--mac", help="Filter by MAC prefix, any separator (e.g. 00:1a:2b)"
+    )
+    parser.add_argument(
+        "--format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format (default: table)",
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=15, help="SSH connect timeout in seconds"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.WARNING,
+        format="%(levelname)s %(message)s",
+    )
+
+    password = args.password or getpass.getpass(
+        f"Password for {args.username}@{args.host}: "
+    )
+
+    try:
+        client = _ssh_connect(args.host, args.port, args.username, password, args.timeout)
+    except Exception:
+        return 1
+
+    try:
+        raw = _run_command(client, "show mac address-table")
+    except Exception as exc:
+        LOG.error("Command failed: %s", exc)
+        return 1
+    finally:
+        client.close()
+
+    entries = parse_mac_table(raw)
+    if not entries:
+        print(
+            "No MAC entries parsed. Use --debug to inspect raw output.",
+            file=sys.stderr,
+        )
+        if args.debug:
+            print(raw)
+        return 1
+
+    entries = filter_entries(entries, args.vlan, args.mac)
+
+    if args.format == "json":
+        print(json.dumps([asdict(e) for e in entries], indent=2))
     else:
-        logger.warning("No devices were successfully monitored")
-        sys.exit(1)
+        print_table(entries)
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 ```
