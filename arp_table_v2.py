@@ -1,241 +1,223 @@
-arp_table_monitor.py - ARP Table Change Monitor
+```python
+"""
+ARP Change Monitor — detect unauthorized devices and ARP spoofing on network infrastructure.
 
-Purpose:
-    Connects to a Cisco IOS/IOS-XE device via SSH, retrieves the current ARP
-    table, and optionally compares it against a saved baseline to detect new
-    hosts, removed entries, and IP/MAC binding changes. Useful for spotting
-    rogue devices, ARP poisoning attempts, and unauthorized DHCP assignments.
+Connects via SSH (paramiko), fetches 'show ip arp', and compares the result against a
+saved baseline or a previous poll. Useful for security auditing, change management, and
+detecting rogue devices or ARP spoofing in a network segment.
 
 Usage:
-    # One-shot snapshot:
-    python arp_table_monitor.py --host 192.168.1.1 --user admin
+    # One-shot: print current table
+    python arp_monitor.py -H 192.168.1.1 -u admin -p secret
 
-    # Save current table as baseline:
-    python arp_table_monitor.py --host 192.168.1.1 --user admin --baseline save
+    # Save a baseline, then diff against it on the next run
+    python arp_monitor.py -H 192.168.1.1 -u admin -p secret --baseline arp_baseline.json
 
-    # Compare current table against saved baseline:
-    python arp_table_monitor.py --host 192.168.1.1 --user admin --baseline compare
-
-    # Use a non-default baseline file:
-    python arp_table_monitor.py --host 192.168.1.1 --user admin \
-        --baseline compare --baseline-file /tmp/arp_snap.json
+    # Continuously poll every 60 seconds and alert on changes
+    python arp_monitor.py -H 192.168.1.1 -u admin --key ~/.ssh/id_rsa --watch --interval 60
 
 Prerequisites:
     pip install paramiko
-    SSH must be enabled on the target device.
-    Tested against Cisco IOS 15.x and IOS-XE 17.x.
-    'show arp' output must follow the standard Cisco columnar format.
+    SSH access with at least privilege level 1 (show commands).
+    Tested against Cisco IOS, IOS-XE, and NX-OS 'show ip arp' output.
 """
 
 import argparse
 import json
 import logging
-import os
 import re
 import sys
 import time
 from datetime import datetime, timezone
-from getpass import getpass
+from pathlib import Path
 
 import paramiko
 
 logging.basicConfig(
-    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
 )
 log = logging.getLogger(__name__)
 
-_ARP_RE = re.compile(
-    r"(?P<protocol>\S+)\s+"
-    r"(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s+"
-    r"(?P<age>\S+)\s+"
-    r"(?P<mac>[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+"
-    r"(?P<encap>\S+)\s+"
-    r"(?P<interface>\S+)"
-)
 
-
-def _connect(host, port, username, password, timeout):
+def ssh_run(host, port, username, password, key_file, command, timeout=10):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
+    connect_kwargs = dict(
         hostname=host,
         port=port,
         username=username,
-        password=password,
         timeout=timeout,
-        look_for_keys=False,
+        look_for_keys=bool(key_file),
         allow_agent=False,
     )
-    return client
-
-
-def _run(client, command, settle=3):
-    shell = client.invoke_shell(width=220, height=50)
-    shell.settimeout(settle + 2)
-    time.sleep(1)
-    shell.recv(8192)  # drain banner/prompt
-    shell.send("terminal length 0\n")
-    time.sleep(0.5)
-    shell.recv(8192)
-    shell.send(command + "\n")
-    time.sleep(settle)
-    buf = ""
-    while shell.recv_ready():
-        buf += shell.recv(65535).decode("utf-8", errors="replace")
-    shell.close()
-    return buf
-
-
-def parse_arp(raw):
-    entries = {}
-    for line in raw.splitlines():
-        m = _ARP_RE.search(line)
-        if m:
-            ip = m.group("ip")
-            entries[ip] = {
-                "mac": m.group("mac").lower(),
-                "interface": m.group("interface"),
-                "protocol": m.group("protocol"),
-            }
-    return entries
-
-
-def save_baseline(entries, path):
-    payload = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "count": len(entries),
-        "entries": entries,
-    }
-    with open(path, "w") as fh:
-        json.dump(payload, fh, indent=2)
-    log.info("Baseline saved → %s  (%d entries)", path, len(entries))
-
-
-def load_baseline(path):
-    if not os.path.exists(path):
-        log.error("Baseline file not found: %s", path)
-        sys.exit(1)
-    with open(path) as fh:
-        data = json.load(fh)
-    log.info("Baseline loaded: %s  (%d entries)", data.get("timestamp", "?"), data["count"])
-    return data["entries"]
-
-
-def diff_tables(old, new):
-    added = {ip: new[ip] for ip in new if ip not in old}
-    removed = {ip: old[ip] for ip in old if ip not in new}
-    rebound = {
-        ip: {"was": old[ip]["mac"], "now": new[ip]["mac"], "iface": new[ip]["interface"]}
-        for ip in new
-        if ip in old and new[ip]["mac"] != old[ip]["mac"]
-    }
-    return added, removed, rebound
-
-
-def _print_table(entries, title):
-    print(f"\n{title}")
-    print("─" * 62)
-    print(f"  {'IP Address':<18} {'MAC Address':<20} {'Interface'}")
-    print("─" * 62)
-    for ip in sorted(entries):
-        d = entries[ip]
-        print(f"  {ip:<18} {d['mac']:<20} {d['interface']}")
-    print(f"\n  {len(entries)} total entries")
-
-
-def _print_diff(added, removed, rebound):
-    if not (added or removed or rebound):
-        print("\n  [OK] No changes detected since baseline.")
-        return
-
-    if added:
-        print(f"\n  [+] {len(added)} new host(s):")
-        for ip in sorted(added):
-            d = added[ip]
-            print(f"      + {ip:<18} {d['mac']}  {d['interface']}")
-
-    if removed:
-        print(f"\n  [-] {len(removed)} removed host(s):")
-        for ip in sorted(removed):
-            d = removed[ip]
-            print(f"      - {ip:<18} {d['mac']}  {d['interface']}")
-
-    if rebound:
-        print(f"\n  [!] {len(rebound)} MAC binding change(s)  (possible ARP spoof):")
-        for ip in sorted(rebound):
-            d = rebound[ip]
-            print(f"      ! {ip:<18} {d['was']} → {d['now']}  ({d['iface']})")
-
-
-def _build_parser():
-    p = argparse.ArgumentParser(
-        description="Retrieve ARP table from a Cisco device and optionally monitor for changes."
-    )
-    p.add_argument("--host", required=True, help="Device IP or hostname")
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("--user", required=True, help="SSH username")
-    p.add_argument("--password", help="SSH password (prompted if omitted)")
-    p.add_argument(
-        "--baseline",
-        choices=["save", "compare"],
-        metavar="MODE",
-        help="'save' snapshots the current table; 'compare' diffs against a saved snapshot",
-    )
-    p.add_argument(
-        "--baseline-file",
-        default="arp_baseline.json",
-        help="Baseline JSON path (default: arp_baseline.json)",
-    )
-    p.add_argument(
-        "--command",
-        default="show arp",
-        help="ARP command to run (default: 'show arp')",
-    )
-    p.add_argument("--timeout", type=int, default=10, help="SSH connect timeout in seconds")
-    p.add_argument("--debug", action="store_true", help="Verbose paramiko logging")
-    return p
-
-
-if __name__ == "__main__":
-    args = _build_parser().parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logging.getLogger("paramiko").setLevel(logging.DEBUG)
-
-    password = args.password or getpass(f"Password for {args.user}@{args.host}: ")
-
+    if key_file:
+        connect_kwargs["key_filename"] = key_file
+    else:
+        connect_kwargs["password"] = password
     try:
-        log.info("Connecting to %s:%d …", args.host, args.port)
-        client = _connect(args.host, args.port, args.user, password, args.timeout)
-    except paramiko.AuthenticationException:
-        log.error("Authentication failed for %s@%s", args.user, args.host)
-        sys.exit(1)
-    except (paramiko.SSHException, OSError) as exc:
-        log.error("Connection failed: %s", exc)
-        sys.exit(1)
-
-    try:
-        log.info("Running: %s", args.command)
-        raw = _run(client, args.command)
+        client.connect(**connect_kwargs)
+        _, stdout, stderr = client.exec_command(command, timeout=timeout)
+        output = stdout.read().decode(errors="replace")
+        err = stderr.read().decode(errors="replace").strip()
+        if err:
+            log.debug("Device stderr: %s", err)
+        return output
     finally:
         client.close()
 
-    current = parse_arp(raw)
-    if not current:
-        log.warning("No ARP entries parsed — verify command output or adjust --command")
-        log.debug("Raw output:\n%s", raw)
-        sys.exit(1)
 
-    if args.baseline == "save":
-        save_baseline(current, args.baseline_file)
-        _print_table(current, f"ARP Baseline — {args.host}")
-    elif args.baseline == "compare":
-        baseline = load_baseline(args.baseline_file)
-        added, removed, rebound = diff_tables(baseline, current)
-        _print_table(current, f"Current ARP Table — {args.host}")
-        _print_diff(added, removed, rebound)
-    else:
-        _print_table(current, f"ARP Table — {args.host}")
+def parse_arp_table(raw):
+    """Return {ip: mac} from 'show ip arp' output (IOS/IOS-XE/NX-OS)."""
+    entries = {}
+    # Matches the IP and dotted-hex MAC anywhere on the line
+    pattern = re.compile(
+        r"(\d{1,3}(?:\.\d{1,3}){3})\s+\S+\s+"
+        r"([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})"
+    )
+    for line in raw.splitlines():
+        m = pattern.search(line)
+        if m:
+            entries[m.group(1)] = m.group(2).lower()
+    return entries
+
+
+def diff_arp(baseline, current):
+    new = {ip: mac for ip, mac in current.items() if ip not in baseline}
+    gone = {ip: mac for ip, mac in baseline.items() if ip not in current}
+    changed = {
+        ip: {"was": baseline[ip], "now": current[ip]}
+        for ip in current
+        if ip in baseline and current[ip] != baseline[ip]
+    }
+    return new, gone, changed
+
+
+def report_diff(new, gone, changed, host):
+    total = len(new) + len(gone) + len(changed)
+    if total == 0:
+        log.info("[%s] ARP table unchanged.", host)
+        return
+    log.warning("[%s] %d ARP change(s) detected:", host, total)
+    for ip, mac in sorted(new.items()):
+        log.warning("  NEW     %-18s %s", ip, mac)
+    for ip, mac in sorted(gone.items()):
+        log.warning("  REMOVED %-18s %s", ip, mac)
+    for ip, info in sorted(changed.items()):
+        log.warning("  CHANGED %-18s %s -> %s  ** possible ARP spoof **",
+                    ip, info["was"], info["now"])
+
+
+def load_baseline(path):
+    with open(path) as f:
+        data = json.load(f)
+    return data.get("entries", data) if isinstance(data, dict) else data
+
+
+def save_snapshot(entries, path):
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "entry_count": len(entries),
+        "entries": entries,
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+    log.info("Snapshot saved: %s (%d entries)", path, len(entries))
+
+
+def fetch_arp(args):
+    raw = ssh_run(
+        host=args.host,
+        port=args.port,
+        username=args.username,
+        password=args.password,
+        key_file=args.key,
+        command="show ip arp",
+    )
+    return parse_arp_table(raw)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Monitor ARP table changes on a Cisco device for security auditing."
+    )
+    p.add_argument("-H", "--host", required=True, help="Device hostname or IP")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", default=None, help="SSH password")
+    p.add_argument("--key", metavar="FILE", help="SSH private key path")
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument(
+        "--baseline", metavar="FILE",
+        help="JSON baseline file. Created on first run; diffed on subsequent runs.",
+    )
+    p.add_argument(
+        "--save", metavar="FILE",
+        help="Save current ARP snapshot to FILE after each poll.",
+    )
+    p.add_argument(
+        "--watch", action="store_true",
+        help="Poll continuously until Ctrl-C, reporting any changes.",
+    )
+    p.add_argument(
+        "--interval", type=int, default=120, metavar="SECS",
+        help="Poll interval in watch mode, seconds (default: 120).",
+    )
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+
+    if not args.password and not args.key:
+        sys.exit("error: provide --password or --key for authentication")
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    log.info("Connecting to %s:%d as %s", args.host, args.port, args.username)
+    try:
+        current = fetch_arp(args)
+    except paramiko.AuthenticationException:
+        sys.exit(f"error: authentication failed for {args.username}@{args.host}")
+    except (paramiko.SSHException, OSError) as exc:
+        sys.exit(f"error: {exc}")
+
+    log.info("Fetched %d ARP entries from %s", len(current), args.host)
+
+    if args.save:
+        save_snapshot(current, args.save)
+
+    if args.baseline:
+        bpath = Path(args.baseline)
+        if not bpath.exists():
+            log.info("No baseline found — saving current table as baseline: %s", args.baseline)
+            save_snapshot(current, args.baseline)
+        else:
+            baseline = load_baseline(args.baseline)
+            report_diff(*diff_arp(baseline, current), args.host)
+    elif not args.watch:
+        print(f"{'IP Address':<18} {'MAC Address'}")
+        print("-" * 36)
+        for ip, mac in sorted(current.items()):
+            print(f"{ip:<18} {mac}")
+
+    if args.watch:
+        log.info("Watch mode active — polling every %ds. Ctrl-C to stop.", args.interval)
+        snapshot = current
+        while True:
+            time.sleep(args.interval)
+            try:
+                current = fetch_arp(args)
+            except (paramiko.SSHException, OSError) as exc:
+                log.warning("Poll failed (%s) — will retry next interval.", exc)
+                continue
+            report_diff(*diff_arp(snapshot, current), args.host)
+            snapshot = current
+            if args.save:
+                save_snapshot(current, args.save)
+
+
+if __name__ == "__main__":
+    main()
+```
