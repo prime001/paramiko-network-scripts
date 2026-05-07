@@ -1,21 +1,23 @@
+Here is the complete script:
+
 ```python
 """
-cdp_lldp_neighbors.py - Collect CDP/LLDP neighbor topology from network devices.
+cdp_lldp_neighbors.py - Network Neighbor Discovery via CDP/LLDP
 
-Purpose:
-    Connects to a Cisco (or compatible) network device via SSH and retrieves
-    neighbor adjacency data using CDP or LLDP. Useful for building layer-2/3
-    topology maps, auditing physical connectivity, and verifying cabling.
+Connects to a network device via SSH using paramiko and queries CDP and/or
+LLDP neighbor tables to map directly connected devices. Useful for building
+network topology diagrams, auditing cabling, and verifying switch/router
+adjacencies without relying on SNMP or NMS infrastructure.
 
 Usage:
-    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin
-    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin --protocol lldp --format json
-    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin -k ~/.ssh/id_rsa -v
+    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin -p secret
+    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin --protocol lldp
+    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin -p secret --output json
 
 Prerequisites:
     pip install paramiko
-    CDP or LLDP must be enabled on the target device.
-    SSH access with privilege level sufficient to run 'show' commands.
+    SSH access to target device with sufficient privilege (show commands)
+    CDP (Cisco) or LLDP must be enabled: `cdp run` / `lldp run`
 """
 
 import argparse
@@ -24,174 +26,197 @@ import json
 import logging
 import re
 import sys
+import time
 
 import paramiko
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
 
-def ssh_connect(host, username, password=None, key_file=None, port=22, timeout=15):
+def connect(host, username, password, port=22, timeout=15):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    connect_kwargs = {
-        "hostname": host,
-        "port": port,
-        "username": username,
-        "timeout": timeout,
-        "look_for_keys": False,
-        "allow_agent": False,
-    }
-    if key_file:
-        connect_kwargs["key_filename"] = key_file
-        connect_kwargs["look_for_keys"] = True
-    elif password:
-        connect_kwargs["password"] = password
-    try:
-        client.connect(**connect_kwargs)
-    except paramiko.AuthenticationException:
-        log.error("Authentication failed for %s@%s", username, host)
-        raise
-    except Exception as exc:
-        log.error("Connection to %s failed: %s", host, exc)
-        raise
-    return client
+    client.connect(
+        hostname=host,
+        port=port,
+        username=username,
+        password=password,
+        timeout=timeout,
+        look_for_keys=False,
+        allow_agent=False,
+    )
+    shell = client.invoke_shell(width=200, height=500)
+    time.sleep(1.0)
+    if shell.recv_ready():
+        shell.recv(65535)
+    _send(shell, "terminal length 0")
+    return client, shell
 
 
-def run_command(client, command, timeout=30):
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    output = stdout.read().decode(errors="replace")
-    err = stderr.read().decode(errors="replace").strip()
-    if err:
-        log.debug("stderr from device: %s", err)
-    return output
+def _send(shell, command, wait=1.5):
+    shell.send(command + "\n")
+    time.sleep(wait)
+    buf = ""
+    while shell.recv_ready():
+        buf += shell.recv(65535).decode("utf-8", errors="replace")
+    return buf
 
 
-def parse_cdp_neighbors(raw):
+def parse_cdp(output):
     neighbors = []
-    blocks = re.split(r"(?=Device ID:)", raw)
-    for block in blocks:
-        if "Device ID:" not in block:
+    for block in re.split(r"-{10,}", output):
+        if "Device ID" not in block:
             continue
-        entry = {}
-        m = re.search(r"Device ID:\s*(.+)", block)
+        n = {}
+        m = re.search(r"Device ID:\s*(\S+)", block)
         if m:
-            entry["device_id"] = m.group(1).strip()
-        m = re.search(r"IP address:\s*(\S+)", block)
-        entry["ip"] = m.group(1) if m else ""
-        m = re.search(r"Platform:\s*([^,]+)", block)
-        entry["platform"] = m.group(1).strip() if m else ""
-        m = re.search(r"Interface:\s*(\S+)", block)
-        entry["local_port"] = m.group(1).rstrip(",") if m else ""
-        m = re.search(r"Port ID \(outgoing port\):\s*(\S+)", block)
-        entry["remote_port"] = m.group(1) if m else ""
-        m = re.search(r"Duplex:\s*(\S+)", block)
-        entry["duplex"] = m.group(1) if m else ""
-        if entry.get("device_id"):
-            neighbors.append(entry)
+            n["device_id"] = m.group(1)
+        m = re.search(r"IP address:\s*(\S+)", block, re.IGNORECASE)
+        if m:
+            n["ip_address"] = m.group(1)
+        m = re.search(r"Platform:\s*([^,\n]+)", block)
+        if m:
+            n["platform"] = m.group(1).strip()
+        m = re.search(r"Interface:\s*(\S+?),\s*Port ID[^:]*:\s*(\S+)", block)
+        if m:
+            n["local_intf"] = m.group(1)
+            n["remote_intf"] = m.group(2)
+        m = re.search(r"Version\s*:\s*\n?\s*(.+?)(?:\n|$)", block)
+        if m:
+            n["version"] = m.group(1).strip()
+        if n.get("device_id"):
+            neighbors.append(n)
     return neighbors
 
 
-def parse_lldp_neighbors(raw):
+def parse_lldp(output):
     neighbors = []
-    blocks = re.split(r"(?=Local Intf:)", raw)
-    for block in blocks:
-        if "Local Intf:" not in block:
+    for block in re.split(r"-{5,}", output):
+        if "System Name" not in block and "Chassis id" not in block:
             continue
-        entry = {}
-        m = re.search(r"Local Intf:\s*(\S+)", block)
-        entry["local_port"] = m.group(1) if m else ""
-        m = re.search(r"System Name:\s*(.+)", block)
-        entry["device_id"] = m.group(1).strip() if m else ""
-        m = re.search(r"Port id:\s*(\S+)", block)
-        entry["remote_port"] = m.group(1) if m else ""
-        m = re.search(r"Management Addresses[:\s]+(\S+)", block)
-        entry["ip"] = m.group(1) if m else ""
-        m = re.search(r"System Description[:\s]+(.+)", block)
-        entry["platform"] = m.group(1).strip() if m else ""
-        entry["duplex"] = ""
-        if entry.get("device_id") or entry.get("local_port"):
-            neighbors.append(entry)
+        n = {}
+        m = re.search(r"System Name:\s*(\S+)", block)
+        if m:
+            n["device_id"] = m.group(1)
+        m = re.search(
+            r"Management Addresses?.*?(\d{1,3}(?:\.\d{1,3}){3})",
+            block,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if m:
+            n["ip_address"] = m.group(1)
+        m = re.search(r"System Description:\s*(.+?)(?:\n\s*\n|\Z)", block, re.DOTALL)
+        if m:
+            n["platform"] = re.sub(r"\s+", " ", m.group(1)).strip()[:80]
+        m = re.search(r"Local Intf(?:erface)?:\s*(\S+)", block, re.IGNORECASE)
+        if m:
+            n["local_intf"] = m.group(1)
+        m = re.search(r"Port (?:id|ID):\s*(\S+)", block)
+        if m:
+            n["remote_intf"] = m.group(1)
+        if n.get("device_id"):
+            neighbors.append(n)
     return neighbors
 
 
 def print_table(neighbors, host, protocol):
-    print(f"\n{protocol.upper()} neighbors on {host} ({len(neighbors)} found):")
-    header = f"{'Device ID':<32} {'Local Port':<18} {'Remote Port':<18} {'IP':<16} Platform"
-    print(header)
-    print("-" * len(header) + "-" * 10)
+    print(f"\n{protocol.upper()} neighbors on {host}")
+    print("=" * 95)
+    hdr = "{:<28} {:<16} {:<22} {:<22}"
+    print(hdr.format("Device ID", "IP Address", "Local Interface", "Remote Interface"))
+    print("-" * 95)
     for n in neighbors:
-        print(
-            f"{n['device_id']:<32} {n['local_port']:<18} {n['remote_port']:<18}"
-            f" {n['ip']:<16} {n['platform']}"
-        )
+        print(hdr.format(
+            n.get("device_id", "")[:27],
+            n.get("ip_address", "N/A")[:15],
+            n.get("local_intf", "N/A")[:21],
+            n.get("remote_intf", "N/A")[:21],
+        ))
+    print(f"\nTotal: {len(neighbors)} neighbor(s)\n")
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Collect CDP/LLDP neighbor topology from a network device."
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Discover directly connected neighbors via CDP or LLDP"
     )
-    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
-    parser.add_argument("-k", "--key-file", default=None, help="Path to SSH private key")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument(
+    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument(
         "--protocol",
-        choices=["cdp", "lldp"],
+        choices=["cdp", "lldp", "both"],
         default="cdp",
-        help="Neighbor discovery protocol (default: cdp)",
+        help="Discovery protocol to query (default: cdp)",
     )
-    parser.add_argument(
-        "--format",
+    p.add_argument(
+        "--output",
         choices=["table", "json"],
         default="table",
         help="Output format (default: table)",
     )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    args = parser.parse_args()
+    p.add_argument("--timeout", type=int, default=15, help="SSH connect timeout in seconds")
+    p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return p
 
-    if args.verbose:
+
+def main():
+    args = build_parser().parse_args()
+
+    if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+    logging.getLogger("paramiko").setLevel(logging.WARNING)
 
-    if not args.key_file and not args.password:
-        args.password = getpass.getpass(f"Password for {args.username}@{args.device}: ")
+    password = args.password or getpass.getpass(
+        f"Password for {args.username}@{args.device}: "
+    )
 
+    log.info("Connecting to %s", args.device)
     try:
-        log.info("Connecting to %s", args.device)
-        client = ssh_connect(args.device, args.username, args.password, args.key_file, args.port)
-    except Exception:
+        client, shell = connect(
+            args.device, args.username, password, args.port, args.timeout
+        )
+    except paramiko.AuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.device)
+        sys.exit(1)
+    except (paramiko.SSHException, OSError) as exc:
+        log.error("SSH connection failed: %s", exc)
         sys.exit(1)
 
+    results = {}
     try:
-        command = f"show {args.protocol} neighbors detail"
-        log.info("Running: %s", command)
-        raw = run_command(client, command)
+        protocols = ["cdp", "lldp"] if args.protocol == "both" else [args.protocol]
+        for proto in protocols:
+            log.info("Querying %s neighbors", proto.upper())
+            raw = _send(shell, f"show {proto} neighbors detail", wait=2.5)
+            if "Invalid input" in raw or "% Error" in raw or "not enabled" in raw.lower():
+                log.warning("%s not available on this device", proto.upper())
+                continue
+            neighbors = parse_cdp(raw) if proto == "cdp" else parse_lldp(raw)
+            log.info("Found %d %s neighbor(s)", len(neighbors), proto.upper())
+            results[proto] = neighbors
     finally:
+        shell.close()
         client.close()
 
-    neighbors = parse_cdp_neighbors(raw) if args.protocol == "cdp" else parse_lldp_neighbors(raw)
-
-    if not neighbors:
-        log.warning(
-            "No neighbors found — verify %s is enabled on %s",
-            args.protocol.upper(),
-            args.device,
-        )
+    if not results:
+        log.warning("No neighbor data collected — verify CDP/LLDP is enabled")
         sys.exit(0)
 
-    if args.format == "json":
-        print(json.dumps(
-            {"device": args.device, "protocol": args.protocol, "neighbors": neighbors},
-            indent=2,
-        ))
+    if args.output == "json":
+        print(json.dumps(results, indent=2))
     else:
-        print_table(neighbors, args.device, args.protocol)
+        for proto, neighbors in results.items():
+            print_table(neighbors, args.device, proto)
 
 
 if __name__ == "__main__":
     main()
 ```
+
+**What this does differently from `device_inventory.py`:** Instead of inventorying *a single device*, it maps *connected neighbors* — parsing `show cdp/lldp neighbors detail` to extract device IDs, management IPs, platforms, and the local/remote interface pair for each link. The `--protocol both` flag queries both CDP and LLDP in one pass. Output is either a formatted table or JSON for downstream processing.
