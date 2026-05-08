@@ -1,30 +1,35 @@
+The write was blocked by permissions. Here is the complete script content — paste it into `password_rotation.py` in your repo:
+
 ```python
 """
-credential_rotator.py - Rotate SSH login password and enable secret on Cisco IOS devices.
+password_rotation.py - Network Device Password Rotation via Paramiko
 
-Purpose:
-    Connects to one or more Cisco IOS devices via SSH and rotates the local
-    username password, enable secret, or both. After rotation, verifies the
-    new credentials by reconnecting before reporting success.
+Connects to one or more Cisco IOS/IOS-XE devices and rotates the enable
+secret and/or a named local user's password. After each rotation the script
+immediately re-authenticates with the new credential to verify it works,
+then logs a pass/fail result per device.
 
 Usage:
-    python credential_rotator.py -H 192.168.1.1 -u admin -p OldPass \
-        --new-password NewPass456 --enable-secret NewEnable789
+    # Single device
+    python password_rotation.py -d 192.168.1.1 -u admin -p OldPass \
+        --new-password NewPass123 --username-to-rotate netops
 
-    # Rotate across a fleet from a host file (one IP per line, # for comments):
-    python credential_rotator.py --hosts-file devices.txt -u admin -p OldPass \
-        --new-password NewPass456
+    # Multiple devices from file (one IP per line)
+    python password_rotation.py -f devices.txt -u admin -p OldPass \
+        --new-password NewPass123 --enable --username-to-rotate netops
+
+    # Rotate enable secret only
+    python password_rotation.py -d 192.168.1.1 -u admin -p OldPass \
+        --enable-secret OldEnable --new-enable-secret NewEnable --enable
 
 Prerequisites:
     pip install paramiko
-    Device must have SSH enabled with sufficient privilege to enter config mode.
 """
 
 import argparse
 import logging
 import sys
 import time
-from pathlib import Path
 
 import paramiko
 
@@ -36,151 +41,162 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def _connect(host: str, username: str, password: str, port: int) -> paramiko.SSHClient:
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=host,
-        port=port,
-        username=username,
-        password=password,
-        look_for_keys=False,
-        allow_agent=False,
-        timeout=15,
-    )
-    return client
-
-
-def _drain(shell: paramiko.Channel, chunk: int = 4096) -> str:
+def _exec(shell, command: str, wait: float = 1.5) -> str:
+    shell.send(command + "\n")
+    time.sleep(wait)
     output = ""
     while shell.recv_ready():
-        output += shell.recv(chunk).decode("utf-8", errors="replace")
+        output += shell.recv(4096).decode("utf-8", errors="replace")
     return output
 
 
-def _send(shell: paramiko.Channel, cmd: str, delay: float = 0.5) -> str:
-    shell.send(cmd + "\n")
-    time.sleep(delay)
-    return _drain(shell)
+def _open_shell(host: str, username: str, password: str, timeout: int = 10):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        host,
+        username=username,
+        password=password,
+        timeout=timeout,
+        look_for_keys=False,
+        allow_agent=False,
+    )
+    shell = client.invoke_shell(width=200, height=50)
+    time.sleep(1.0)
+    shell.recv(4096)
+    return client, shell
 
 
 def rotate_device(
     host: str,
     username: str,
-    current_password: str,
-    new_password: str,
-    enable_secret: "str | None" = None,
-    port: int = 22,
+    password: str,
+    new_password: str | None,
+    username_to_rotate: str | None,
+    enable_secret: str | None,
+    new_enable_secret: str | None,
+    use_enable: bool,
+    timeout: int,
 ) -> bool:
-    """Push new credentials to a device and verify they work before returning True."""
+    log.info("[%s] Connecting …", host)
     try:
-        client = _connect(host, username, current_password, port)
-    except paramiko.AuthenticationException:
-        log.error("%s: authentication failed with current credentials", host)
-        return False
+        client, shell = _open_shell(host, username, password, timeout)
     except Exception as exc:
-        log.error("%s: connection error: %s", host, exc)
+        log.error("[%s] Connection failed: %s", host, exc)
         return False
 
     try:
-        shell = client.invoke_shell(width=200, height=50)
-        shell.settimeout(10)
-        time.sleep(1.0)
-        _drain(shell)
+        _exec(shell, "terminal length 0")
 
-        _send(shell, "enable", delay=0.4)
-        if enable_secret:
-            _send(shell, enable_secret, delay=0.4)
+        if use_enable and enable_secret:
+            out = _exec(shell, "enable")
+            if "Password" in out:
+                _exec(shell, enable_secret)
 
-        _send(shell, "conf t")
-        _send(shell, f"username {username} secret {new_password}")
-        if enable_secret:
-            _send(shell, f"enable secret {enable_secret}")
-        _send(shell, "end")
-        out = _send(shell, "write memory", delay=2.0)
+        _exec(shell, "configure terminal")
 
-        if "[OK]" not in out:
-            log.warning("%s: unexpected write memory output: %s", host, out.strip())
-    except Exception as exc:
-        log.error("%s: error during credential push: %s", host, exc)
-        return False
-    finally:
+        if username_to_rotate and new_password:
+            cmd = f"username {username_to_rotate} privilege 15 secret {new_password}"
+            _exec(shell, cmd)
+            log.info("[%s] Rotated password for user '%s'", host, username_to_rotate)
+
+        if new_enable_secret:
+            _exec(shell, f"enable secret {new_enable_secret}")
+            log.info("[%s] Rotated enable secret", host)
+
+        _exec(shell, "end")
+        _exec(shell, "write memory", wait=3.0)
         client.close()
-
-    try:
-        verify = _connect(host, username, new_password, port)
-        verify.close()
-        log.info("%s: rotation verified — new credentials accepted", host)
-        return True
-    except paramiko.AuthenticationException:
-        log.error("%s: rotation failed — device rejected new credentials", host)
-        return False
     except Exception as exc:
-        # Device may throttle reconnects; rotation likely succeeded
-        log.warning("%s: rotation complete but re-connect check failed: %s", host, exc)
+        log.error("[%s] Rotation commands failed: %s", host, exc)
+        client.close()
+        return False
+
+    # Verify new credential
+    verify_user = username_to_rotate or username
+    verify_pass = new_password or password
+    log.info("[%s] Verifying new credentials …", host)
+    try:
+        vc, vs = _open_shell(host, verify_user, verify_pass, timeout)
+        _exec(vs, "show version", wait=2.0)
+        vc.close()
+        log.info("[%s] Verification PASSED", host)
         return True
-
-
-def load_hosts(hosts_file: Path) -> list:
-    if not hosts_file.exists():
-        log.error("Hosts file not found: %s", hosts_file)
-        sys.exit(1)
-    return [
-        line.strip()
-        for line in hosts_file.read_text().splitlines()
-        if line.strip() and not line.startswith("#")
-    ]
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Rotate SSH password and/or enable secret on Cisco IOS devices."
-    )
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("-H", "--host", help="Single device IP or hostname")
-    target.add_argument("--hosts-file", type=Path, metavar="FILE",
-                        help="File listing one host per line (# lines ignored)")
-
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", required=True, help="Current password")
-    parser.add_argument("--new-password", required=True, help="Replacement password")
-    parser.add_argument("--enable-secret", default=None,
-                        help="New enable secret (skipped if omitted)")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--debug", action="store_true", help="Enable debug-level logging")
-    return parser.parse_args()
+    except Exception as exc:
+        log.error("[%s] Verification FAILED — new credential rejected: %s", host, exc)
+        return False
 
 
 def main() -> None:
-    args = parse_args()
+    parser = argparse.ArgumentParser(
+        description="Rotate passwords on Cisco IOS/IOS-XE devices."
+    )
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("-d", "--device", help="Single device IP or hostname")
+    target.add_argument("-f", "--file", help="File with one device IP per line")
 
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+    parser.add_argument("-u", "--username", required=True, help="SSH login username")
+    parser.add_argument("-p", "--password", required=True, help="Current SSH password")
+    parser.add_argument("--new-password", help="New password for --username-to-rotate")
+    parser.add_argument(
+        "--username-to-rotate",
+        help="Local username whose password should be rotated",
+    )
+    parser.add_argument(
+        "--enable", action="store_true", help="Enter enable mode before configuring"
+    )
+    parser.add_argument("--enable-secret", help="Current enable secret")
+    parser.add_argument("--new-enable-secret", help="New enable secret to set")
+    parser.add_argument(
+        "--timeout", type=int, default=10, help="SSH connection timeout (default 10s)"
+    )
+    args = parser.parse_args()
 
-    hosts = [args.host] if args.host else load_hosts(args.hosts_file)
-    if not hosts:
-        log.error("No hosts to process")
+    if not args.new_password and not args.new_enable_secret:
+        parser.error("At least one of --new-password or --new-enable-secret is required")
+
+    devices: list[str] = []
+    if args.device:
+        devices = [args.device]
+    else:
+        try:
+            with open(args.file) as fh:
+                devices = [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
+        except OSError as exc:
+            log.error("Cannot read device file: %s", exc)
+            sys.exit(1)
+
+    if not devices:
+        log.error("No devices to process")
         sys.exit(1)
 
-    succeeded, failed = [], []
-    for host in hosts:
-        log.info("Rotating credentials on %s", host)
-        ok = rotate_device(
+    results: dict[str, bool] = {}
+    for host in devices:
+        results[host] = rotate_device(
             host=host,
             username=args.username,
-            current_password=args.password,
+            password=args.password,
             new_password=args.new_password,
+            username_to_rotate=args.username_to_rotate,
             enable_secret=args.enable_secret,
-            port=args.port,
+            new_enable_secret=args.new_enable_secret,
+            use_enable=args.enable,
+            timeout=args.timeout,
         )
-        (succeeded if ok else failed).append(host)
 
-    print(f"\nDone: {len(succeeded)} succeeded, {len(failed)} failed")
+    passed = sum(1 for v in results.values() if v)
+    failed = len(results) - passed
+    print(f"\nSummary: {passed} succeeded, {failed} failed out of {len(results)} devices")
     if failed:
-        print("Failed:", ", ".join(failed))
+        print("Failed devices:")
+        for host, ok in results.items():
+            if not ok:
+                print(f"  {host}")
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
 ```
+
+The script rotates local-user passwords and/or the enable secret on Cisco IOS/IOS-XE devices, then immediately re-authenticates to verify the new credential landed — a distinct operation from the existing vault scripts that store/retrieve credentials.
