@@ -1,239 +1,181 @@
-The prompt asks for script content output only — here it is:
+Here's the complete script — you can save it as `mac_table.py`:
 
-```
-"""
-vlan_audit.py - VLAN table auditor for Cisco IOS/IOS-XE devices
+```python
+"""mac_table.py - MAC Address Table Collector and Parser
 
-Connects via SSH (paramiko), runs 'show vlan brief', parses the output into
-structured records, and exports as a console table, JSON, or CSV.  Useful for
-VLAN inventory audits, change verification, and drift detection.
-
-Usage:
-    python vlan_audit.py -d 192.168.1.1 -u admin -p secret
-    python vlan_audit.py -d 192.168.1.1 -u admin -p secret --format csv -o vlans.csv
-    python vlan_audit.py -d 192.168.1.1 -u admin --key ~/.ssh/id_rsa --active-only
-    python vlan_audit.py -d 192.168.1.1 -u admin -p secret --format json -o vlans.json
-
-Prerequisites:
-    pip install paramiko
-"""
-```
-
-Since I can't write to `/opt/NetAutoCommitter`, here is the raw script content (no fences, no explanation — copy this directly):
-
----
-
-"""
-vlan_audit.py - VLAN table auditor for Cisco IOS/IOS-XE devices
-
-Connects via SSH (paramiko), runs 'show vlan brief', parses the output into
-structured records, and exports as a console table, JSON, or CSV.  Useful for
-VLAN inventory audits, change verification, and drift detection.
+Purpose:
+    Connects to a Cisco IOS/IOS-XE device via SSH, retrieves the MAC address
+    table, and parses it into structured data. Supports filtering by VLAN,
+    interface prefix, or entry type (DYNAMIC/STATIC) and outputs as a
+    formatted table or JSON.
 
 Usage:
-    python vlan_audit.py -d 192.168.1.1 -u admin -p secret
-    python vlan_audit.py -d 192.168.1.1 -u admin -p secret --format csv -o vlans.csv
-    python vlan_audit.py -d 192.168.1.1 -u admin --key ~/.ssh/id_rsa --active-only
-    python vlan_audit.py -d 192.168.1.1 -u admin -p secret --format json -o vlans.json
+    python mac_table.py -H 192.168.1.1 -u admin -p secret
+    python mac_table.py -H 192.168.1.1 -u admin -p secret --vlan 100
+    python mac_table.py -H 192.168.1.1 -u admin -p secret --interface Gi0/1
+    python mac_table.py -H 192.168.1.1 -u admin -p secret --type DYNAMIC --json
 
 Prerequisites:
     pip install paramiko
 """
 
 import argparse
-import csv
 import json
 import logging
 import re
 import sys
-import time
 
 import paramiko
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-def connect(host, username, password=None, key_path=None, port=22, timeout=15):
+def connect(host, port, username, password, timeout):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = dict(
+    client.connect(
         hostname=host,
         port=port,
         username=username,
+        password=password,
         timeout=timeout,
-        look_for_keys=bool(key_path),
+        look_for_keys=False,
         allow_agent=False,
     )
-    if key_path:
-        kwargs["key_filename"] = key_path
-    elif password:
-        kwargs["password"] = password
-    else:
-        raise ValueError("Provide --password or --key")
-    client.connect(**kwargs)
     return client
 
 
-def run_command(client, command, settle=1.5):
-    shell = client.invoke_shell()
-    shell.settimeout(10)
-    time.sleep(0.4)
-    if shell.recv_ready():
-        shell.recv(8192)
-    shell.send("terminal length 0\n")
-    time.sleep(0.3)
-    if shell.recv_ready():
-        shell.recv(8192)
-    shell.send(command + "\n")
-    time.sleep(settle)
-    output = ""
-    while shell.recv_ready():
-        output += shell.recv(8192).decode("utf-8", errors="replace")
-        time.sleep(0.15)
-    shell.close()
+def run_command(client, command, read_timeout=15):
+    _, stdout, stderr = client.exec_command(command, timeout=read_timeout)
+    output = stdout.read().decode("utf-8", errors="replace")
+    err = stderr.read().decode("utf-8", errors="replace")
+    if err.strip():
+        logger.debug("stderr: %s", err.strip())
     return output
 
 
-def parse_vlan_brief(raw):
-    """Return list of dicts from 'show vlan brief' output."""
-    vlans = []
-    past_header = False
-    status_pat = re.compile(
-        r"^(\d{1,4})\s+(\S+)\s+(active|act/unsup|act/lshut|suspended|unsupported)\s*(.*)?$",
-        re.IGNORECASE,
+def parse_mac_table(output):
+    entries = []
+    # Matches Cisco IOS lines:  100  aabb.cc00.0100  DYNAMIC  Gi0/1
+    pattern = re.compile(
+        r"^\s*(\d+|All)\s+"
+        r"([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+"
+        r"(\S+)\s+"
+        r"(\S+)",
+        re.MULTILINE,
     )
-    for line in raw.splitlines():
-        stripped = line.strip()
-        if re.match(r"^-{4,}", stripped):
-            past_header = True
-            continue
-        if not past_header or not stripped:
-            continue
-        m = status_pat.match(stripped)
-        if m:
-            ports = [p.strip() for p in m.group(4).split(",") if p.strip()]
-            vlans.append({
-                "vlan_id": int(m.group(1)),
-                "name": m.group(2),
-                "status": m.group(3).lower(),
-                "port_count": len(ports),
-                "ports": ", ".join(ports),
-            })
-        elif vlans and re.match(r"^[A-Za-z]{2}\d", stripped):
-            extra = [p.strip() for p in stripped.split(",") if p.strip()]
-            vlans[-1]["ports"] += (", " if vlans[-1]["ports"] else "") + ", ".join(extra)
-            vlans[-1]["port_count"] += len(extra)
-    return vlans
+    for match in pattern.finditer(output):
+        entries.append({
+            "vlan": match.group(1),
+            "mac": match.group(2).lower(),
+            "type": match.group(3).upper(),
+            "interface": match.group(4),
+        })
+    return entries
 
 
-def print_table(vlans):
-    if not vlans:
-        print("No VLANs found.")
+def filter_entries(entries, vlan=None, interface=None, entry_type=None):
+    if vlan is not None:
+        entries = [e for e in entries if e["vlan"] == str(vlan)]
+    if interface:
+        prefix = interface.lower()
+        entries = [e for e in entries if e["interface"].lower().startswith(prefix)]
+    if entry_type:
+        entries = [e for e in entries if e["type"] == entry_type.upper()]
+    return entries
+
+
+def print_table(entries):
+    if not entries:
+        print("No matching MAC address table entries.")
         return
-    print(f"{'VLAN':>6}  {'Name':<28}  {'Status':<14}  {'Ports':>5}  Interfaces")
-    print("-" * 82)
-    for v in vlans:
-        preview = (v["ports"][:33] + "…") if len(v["ports"]) > 34 else v["ports"]
-        print(f"{v['vlan_id']:>6}  {v['name']:<28}  {v['status']:<14}  {v['port_count']:>5}  {preview}")
-    print(f"\nTotal: {len(vlans)} VLANs")
-
-
-def export_json(vlans, outfile=None):
-    data = json.dumps(vlans, indent=2)
-    if outfile:
-        with open(outfile, "w") as fh:
-            fh.write(data)
-        log.info("Wrote JSON → %s", outfile)
-    else:
-        print(data)
-
-
-def export_csv(vlans, outfile=None):
-    fields = ["vlan_id", "name", "status", "port_count", "ports"]
-    dest = open(outfile, "w", newline="") if outfile else sys.stdout
-    try:
-        writer = csv.DictWriter(dest, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(vlans)
-    finally:
-        if outfile:
-            dest.close()
-            log.info("Wrote CSV → %s", outfile)
+    col_iface = max(len(e["interface"]) for e in entries)
+    col_iface = max(col_iface, 9)
+    header = f"{'VLAN':<6}  {'MAC Address':<17}  {'Type':<10}  {'Interface':<{col_iface}}"
+    print(header)
+    print("-" * len(header))
+    for e in entries:
+        print(
+            f"{e['vlan']:<6}  {e['mac']:<17}  {e['type']:<10}  {e['interface']:<{col_iface}}"
+        )
+    print(f"\nTotal: {len(entries)} entries")
 
 
 def build_parser():
     p = argparse.ArgumentParser(
-        description="Audit VLAN table on a Cisco IOS device via SSH"
+        description="Retrieve and parse the MAC address table from a network device."
     )
-    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    p.add_argument("-H", "--host", required=True, help="Device hostname or IP")
     p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", default=None, help="SSH password")
-    p.add_argument("--key", metavar="FILE", help="SSH private key path")
-    p.add_argument("--port", type=int, default=22, help="SSH port (default 22)")
+    p.add_argument("-p", "--password", required=True, help="SSH password")
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("--vlan", help="Filter results to a specific VLAN ID")
+    p.add_argument("--interface", help="Filter by interface name prefix (e.g. Gi0/1)")
     p.add_argument(
-        "--format", choices=["table", "json", "csv"], default="table",
-        help="Output format (default: table)",
+        "--type",
+        dest="entry_type",
+        choices=["DYNAMIC", "STATIC"],
+        help="Filter by entry type",
     )
-    p.add_argument("-o", "--output", metavar="FILE", help="Write output to file")
-    p.add_argument(
-        "--active-only", action="store_true",
-        help="Include only VLANs with status 'active'",
-    )
-    p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    p.add_argument("--json", action="store_true", dest="as_json", help="Output as JSON")
+    p.add_argument("--timeout", type=int, default=10, help="SSH connect timeout (seconds)")
+    p.add_argument("--debug", action="store_true", help="Enable debug logging")
     return p
 
 
 def main():
     args = build_parser().parse_args()
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    if not args.password and not args.key:
-        sys.exit("error: provide --password or --key")
 
-    log.info("Connecting to %s:%d as %s", args.device, args.port, args.username)
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger("paramiko").setLevel(logging.DEBUG)
+    else:
+        logging.getLogger("paramiko").setLevel(logging.WARNING)
+
     try:
-        client = connect(
-            args.device, args.username,
-            password=args.password, key_path=args.key, port=args.port,
-        )
+        logger.info("Connecting to %s:%d", args.host, args.port)
+        client = connect(args.host, args.port, args.username, args.password, args.timeout)
     except paramiko.AuthenticationException:
-        log.error("Authentication failed")
+        logger.error("Authentication failed for %s@%s", args.username, args.host)
         sys.exit(1)
     except (paramiko.SSHException, OSError) as exc:
-        log.error("Connection error: %s", exc)
+        logger.error("Connection error: %s", exc)
         sys.exit(1)
 
     try:
-        log.info("Running 'show vlan brief'")
-        raw = run_command(client, "show vlan brief")
-        log.debug("Raw output:\n%s", raw)
+        logger.info("Fetching MAC address table from %s", args.host)
+        output = run_command(client, "show mac address-table")
+        if "Invalid input" in output or "% Unknown" in output:
+            logger.debug("Retrying with alternate command syntax")
+            output = run_command(client, "show mac-address-table")
     finally:
         client.close()
 
-    vlans = parse_vlan_brief(raw)
-    if not vlans:
-        log.error("No VLAN records parsed — verify device output format")
+    entries = parse_mac_table(output)
+    if not entries:
+        logger.warning(
+            "No entries parsed — output may not match expected format. "
+            "Re-run with --debug to see raw output."
+        )
+        if args.debug:
+            print(output)
         sys.exit(1)
 
-    if args.active_only:
-        vlans = [v for v in vlans if v["status"] == "active"]
+    logger.info("Parsed %d total entries", len(entries))
+    entries = filter_entries(entries, args.vlan, args.interface, args.entry_type)
 
-    log.info("Parsed %d VLANs", len(vlans))
-
-    if args.format == "json":
-        export_json(vlans, args.output)
-    elif args.format == "csv":
-        export_csv(vlans, args.output)
+    if args.as_json:
+        print(json.dumps(entries, indent=2))
     else:
-        print_table(vlans)
-        if args.output:
-            export_json(vlans, args.output)
+        print_table(entries)
 
 
 if __name__ == "__main__":
     main()
+```
+
+**What this does:** Retrieves `show mac address-table` output via paramiko, parses each entry with a regex (VLAN / MAC / type / interface columns), then lets you filter by VLAN, interface prefix, or entry type (DYNAMIC/STATIC). Falls back to the hyphenated command syntax if the first fails. Output is either a formatted column table or JSON. ~160 lines, no overlap with the existing scripts.
