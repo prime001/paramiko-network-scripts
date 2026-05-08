@@ -1,207 +1,265 @@
 ```python
+#!/usr/bin/env python3
 """
-config_backup_rotate.py — Rotating config backup with change detection.
+Device System Health Monitor
 
-Connects to a network device via SSH, retrieves the running configuration,
-and saves it only when the content differs from the previous backup.
-Maintains a configurable retention window and compresses archives older
-than a threshold to save disk space.
+Monitors network device system resources (CPU, memory, disk) via SSH.
+Retrieves health metrics, compares against thresholds, and reports
+issues. Useful for capacity planning and proactive alerting.
 
 Usage:
-    python config_backup_rotate.py -H 192.168.1.1 -u admin -p secret
-    python config_backup_rotate.py -H 192.168.1.1 -u admin --key ~/.ssh/id_rsa \
-        --output-dir /backups/routers --keep 30 --compress-after 7
+    python device_health_monitor.py --device 10.0.0.1 --user admin --port 22
+    python device_health_monitor.py --device 10.0.0.1 --user admin --warn-cpu 75 --crit-cpu 90
 
 Prerequisites:
-    pip install paramiko
+    - paramiko library
+    - SSH access to target device
+    - Device must support standard show commands (IOS/IOS-XE/NX-OS)
 """
 
 import argparse
-import gzip
-import hashlib
 import logging
-import os
-import shutil
 import sys
-from datetime import datetime, timedelta
-from pathlib import Path
-
+from datetime import datetime
 import paramiko
+from paramiko.ssh_exception import (
+    AuthenticationException,
+    SSHException,
+    NoValidConnectionsError,
+)
+
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger(__name__)
-
-SHOW_RUN_CMD = "show running-config"
-TIMESTAMP_FMT = "%Y%m%d_%H%M%S"
+logger = logging.getLogger(__name__)
 
 
-def connect(host: str, port: int, username: str, password: str | None,
-            key_path: str | None, timeout: int) -> paramiko.SSHClient:
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    connect_kwargs: dict = dict(
-        hostname=host,
-        port=port,
-        username=username,
-        timeout=timeout,
-        look_for_keys=False,
-        allow_agent=False,
-    )
-    if key_path:
-        connect_kwargs["key_filename"] = key_path
-    else:
-        connect_kwargs["password"] = password
-    client.connect(**connect_kwargs)
-    return client
+class DeviceHealthMonitor:
+    def __init__(self, device, username, password, port=22):
+        self.device = device
+        self.username = username
+        self.password = password
+        self.port = port
+        self.client = None
+        self.metrics = {}
+        self.alerts = []
+
+    def connect(self):
+        self.client = paramiko.SSHClient()
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            self.client.connect(
+                self.device,
+                port=self.port,
+                username=self.username,
+                password=self.password,
+                timeout=10,
+                look_for_keys=False,
+                allow_agent=False,
+            )
+            logger.info(f"Connected to {self.device}")
+        except AuthenticationException:
+            logger.error("Authentication failed")
+            raise
+        except (SSHException, NoValidConnectionsError) as e:
+            logger.error(f"SSH connection failed: {e}")
+            raise
+
+    def execute_command(self, command):
+        if not self.client:
+            raise RuntimeError("Not connected")
+        try:
+            stdin, stdout, stderr = self.client.exec_command(command, timeout=10)
+            output = stdout.read().decode("utf-8", errors="ignore")
+            return output
+        except Exception as e:
+            logger.error(f"Command execution failed: {e}")
+            raise
+
+    def get_cpu_usage(self):
+        output = self.execute_command("show processes cpu")
+        for line in output.split("\n"):
+            if "CPU utilization" in line:
+                parts = line.split()
+                for i, part in enumerate(parts):
+                    if part == "utilization":
+                        try:
+                            cpu = float(parts[i + 1].rstrip("%"))
+                            self.metrics["cpu"] = cpu
+                            logger.info(f"CPU Usage: {cpu}%")
+                            return cpu
+                        except (ValueError, IndexError):
+                            continue
+        logger.warning("Could not parse CPU metrics")
+        return None
+
+    def get_memory_usage(self):
+        output = self.execute_command("show memory statistics")
+        for line in output.split("\n"):
+            if "Processor" in line and "used" in line:
+                parts = line.split()
+                try:
+                    total = int(parts[-4])
+                    used = int(parts[-6])
+                    if total > 0:
+                        mem_pct = (used / total) * 100
+                        self.metrics["memory"] = mem_pct
+                        logger.info(f"Memory Usage: {mem_pct:.1f}%")
+                        return mem_pct
+                except (ValueError, IndexError):
+                    continue
+        logger.warning("Could not parse memory metrics")
+        return None
+
+    def get_disk_usage(self):
+        output = self.execute_command("dir")
+        total = None
+        used = None
+        for line in output.split("\n"):
+            if "bytes total" in line:
+                try:
+                    parts = line.split()
+                    total = int(parts[0])
+                except (ValueError, IndexError):
+                    continue
+            if "bytes used" in line:
+                try:
+                    parts = line.split()
+                    used = int(parts[0])
+                except (ValueError, IndexError):
+                    continue
+        if total and used:
+            disk_pct = (used / total) * 100
+            self.metrics["disk"] = disk_pct
+            logger.info(f"Disk Usage: {disk_pct:.1f}%")
+            return disk_pct
+        logger.warning("Could not parse disk metrics")
+        return None
+
+    def check_thresholds(self, warn_cpu=80, crit_cpu=95, warn_mem=85,
+                         crit_mem=95, warn_disk=90, crit_disk=98):
+        self.alerts = []
+        cpu = self.metrics.get("cpu")
+        if cpu:
+            if cpu >= crit_cpu:
+                self.alerts.append(f"CRITICAL: CPU at {cpu}%")
+            elif cpu >= warn_cpu:
+                self.alerts.append(f"WARNING: CPU at {cpu}%")
+
+        mem = self.metrics.get("memory")
+        if mem:
+            if mem >= crit_mem:
+                self.alerts.append(f"CRITICAL: Memory at {mem:.1f}%")
+            elif mem >= warn_mem:
+                self.alerts.append(f"WARNING: Memory at {mem:.1f}%")
+
+        disk = self.metrics.get("disk")
+        if disk:
+            if disk >= crit_disk:
+                self.alerts.append(f"CRITICAL: Disk at {disk:.1f}%")
+            elif disk >= warn_disk:
+                self.alerts.append(f"WARNING: Disk at {disk:.1f}%")
+
+    def report(self):
+        print("\n" + "=" * 60)
+        print(f"Device Health Report: {self.device}")
+        print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 60)
+        print(f"CPU Usage:    {self.metrics.get('cpu', 'N/A')}%")
+        print(f"Memory Usage: {self.metrics.get('memory', 'N/A')}%")
+        print(f"Disk Usage:   {self.metrics.get('disk', 'N/A')}%")
+        if self.alerts:
+            print("\nAlerts:")
+            for alert in self.alerts:
+                print(f"  • {alert}")
+        else:
+            print("\nStatus: All metrics within thresholds")
+        print("=" * 60 + "\n")
+
+    def disconnect(self):
+        if self.client:
+            self.client.close()
+            logger.info("Disconnected")
+
+    def run(self, warn_cpu=80, crit_cpu=95, warn_mem=85, crit_mem=95,
+            warn_disk=90, crit_disk=98):
+        try:
+            self.connect()
+            self.get_cpu_usage()
+            self.get_memory_usage()
+            self.get_disk_usage()
+            self.check_thresholds(warn_cpu, crit_cpu, warn_mem, crit_mem,
+                                 warn_disk, crit_disk)
+            self.report()
+            return 0 if not self.alerts else 1
+        except Exception as e:
+            logger.error(f"Monitor failed: {e}")
+            return 2
+        finally:
+            self.disconnect()
 
 
-def fetch_config(client: paramiko.SSHClient, command: str, recv_timeout: int) -> str:
-    chan = client.get_transport().open_session()
-    chan.settimeout(recv_timeout)
-    chan.exec_command(command)
-    stdout = chan.makefile("r")
-    output = stdout.read()
-    exit_status = chan.recv_exit_status()
-    chan.close()
-    if exit_status != 0:
-        stderr = chan.makefile_stderr("r").read()
-        raise RuntimeError(f"Command exited {exit_status}: {stderr.strip()}")
-    return output if isinstance(output, str) else output.decode("utf-8", errors="replace")
-
-
-def sha256(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()
-
-
-def latest_backup(backup_dir: Path) -> Path | None:
-    candidates = sorted(
-        backup_dir.glob("*.cfg"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    return candidates[0] if candidates else None
-
-
-def read_backup(path: Path) -> str:
-    if path.suffix == ".gz":
-        with gzip.open(path, "rt", encoding="utf-8") as fh:
-            return fh.read()
-    return path.read_text(encoding="utf-8")
-
-
-def save_backup(backup_dir: Path, host: str, config: str) -> Path:
-    ts = datetime.now().strftime(TIMESTAMP_FMT)
-    filename = backup_dir / f"{host}_{ts}.cfg"
-    filename.write_text(config, encoding="utf-8")
-    return filename
-
-
-def enforce_retention(backup_dir: Path, host: str, keep: int,
-                      compress_after_days: int) -> None:
-    all_backups = sorted(
-        list(backup_dir.glob(f"{host}_*.cfg")) +
-        list(backup_dir.glob(f"{host}_*.cfg.gz")),
-        key=lambda p: p.stat().st_mtime,
-    )
-
-    cutoff = datetime.now() - timedelta(days=compress_after_days)
-    for path in all_backups:
-        if path.suffix != ".gz" and datetime.fromtimestamp(path.stat().st_mtime) < cutoff:
-            gz_path = path.with_suffix(".cfg.gz")
-            with open(path, "rb") as src, gzip.open(gz_path, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-            path.unlink()
-            log.info("Compressed %s → %s", path.name, gz_path.name)
-
-    all_backups = sorted(
-        list(backup_dir.glob(f"{host}_*.cfg")) +
-        list(backup_dir.glob(f"{host}_*.cfg.gz")),
-        key=lambda p: p.stat().st_mtime,
-    )
-    excess = all_backups[: max(0, len(all_backups) - keep)]
-    for path in excess:
-        path.unlink()
-        log.info("Pruned old backup: %s", path.name)
-
-
-def parse_args() -> argparse.Namespace:
+def main():
     parser = argparse.ArgumentParser(
-        description="Rotating config backup with change detection."
+        description="Monitor network device system health"
     )
-    parser.add_argument("-H", "--host", required=True, help="Device hostname or IP")
-    parser.add_argument("-P", "--port", type=int, default=22, help="SSH port")
-    parser.add_argument("-u", "--username", required=True)
-    parser.add_argument("-p", "--password", default=None)
-    parser.add_argument("--key", dest="key_path", default=None,
-                        help="Path to SSH private key")
-    parser.add_argument("--command", default=SHOW_RUN_CMD,
-                        help="Command to retrieve config")
-    parser.add_argument("--output-dir", default="./backups",
-                        help="Directory to store backups")
-    parser.add_argument("--keep", type=int, default=14,
-                        help="Number of backups to retain per device")
-    parser.add_argument("--compress-after", type=int, default=3,
-                        dest="compress_after",
-                        help="Compress backups older than N days")
-    parser.add_argument("--timeout", type=int, default=30,
-                        help="SSH connection timeout in seconds")
-    parser.add_argument("--recv-timeout", type=int, default=60,
-                        dest="recv_timeout",
-                        help="Command receive timeout in seconds")
-    parser.add_argument("--force", action="store_true",
-                        help="Save backup even if config is unchanged")
-    parser.add_argument("-v", "--verbose", action="store_true")
-    return parser.parse_args()
+    parser.add_argument(
+        "-d", "--device", required=True, help="Device IP address or hostname"
+    )
+    parser.add_argument(
+        "-u", "--user", required=True, help="SSH username"
+    )
+    parser.add_argument(
+        "-p", "--password", help="SSH password (prompt if not provided)"
+    )
+    parser.add_argument(
+        "--port", type=int, default=22, help="SSH port (default: 22)"
+    )
+    parser.add_argument(
+        "--warn-cpu", type=float, default=80, help="CPU warning threshold %"
+    )
+    parser.add_argument(
+        "--crit-cpu", type=float, default=95, help="CPU critical threshold %"
+    )
+    parser.add_argument(
+        "--warn-mem", type=float, default=85, help="Memory warning threshold %"
+    )
+    parser.add_argument(
+        "--crit-mem", type=float, default=95, help="Memory critical threshold %"
+    )
+    parser.add_argument(
+        "--warn-disk", type=float, default=90, help="Disk warning threshold %"
+    )
+    parser.add_argument(
+        "--crit-disk", type=float, default=98, help="Disk critical threshold %"
+    )
+    args = parser.parse_args()
+
+    if not args.password:
+        import getpass
+        args.password = getpass.getpass("SSH Password: ")
+
+    monitor = DeviceHealthMonitor(
+        device=args.device,
+        username=args.user,
+        password=args.password,
+        port=args.port,
+    )
+    sys.exit(
+        monitor.run(
+            warn_cpu=args.warn_cpu,
+            crit_cpu=args.crit_cpu,
+            warn_mem=args.warn_mem,
+            crit_mem=args.crit_mem,
+            warn_disk=args.warn_disk,
+            crit_disk=args.crit_disk,
+        )
+    )
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    if args.verbose:
-        log.setLevel(logging.DEBUG)
-
-    if not args.password and not args.key_path:
-        log.error("Provide --password or --key for authentication.")
-        sys.exit(1)
-
-    backup_dir = Path(args.output_dir)
-    backup_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        log.info("Connecting to %s:%s", args.host, args.port)
-        client = connect(args.host, args.port, args.username,
-                         args.password, args.key_path, args.timeout)
-    except (paramiko.AuthenticationException,
-            paramiko.SSHException, OSError) as exc:
-        log.error("Connection failed: %s", exc)
-        sys.exit(1)
-
-    try:
-        log.debug("Running: %s", args.command)
-        config = fetch_config(client, args.command, args.recv_timeout)
-    except (RuntimeError, paramiko.SSHException, OSError) as exc:
-        log.error("Failed to retrieve config: %s", exc)
-        client.close()
-        sys.exit(1)
-    finally:
-        client.close()
-
-    current_hash = sha256(config)
-    prior = latest_backup(backup_dir)
-
-    if prior and not args.force:
-        prior_hash = sha256(read_backup(prior))
-        if current_hash == prior_hash:
-            log.info("Config unchanged since %s — skipping save.", prior.name)
-            enforce_retention(backup_dir, args.host, args.keep, args.compress_after)
-            sys.exit(0)
-
-    saved = save_backup(backup_dir, args.host, config)
-    log.info("Saved %s (%d bytes, sha256=%s…)", saved.name, len(config),
-             current_hash[:12])
-
-    enforce_retention(backup_dir, args.host, args.keep, args.compress_after)
+    main()
 ```
