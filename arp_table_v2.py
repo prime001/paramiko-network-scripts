@@ -1,223 +1,215 @@
 ```python
 """
-ARP Change Monitor — detect unauthorized devices and ARP spoofing on network infrastructure.
+Device Health Monitor - Retrieve system health metrics from network devices.
 
-Connects via SSH (paramiko), fetches 'show ip arp', and compares the result against a
-saved baseline or a previous poll. Useful for security auditing, change management, and
-detecting rogue devices or ARP spoofing in a network segment.
+Purpose:
+    Connects to network devices and retrieves key health metrics including uptime,
+    CPU usage, memory utilization, and interface statistics. Useful for monitoring
+    device health and capacity planning.
 
 Usage:
-    # One-shot: print current table
-    python arp_monitor.py -H 192.168.1.1 -u admin -p secret
-
-    # Save a baseline, then diff against it on the next run
-    python arp_monitor.py -H 192.168.1.1 -u admin -p secret --baseline arp_baseline.json
-
-    # Continuously poll every 60 seconds and alert on changes
-    python arp_monitor.py -H 192.168.1.1 -u admin --key ~/.ssh/id_rsa --watch --interval 60
+    python device_health_monitor.py --device 192.168.1.1 --username admin --password pass
+    python device_health_monitor.py --device 192.168.1.1 -u admin -p pass --csv health.csv
+    python device_health_monitor.py --device sw01.example.com -u admin -p pass --verbose
 
 Prerequisites:
-    pip install paramiko
-    SSH access with at least privilege level 1 (show commands).
-    Tested against Cisco IOS, IOS-XE, and NX-OS 'show ip arp' output.
+    - paramiko library installed (pip install paramiko)
+    - SSH access enabled on target devices
+    - User account with sufficient privileges to view system information
+    - Network connectivity to target device
+
+Examples:
+    Basic health check:
+        python device_health_monitor.py --device 10.0.0.1 -u admin -p Password123
+
+    Export to CSV:
+        python device_health_monitor.py --device 10.0.0.1 -u admin -p pass --csv report.csv
+
+    Verbose output:
+        python device_health_monitor.py --device 10.0.0.1 -u admin -p pass -v
 """
 
 import argparse
-import json
 import logging
+import paramiko
 import re
 import sys
-import time
-from datetime import datetime, timezone
-from pathlib import Path
+import csv
+from datetime import datetime
+from typing import Dict, Optional
 
-import paramiko
 
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
     level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-def ssh_run(host, port, username, password, key_file, command, timeout=10):
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    connect_kwargs = dict(
-        hostname=host,
-        port=port,
-        username=username,
-        timeout=timeout,
-        look_for_keys=bool(key_file),
-        allow_agent=False,
-    )
-    if key_file:
-        connect_kwargs["key_filename"] = key_file
-    else:
-        connect_kwargs["password"] = password
-    try:
-        client.connect(**connect_kwargs)
-        _, stdout, stderr = client.exec_command(command, timeout=timeout)
-        output = stdout.read().decode(errors="replace")
-        err = stderr.read().decode(errors="replace").strip()
-        if err:
-            log.debug("Device stderr: %s", err)
-        return output
-    finally:
-        client.close()
+class DeviceHealthMonitor:
+    """Monitor and retrieve health metrics from network devices."""
 
+    def __init__(self, host: str, username: str, password: str, timeout: int = 10):
+        """Initialize SSH connection parameters."""
+        self.host = host
+        self.username = username
+        self.password = password
+        self.timeout = timeout
+        self.client = None
 
-def parse_arp_table(raw):
-    """Return {ip: mac} from 'show ip arp' output (IOS/IOS-XE/NX-OS)."""
-    entries = {}
-    # Matches the IP and dotted-hex MAC anywhere on the line
-    pattern = re.compile(
-        r"(\d{1,3}(?:\.\d{1,3}){3})\s+\S+\s+"
-        r"([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})"
-    )
-    for line in raw.splitlines():
-        m = pattern.search(line)
-        if m:
-            entries[m.group(1)] = m.group(2).lower()
-    return entries
+    def connect(self) -> bool:
+        """Establish SSH connection to device."""
+        try:
+            self.client = paramiko.SSHClient()
+            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            self.client.connect(
+                hostname=self.host,
+                username=self.username,
+                password=self.password,
+                timeout=self.timeout,
+                look_for_keys=False,
+                allow_agent=False
+            )
+            logger.info(f"Successfully connected to {self.host}")
+            return True
+        except paramiko.AuthenticationException:
+            logger.error(f"Authentication failed for {self.host}")
+            return False
+        except paramiko.SSHException as e:
+            logger.error(f"SSH connection error: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Connection error: {e}")
+            return False
 
+    def send_command(self, command: str) -> str:
+        """Send command and return output."""
+        try:
+            stdin, stdout, stderr = self.client.exec_command(command, timeout=self.timeout)
+            output = stdout.read().decode('utf-8')
+            return output
+        except Exception as e:
+            logger.error(f"Error executing command '{command}': {e}")
+            return ""
 
-def diff_arp(baseline, current):
-    new = {ip: mac for ip, mac in current.items() if ip not in baseline}
-    gone = {ip: mac for ip, mac in baseline.items() if ip not in current}
-    changed = {
-        ip: {"was": baseline[ip], "now": current[ip]}
-        for ip in current
-        if ip in baseline and current[ip] != baseline[ip]
-    }
-    return new, gone, changed
+    def parse_uptime(self, uptime_output: str) -> Optional[str]:
+        """Extract uptime from device output."""
+        match = re.search(r'uptime is (.+?)$', uptime_output, re.MULTILINE | re.IGNORECASE)
+        return match.group(1).strip() if match else None
 
+    def parse_cpu(self, cpu_output: str) -> Optional[str]:
+        """Extract CPU usage percentage."""
+        match = re.search(r'(\d+)%', cpu_output)
+        return match.group(1) + '%' if match else None
 
-def report_diff(new, gone, changed, host):
-    total = len(new) + len(gone) + len(changed)
-    if total == 0:
-        log.info("[%s] ARP table unchanged.", host)
-        return
-    log.warning("[%s] %d ARP change(s) detected:", host, total)
-    for ip, mac in sorted(new.items()):
-        log.warning("  NEW     %-18s %s", ip, mac)
-    for ip, mac in sorted(gone.items()):
-        log.warning("  REMOVED %-18s %s", ip, mac)
-    for ip, info in sorted(changed.items()):
-        log.warning("  CHANGED %-18s %s -> %s  ** possible ARP spoof **",
-                    ip, info["was"], info["now"])
+    def parse_memory(self, mem_output: str) -> Optional[Dict[str, str]]:
+        """Extract memory usage information."""
+        used_match = re.search(r'(\d+)K\s*used', mem_output)
+        total_match = re.search(r'(\d+)K\s*total', mem_output)
 
+        if used_match and total_match:
+            used_kb = int(used_match.group(1))
+            total_kb = int(total_match.group(1))
+            percent = (used_kb / total_kb) * 100
+            return {
+                'used': f"{used_kb / 1024:.2f}MB",
+                'total': f"{total_kb / 1024:.2f}MB",
+                'percent': f"{percent:.1f}%"
+            }
+        return None
 
-def load_baseline(path):
-    with open(path) as f:
-        data = json.load(f)
-    return data.get("entries", data) if isinstance(data, dict) else data
+    def get_health_metrics(self) -> Dict[str, Optional[str]]:
+        """Retrieve all health metrics."""
+        metrics = {
+            'device': self.host,
+            'timestamp': datetime.now().isoformat(),
+            'uptime': None,
+            'cpu': None,
+            'memory': None,
+            'status': 'unknown'
+        }
 
+        if not self.connect():
+            metrics['status'] = 'offline'
+            return metrics
 
-def save_snapshot(entries, path):
-    payload = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "entry_count": len(entries),
-        "entries": entries,
-    }
-    with open(path, "w") as f:
-        json.dump(payload, f, indent=2)
-    log.info("Snapshot saved: %s (%d entries)", path, len(entries))
+        try:
+            uptime_output = self.send_command("show version")
+            metrics['uptime'] = self.parse_uptime(uptime_output)
 
+            cpu_output = self.send_command("show processes cpu")
+            metrics['cpu'] = self.parse_cpu(cpu_output)
 
-def fetch_arp(args):
-    raw = ssh_run(
-        host=args.host,
-        port=args.port,
-        username=args.username,
-        password=args.password,
-        key_file=args.key,
-        command="show ip arp",
-    )
-    return parse_arp_table(raw)
+            mem_output = self.send_command("show memory")
+            mem_info = self.parse_memory(mem_output)
+            if mem_info:
+                metrics['memory'] = f"{mem_info['used']}/{mem_info['total']} ({mem_info['percent']})"
 
+            metrics['status'] = 'online'
+        except Exception as e:
+            logger.error(f"Error retrieving metrics: {e}")
+            metrics['status'] = 'error'
+        finally:
+            self.disconnect()
 
-def build_parser():
-    p = argparse.ArgumentParser(
-        description="Monitor ARP table changes on a Cisco device for security auditing."
-    )
-    p.add_argument("-H", "--host", required=True, help="Device hostname or IP")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", default=None, help="SSH password")
-    p.add_argument("--key", metavar="FILE", help="SSH private key path")
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument(
-        "--baseline", metavar="FILE",
-        help="JSON baseline file. Created on first run; diffed on subsequent runs.",
-    )
-    p.add_argument(
-        "--save", metavar="FILE",
-        help="Save current ARP snapshot to FILE after each poll.",
-    )
-    p.add_argument(
-        "--watch", action="store_true",
-        help="Poll continuously until Ctrl-C, reporting any changes.",
-    )
-    p.add_argument(
-        "--interval", type=int, default=120, metavar="SECS",
-        help="Poll interval in watch mode, seconds (default: 120).",
-    )
-    p.add_argument("-v", "--verbose", action="store_true")
-    return p
+        return metrics
+
+    def disconnect(self):
+        """Close SSH connection."""
+        if self.client:
+            self.client.close()
+            logger.info(f"Disconnected from {self.host}")
 
 
 def main():
-    args = build_parser().parse_args()
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description='Retrieve health metrics from network devices',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Examples:\n'
+               '  %(prog)s --device 10.0.0.1 -u admin -p pass\n'
+               '  %(prog)s --device sw01 -u admin -p pass --csv health.csv'
+    )
+    parser.add_argument('--device', '-d', required=True, help='Device hostname or IP address')
+    parser.add_argument('--username', '-u', required=True, help='SSH username')
+    parser.add_argument('--password', '-p', required=True, help='SSH password')
+    parser.add_argument('--timeout', '-t', type=int, default=10, help='Connection timeout (default: 10)')
+    parser.add_argument('--csv', help='Export results to CSV file')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose output')
 
-    if not args.password and not args.key:
-        sys.exit("error: provide --password or --key for authentication")
+    args = parser.parse_args()
 
     if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
 
-    log.info("Connecting to %s:%d as %s", args.host, args.port, args.username)
-    try:
-        current = fetch_arp(args)
-    except paramiko.AuthenticationException:
-        sys.exit(f"error: authentication failed for {args.username}@{args.host}")
-    except (paramiko.SSHException, OSError) as exc:
-        sys.exit(f"error: {exc}")
+    monitor = DeviceHealthMonitor(args.device, args.username, args.password, args.timeout)
+    metrics = monitor.get_health_metrics()
 
-    log.info("Fetched %d ARP entries from %s", len(current), args.host)
+    print("\n" + "="*60)
+    print(f"Device Health Report: {metrics['device']}")
+    print("="*60)
+    print(f"Status:     {metrics['status']}")
+    print(f"Timestamp:  {metrics['timestamp']}")
+    print(f"Uptime:     {metrics['uptime'] or 'N/A'}")
+    print(f"CPU Usage:  {metrics['cpu'] or 'N/A'}")
+    print(f"Memory:     {metrics['memory'] or 'N/A'}")
+    print("="*60 + "\n")
 
-    if args.save:
-        save_snapshot(current, args.save)
+    if args.csv:
+        try:
+            with open(args.csv, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=metrics.keys())
+                if f.tell() == 0:
+                    writer.writeheader()
+                writer.writerow(metrics)
+            logger.info(f"Results exported to {args.csv}")
+        except IOError as e:
+            logger.error(f"Failed to write CSV: {e}")
+            return 1
 
-    if args.baseline:
-        bpath = Path(args.baseline)
-        if not bpath.exists():
-            log.info("No baseline found — saving current table as baseline: %s", args.baseline)
-            save_snapshot(current, args.baseline)
-        else:
-            baseline = load_baseline(args.baseline)
-            report_diff(*diff_arp(baseline, current), args.host)
-    elif not args.watch:
-        print(f"{'IP Address':<18} {'MAC Address'}")
-        print("-" * 36)
-        for ip, mac in sorted(current.items()):
-            print(f"{ip:<18} {mac}")
-
-    if args.watch:
-        log.info("Watch mode active — polling every %ds. Ctrl-C to stop.", args.interval)
-        snapshot = current
-        while True:
-            time.sleep(args.interval)
-            try:
-                current = fetch_arp(args)
-            except (paramiko.SSHException, OSError) as exc:
-                log.warning("Poll failed (%s) — will retry next interval.", exc)
-                continue
-            report_diff(*diff_arp(snapshot, current), args.host)
-            snapshot = current
-            if args.save:
-                save_snapshot(current, args.save)
+    return 0 if metrics['status'] == 'online' else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 ```
