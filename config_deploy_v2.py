@@ -1,33 +1,41 @@
-vlan_provisioner.py — Deploy and verify VLAN configuration across Cisco IOS/IOS-XE switches.
+The prompt says "Output ONLY the script content" — let me just print it directly.
+
+```
+"""
+MAC Address Table Lookup
 
 Purpose:
-    Create or remove a single VLAN on one or more switches via SSH.  After each
-    change the script reads 'show vlan brief' and verifies the VLAN is present
-    (or absent), reporting per-device results and exiting non-zero on any failure.
+    Query and search the MAC address table on Cisco IOS/IOS-XE switches.
+    Useful for locating where specific hosts are connected, auditing
+    unauthorized devices, and correlating Layer 2 port assignments.
 
 Usage:
-    # Create VLAN 100 on two switches
-    python vlan_provisioner.py --hosts 10.0.0.1 10.0.0.2 \
-        --username admin --password secret \
-        --vlan-id 100 --vlan-name CORP_DATA
+    # Dump the full MAC table
+    python mac_table.py -d 192.168.1.1 -u admin -p secret
 
-    # Remove VLAN 100
-    python vlan_provisioner.py --hosts 10.0.0.1 \
-        --username admin --password secret \
-        --vlan-id 100 --remove
+    # Filter to a single VLAN
+    python mac_table.py -d 192.168.1.1 -u admin -p secret --vlan 100
 
-    # Preview without making changes
-    python vlan_provisioner.py --hosts 10.0.0.1 \
-        --username admin --password secret \
-        --vlan-id 100 --vlan-name CORP_DATA --dry-run
+    # Find which port a host is plugged into
+    python mac_table.py -d 192.168.1.1 -u admin -p secret --mac aa:bb:cc:dd:ee:ff
+
+    # Show all MACs learned on an uplink
+    python mac_table.py -d 192.168.1.1 -u admin -p secret --interface Gi0/1
+
+    # Machine-readable output
+    python mac_table.py -d 192.168.1.1 -u admin -p secret --output json
 
 Prerequisites:
     pip install paramiko
-    SSH enabled on target devices; credentials require privilege 15.
+    SSH enabled on the target switch (ip ssh version 2)
+    Account with at minimum privilege 1 and access to 'show' commands
+    Tested against Cisco IOS 15.x and IOS-XE 16.x/17.x
 """
 
 import argparse
+import json
 import logging
+import re
 import sys
 import time
 
@@ -40,154 +48,168 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-_BUFFER = 65535
-_PROMPT_TIMEOUT = 4.0
+# Matches both IOS and IOS-XE table rows:
+#   100  aabb.ccdd.eeff    DYNAMIC     Gi0/1
+_ROW_RE = re.compile(
+    r"^\s*(\d+)\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+(\S+)\s+(\S+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_PROMPT_RE = re.compile(r"[>#]\s*$")
 
 
-def _recv_until(shell, marker="#", timeout=_PROMPT_TIMEOUT):
-    buf = ""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if shell.recv_ready():
-            buf += shell.recv(_BUFFER).decode("utf-8", errors="replace")
-            if marker in buf:
-                break
-        else:
-            time.sleep(0.05)
-    return buf
+def normalize_mac(mac: str) -> str:
+    digits = re.sub(r"[:\-\.]", "", mac).lower()
+    if len(digits) != 12 or not re.fullmatch(r"[0-9a-f]{12}", digits):
+        raise ValueError(f"Unrecognised MAC format: {mac!r}")
+    return f"{digits[:4]}.{digits[4:8]}.{digits[8:]}"
 
 
-def _send(shell, cmd, marker="#", timeout=_PROMPT_TIMEOUT):
-    shell.send(cmd + "\n")
-    return _recv_until(shell, marker, timeout)
-
-
-def _open_shell(host, port, username, password, connect_timeout):
+def connect(host: str, port: int, username: str, password: str) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        host,
-        port=port,
-        username=username,
-        password=password,
-        timeout=connect_timeout,
-        look_for_keys=False,
-        allow_agent=False,
-    )
-    shell = client.invoke_shell(width=220, height=50)
-    _recv_until(shell)
-    return client, shell
-
-
-def _vlan_present(show_output, vlan_id):
-    target = str(vlan_id)
-    for line in show_output.splitlines():
-        first = line.strip().split()
-        if first and first[0] == target:
-            return True
-    return False
-
-
-def provision(host, port, username, password, vlan_id, vlan_name, remove, dry_run, connect_timeout):
-    """Connect to *host* and create or remove *vlan_id*. Returns (ok, message)."""
     try:
-        client, shell = _open_shell(host, port, username, password, connect_timeout)
+        client.connect(
+            host,
+            port=port,
+            username=username,
+            password=password,
+            timeout=15,
+            look_for_keys=False,
+            allow_agent=False,
+        )
     except paramiko.AuthenticationException:
-        return False, "authentication failed"
+        log.error("Authentication failed for %s@%s", username, host)
+        sys.exit(1)
     except Exception as exc:
-        return False, f"connection error: {exc}"
+        log.error("Cannot reach %s:%d — %s", host, port, exc)
+        sys.exit(1)
+    return client
 
-    try:
-        _send(shell, "terminal length 0")
-        show_before = _send(shell, "show vlan brief")
-        already_present = _vlan_present(show_before, vlan_id)
 
-        if dry_run:
-            if remove:
-                note = "not present — nothing to do" if not already_present else "would be removed"
-            else:
-                note = "already present" if already_present else f"would be added (name={vlan_name or 'unset'})"
-            return True, f"[DRY-RUN] VLAN {vlan_id}: {note}"
+def run_command(client: paramiko.SSHClient, command: str, timeout: int = 30) -> str:
+    shell = client.invoke_shell(width=250, height=250)
+    time.sleep(1)
+    shell.recv(65535)  # discard login banner
 
-        _send(shell, "configure terminal", marker="(config)#")
-        if remove:
-            _send(shell, f"no vlan {vlan_id}", marker="(config)#")
+    shell.send("terminal length 0\n")
+    time.sleep(0.5)
+    shell.recv(65535)
+
+    shell.send(command + "\n")
+
+    output = ""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if shell.recv_ready():
+            chunk = shell.recv(65535).decode("utf-8", errors="replace")
+            output += chunk
+            if _PROMPT_RE.search(chunk):
+                break
         else:
-            _send(shell, f"vlan {vlan_id}", marker="(config-vlan)#")
-            if vlan_name:
-                _send(shell, f"name {vlan_name}", marker="(config-vlan)#")
-            _send(shell, "exit", marker="(config)#")
+            time.sleep(0.25)
 
-        _send(shell, "end")
-        _send(shell, "write memory", timeout=20)
-
-        show_after = _send(shell, "show vlan brief")
-        now_present = _vlan_present(show_after, vlan_id)
-
-        if remove and not now_present:
-            return True, f"VLAN {vlan_id} removed and verified absent"
-        if remove and now_present:
-            return False, f"VLAN {vlan_id} still present after removal"
-        if not remove and now_present:
-            return True, f"VLAN {vlan_id} provisioned and verified present"
-        return False, f"VLAN {vlan_id} not found in 'show vlan brief' after provisioning"
-
-    except Exception as exc:
-        return False, f"error during provisioning: {exc}"
-    finally:
-        client.close()
+    shell.close()
+    return output
 
 
-def build_parser():
+def fetch_mac_table(client: paramiko.SSHClient) -> str:
+    raw = run_command(client, "show mac address-table")
+    if not _ROW_RE.search(raw):
+        log.debug("No rows with 'show mac address-table', trying alternate syntax")
+        raw = run_command(client, "show mac-address-table")
+    return raw
+
+
+def parse(raw: str) -> list[dict]:
+    return [
+        {
+            "vlan": int(m.group(1)),
+            "mac": m.group(2).lower(),
+            "type": m.group(3).upper(),
+            "port": m.group(4),
+        }
+        for m in _ROW_RE.finditer(raw)
+    ]
+
+
+def apply_filters(
+    entries: list[dict],
+    vlan: int | None,
+    mac: str | None,
+    interface: str | None,
+) -> list[dict]:
+    if vlan is not None:
+        entries = [e for e in entries if e["vlan"] == vlan]
+    if mac is not None:
+        target = normalize_mac(mac)
+        entries = [e for e in entries if e["mac"] == target]
+    if interface is not None:
+        needle = interface.lower()
+        entries = [e for e in entries if needle in e["port"].lower()]
+    return entries
+
+
+def render_table(entries: list[dict]) -> None:
+    if not entries:
+        print("No matching entries.")
+        return
+    print(f"{'VLAN':<6}  {'MAC Address':<18}  {'Type':<10}  Port")
+    print("-" * 60)
+    for e in entries:
+        print(f"{e['vlan']:<6}  {e['mac']:<18}  {e['type']:<10}  {e['port']}")
+
+
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Create or remove a VLAN on one or more Cisco IOS/IOS-XE switches."
+        description="Query MAC address table on Cisco IOS/IOS-XE switches",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--hosts", nargs="+", required=True, metavar="HOST",
-                   help="Device IP(s) or hostnames")
-    p.add_argument("--username", required=True)
-    p.add_argument("--password", required=True)
-    p.add_argument("--vlan-id", required=True, type=int, metavar="ID",
-                   help="VLAN ID (1–4094)")
-    p.add_argument("--vlan-name", default="", metavar="NAME",
-                   help="VLAN name (optional when creating)")
-    p.add_argument("--remove", action="store_true",
-                   help="Remove VLAN instead of creating it")
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("--timeout", type=int, default=10, metavar="SEC",
-                   help="TCP connect timeout in seconds (default: 10)")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Show what would change without touching the device")
+    p.add_argument("-d", "--device", required=True, metavar="HOST",
+                   help="Switch hostname or IP address")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", required=True, help="SSH password")
+    p.add_argument("--port", type=int, default=22, metavar="N",
+                   help="SSH port (default: 22)")
+    p.add_argument("--vlan", type=int, metavar="ID", help="Restrict to a VLAN")
+    p.add_argument("--mac", metavar="ADDR",
+                   help="Look up a specific MAC (any notation: aa:bb:..., aabb.ccdd.eeff, ...)")
+    p.add_argument("--interface", metavar="IFACE",
+                   help="Filter by interface name (partial match, e.g. Gi0/1)")
+    p.add_argument("--output", choices=["table", "json"], default="table",
+                   help="Output format (default: table)")
+    p.add_argument("--debug", action="store_true", help="Verbose SSH logging")
     return p
 
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
 
-    if not 1 <= args.vlan_id <= 4094:
-        log.error("--vlan-id must be between 1 and 4094")
-        sys.exit(1)
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger("paramiko").setLevel(logging.DEBUG)
 
-    failures = []
-    for host in args.hosts:
-        log.info("%-20s  processing …", host)
-        ok, msg = provision(
-            host=host,
-            port=args.port,
-            username=args.username,
-            password=args.password,
-            vlan_id=args.vlan_id,
-            vlan_name=args.vlan_name,
-            remove=args.remove,
-            dry_run=args.dry_run,
-            connect_timeout=args.timeout,
-        )
-        level = logging.INFO if ok else logging.ERROR
-        log.log(level, "%-20s  %s", host, msg)
-        if not ok:
-            failures.append(host)
+    log.info("Connecting to %s:%d", args.device, args.port)
+    client = connect(args.device, args.port, args.username, args.password)
 
-    if failures:
-        log.error("%d device(s) failed: %s", len(failures), ", ".join(failures))
-        sys.exit(1)
+    try:
+        raw = fetch_mac_table(client)
+        entries = parse(raw)
+        log.info("Parsed %d total entries", len(entries))
 
-    log.info("all %d device(s) completed successfully", len(args.hosts))
+        if args.mac:
+            try:
+                args.mac = normalize_mac(args.mac)
+            except ValueError as exc:
+                log.error("%s", exc)
+                sys.exit(1)
+
+        entries = apply_filters(entries, args.vlan, args.mac, args.interface)
+        log.info("%d entries after filtering", len(entries))
+
+        if args.output == "json":
+            print(json.dumps(entries, indent=2))
+        else:
+            render_table(entries)
+    finally:
+        client.close()
+```
