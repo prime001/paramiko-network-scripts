@@ -1,222 +1,208 @@
-Here is the complete script:
+hardware_inventory.py - Collect physical hardware inventory from Cisco network devices.
 
-```python
-"""
-cdp_lldp_neighbors.py - Network Neighbor Discovery via CDP/LLDP
-
-Connects to a network device via SSH using paramiko and queries CDP and/or
-LLDP neighbor tables to map directly connected devices. Useful for building
-network topology diagrams, auditing cabling, and verifying switch/router
-adjacencies without relying on SNMP or NMS infrastructure.
+Queries `show version` and `show inventory` to extract chassis serial numbers,
+hardware module PIDs/VIDs, installed memory, and flash capacity.  Distinct from
+device_inventory.py (which captures OS/uptime/config metadata): this script targets
+physical asset tracking, rack audits, and RMA prep workflows.
 
 Usage:
-    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin -p secret
-    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin --protocol lldp
-    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin -p secret --output json
+    python hardware_inventory.py -H 192.168.1.1 -u admin -p secret
+    python hardware_inventory.py --hosts devices.txt -u admin --key ~/.ssh/id_rsa
+    python hardware_inventory.py -H 10.0.0.1 -u admin -p secret --format json -o out.json
 
 Prerequisites:
     pip install paramiko
-    SSH access to target device with sufficient privilege (show commands)
-    CDP (Cisco) or LLDP must be enabled: `cdp run` / `lldp run`
+    SSH access to Cisco IOS / IOS-XE / NX-OS devices.
+    'terminal length 0' is sent automatically; enable privilege not required for show cmds.
 """
 
 import argparse
+import csv
 import getpass
 import json
 import logging
 import re
+import socket
 import sys
-import time
+from datetime import datetime, timezone
 
 import paramiko
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger(__name__)
+logging.basicConfig(format="%(asctime)s %(levelname)-8s %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-def connect(host, username, password, port=22, timeout=15):
+def _ssh_connect(host, port, username, password, key_file, timeout):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=host,
-        port=port,
-        username=username,
-        password=password,
-        timeout=timeout,
-        look_for_keys=False,
-        allow_agent=False,
-    )
-    shell = client.invoke_shell(width=200, height=500)
-    time.sleep(1.0)
-    if shell.recv_ready():
-        shell.recv(65535)
-    _send(shell, "terminal length 0")
-    return client, shell
+    kwargs = dict(hostname=host, port=port, username=username, timeout=timeout,
+                  look_for_keys=False, allow_agent=False)
+    if key_file:
+        kwargs["key_filename"] = key_file
+    else:
+        kwargs["password"] = password
+    client.connect(**kwargs)
+    return client
 
 
-def _send(shell, command, wait=1.5):
-    shell.send(command + "\n")
-    time.sleep(wait)
-    buf = ""
-    while shell.recv_ready():
-        buf += shell.recv(65535).decode("utf-8", errors="replace")
-    return buf
+def _run(client, command, timeout=20):
+    _, stdout, stderr = client.exec_command(command, timeout=timeout)
+    out = stdout.read().decode("utf-8", errors="replace")
+    err = stderr.read().decode("utf-8", errors="replace").strip()
+    if err:
+        logger.debug("stderr (%s): %s", command, err)
+    return out
 
 
-def parse_cdp(output):
-    neighbors = []
-    for block in re.split(r"-{10,}", output):
-        if "Device ID" not in block:
-            continue
-        n = {}
-        m = re.search(r"Device ID:\s*(\S+)", block)
-        if m:
-            n["device_id"] = m.group(1)
-        m = re.search(r"IP address:\s*(\S+)", block, re.IGNORECASE)
-        if m:
-            n["ip_address"] = m.group(1)
-        m = re.search(r"Platform:\s*([^,\n]+)", block)
-        if m:
-            n["platform"] = m.group(1).strip()
-        m = re.search(r"Interface:\s*(\S+?),\s*Port ID[^:]*:\s*(\S+)", block)
-        if m:
-            n["local_intf"] = m.group(1)
-            n["remote_intf"] = m.group(2)
-        m = re.search(r"Version\s*:\s*\n?\s*(.+?)(?:\n|$)", block)
-        if m:
-            n["version"] = m.group(1).strip()
-        if n.get("device_id"):
-            neighbors.append(n)
-    return neighbors
+def _parse_version(output):
+    data = {}
+    m = re.search(r"^(\S+)\s+uptime is", output, re.MULTILINE)
+    if m:
+        data["hostname"] = m.group(1)
+    m = re.search(r"Version\s+([\d\w()./:]+)", output)
+    if m:
+        data["ios_version"] = m.group(1)
+    m = re.search(r"Processor board ID\s+(\S+)", output)
+    if m:
+        data["chassis_serial"] = m.group(1)
+    m = re.search(r"(\d+)[Kk] bytes of physical memory", output)
+    if not m:
+        m = re.search(r"(\d+)[Kk]/\d+[Kk] bytes of memory", output)
+    if m:
+        data["memory_kb"] = int(m.group(1))
+    m = re.search(r"(\d+)[Kk] bytes of.*?[Ff]lash", output)
+    if m:
+        data["flash_kb"] = int(m.group(1))
+    m = re.search(r"(?:cisco\s+)([\w-]+)\s+(?:processor|chassis|with)", output, re.IGNORECASE)
+    if m:
+        data["platform"] = m.group(1)
+    return data
 
 
-def parse_lldp(output):
-    neighbors = []
-    for block in re.split(r"-{5,}", output):
-        if "System Name" not in block and "Chassis id" not in block:
-            continue
-        n = {}
-        m = re.search(r"System Name:\s*(\S+)", block)
-        if m:
-            n["device_id"] = m.group(1)
-        m = re.search(
-            r"Management Addresses?.*?(\d{1,3}(?:\.\d{1,3}){3})",
-            block,
-            re.DOTALL | re.IGNORECASE,
-        )
-        if m:
-            n["ip_address"] = m.group(1)
-        m = re.search(r"System Description:\s*(.+?)(?:\n\s*\n|\Z)", block, re.DOTALL)
-        if m:
-            n["platform"] = re.sub(r"\s+", " ", m.group(1)).strip()[:80]
-        m = re.search(r"Local Intf(?:erface)?:\s*(\S+)", block, re.IGNORECASE)
-        if m:
-            n["local_intf"] = m.group(1)
-        m = re.search(r"Port (?:id|ID):\s*(\S+)", block)
-        if m:
-            n["remote_intf"] = m.group(1)
-        if n.get("device_id"):
-            neighbors.append(n)
-    return neighbors
+def _parse_inventory(output):
+    modules = []
+    for block in re.split(r"\n(?=NAME:)", output):
+        item = {}
+        for field, pattern in [("name", r'NAME:\s+"([^"]+)"'),
+                                ("descr", r'DESCR:\s+"([^"]+)"'),
+                                ("pid", r'PID:\s+(\S+)'),
+                                ("vid", r'VID:\s+(\S+)'),
+                                ("sn", r'SN:\s+(\S+)')]:
+            m = re.search(pattern, block)
+            if m:
+                item[field] = m.group(1).strip()
+        if item.get("sn") and item.get("pid") and item["pid"] != "":
+            modules.append(item)
+    return modules
 
 
-def print_table(neighbors, host, protocol):
-    print(f"\n{protocol.upper()} neighbors on {host}")
-    print("=" * 95)
-    hdr = "{:<28} {:<16} {:<22} {:<22}"
-    print(hdr.format("Device ID", "IP Address", "Local Interface", "Remote Interface"))
-    print("-" * 95)
-    for n in neighbors:
-        print(hdr.format(
-            n.get("device_id", "")[:27],
-            n.get("ip_address", "N/A")[:15],
-            n.get("local_intf", "N/A")[:21],
-            n.get("remote_intf", "N/A")[:21],
-        ))
-    print(f"\nTotal: {len(neighbors)} neighbor(s)\n")
+def collect(host, port, username, password, key_file, timeout):
+    result = {
+        "host": host,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "error": None,
+        "modules": [],
+    }
+    logger.info("Connecting to %s", host)
+    try:
+        client = _ssh_connect(host, port, username, password, key_file, timeout)
+    except (paramiko.AuthenticationException, paramiko.SSHException, socket.error, OSError) as exc:
+        logger.error("%s: connection failed — %s", host, exc)
+        result["error"] = str(exc)
+        return result
+
+    try:
+        _run(client, "terminal length 0")
+        result.update(_parse_version(_run(client, "show version")))
+        result["modules"] = _parse_inventory(_run(client, "show inventory"))
+        logger.info("%s: collected %d modules", host, len(result["modules"]))
+    except Exception as exc:
+        logger.error("%s: command error — %s", host, exc)
+        result["error"] = str(exc)
+    finally:
+        client.close()
+    return result
 
 
-def build_parser():
-    p = argparse.ArgumentParser(
-        description="Discover directly connected neighbors via CDP or LLDP"
-    )
-    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument(
-        "--protocol",
-        choices=["cdp", "lldp", "both"],
-        default="cdp",
-        help="Discovery protocol to query (default: cdp)",
-    )
-    p.add_argument(
-        "--output",
-        choices=["table", "json"],
-        default="table",
-        help="Output format (default: table)",
-    )
-    p.add_argument("--timeout", type=int, default=15, help="SSH connect timeout in seconds")
-    p.add_argument("--debug", action="store_true", help="Enable debug logging")
-    return p
+def _print_table(results):
+    cols = ["host", "hostname", "platform", "ios_version", "chassis_serial", "memory_kb", "flash_kb"]
+    headers = ["Host", "Hostname", "Platform", "Version", "Chassis S/N", "Mem(KB)", "Flash(KB)"]
+    rows = [[str(r.get(c, "")) for c in cols] for r in results]
+    widths = [max(len(h), max((len(row[i]) for row in rows), default=0))
+              for i, h in enumerate(headers)]
+    sep = "  ".join("-" * w for w in widths)
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*headers))
+    print(sep)
+    for r, row in zip(results, rows):
+        print(fmt.format(*row))
+        for mod in r.get("modules", []):
+            print(f"    ├─ {mod.get('name',''):<24} PID:{mod.get('pid',''):<20} "
+                  f"SN:{mod.get('sn',''):<16} VID:{mod.get('vid','')}")
+
+
+def _write_csv(results, fh):
+    top_fields = ["host", "hostname", "platform", "ios_version",
+                  "chassis_serial", "memory_kb", "flash_kb", "error"]
+    w = csv.DictWriter(fh, fieldnames=top_fields, extrasaction="ignore")
+    w.writeheader()
+    w.writerows(results)
 
 
 def main():
-    args = build_parser().parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-    logging.getLogger("paramiko").setLevel(logging.WARNING)
-
-    password = args.password or getpass.getpass(
-        f"Password for {args.username}@{args.device}: "
+    parser = argparse.ArgumentParser(
+        description="Collect hardware inventory (show version + show inventory) from Cisco devices."
     )
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("-H", "--host", help="Single device IP/hostname")
+    target.add_argument("--hosts", metavar="FILE", help="File with one host per line")
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", default=None)
+    parser.add_argument("--key", metavar="FILE", dest="key_file", help="SSH private key")
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument("--timeout", type=int, default=10, help="SSH connect timeout (default: 10)")
+    parser.add_argument("--format", choices=["table", "json", "csv"], default="table")
+    parser.add_argument("-o", "--output", metavar="FILE", help="Write to file instead of stdout")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args()
 
-    log.info("Connecting to %s", args.device)
-    try:
-        client, shell = connect(
-            args.device, args.username, password, args.port, args.timeout
-        )
-    except paramiko.AuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.device)
-        sys.exit(1)
-    except (paramiko.SSHException, OSError) as exc:
-        log.error("SSH connection failed: %s", exc)
-        sys.exit(1)
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    results = {}
-    try:
-        protocols = ["cdp", "lldp"] if args.protocol == "both" else [args.protocol]
-        for proto in protocols:
-            log.info("Querying %s neighbors", proto.upper())
-            raw = _send(shell, f"show {proto} neighbors detail", wait=2.5)
-            if "Invalid input" in raw or "% Error" in raw or "not enabled" in raw.lower():
-                log.warning("%s not available on this device", proto.upper())
-                continue
-            neighbors = parse_cdp(raw) if proto == "cdp" else parse_lldp(raw)
-            log.info("Found %d %s neighbor(s)", len(neighbors), proto.upper())
-            results[proto] = neighbors
-    finally:
-        shell.close()
-        client.close()
+    if not args.password and not args.key_file:
+        args.password = getpass.getpass("SSH password: ")
 
-    if not results:
-        log.warning("No neighbor data collected — verify CDP/LLDP is enabled")
-        sys.exit(0)
-
-    if args.output == "json":
-        print(json.dumps(results, indent=2))
+    if args.host:
+        hosts = [args.host]
     else:
-        for proto, neighbors in results.items():
-            print_table(neighbors, args.device, proto)
+        try:
+            with open(args.hosts) as fh:
+                hosts = [l.strip() for l in fh if l.strip() and not l.startswith("#")]
+        except OSError as exc:
+            logger.error("Cannot read hosts file: %s", exc)
+            sys.exit(1)
+
+    results = [collect(h, args.port, args.username, args.password,
+                       args.key_file, args.timeout) for h in hosts]
+
+    fh = open(args.output, "w") if args.output else sys.stdout
+    try:
+        if args.format == "json":
+            json.dump(results, fh, indent=2)
+            fh.write("\n")
+        elif args.format == "csv":
+            _write_csv(results, fh)
+        else:
+            _print_table(results)
+    finally:
+        if args.output:
+            fh.close()
+
+    failed = sum(1 for r in results if r["error"])
+    if failed:
+        logger.warning("%d/%d devices failed", failed, len(results))
+        sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
-```
-
-**What this does differently from `device_inventory.py`:** Instead of inventorying *a single device*, it maps *connected neighbors* — parsing `show cdp/lldp neighbors detail` to extract device IDs, management IPs, platforms, and the local/remote interface pair for each link. The `--protocol both` flag queries both CDP and LLDP in one pass. Output is either a formatted table or JSON for downstream processing.
