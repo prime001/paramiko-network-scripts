@@ -1,25 +1,26 @@
-Here's the complete script — you can save it as `mac_table.py`:
+bgp_summary.py - BGP Neighbor State Parser
 
-```python
-"""mac_table.py - MAC Address Table Collector and Parser
+Connect to a Cisco IOS/IOS-XE router via SSH, collect 'show ip bgp summary'
+output, and produce structured JSON or a tabular report showing neighbor state,
+uptime, and prefix counts.
 
-Purpose:
-    Connects to a Cisco IOS/IOS-XE device via SSH, retrieves the MAC address
-    table, and parses it into structured data. Supports filtering by VLAN,
-    interface prefix, or entry type (DYNAMIC/STATIC) and outputs as a
-    formatted table or JSON.
+Practical uses:
+  - NOC dashboards and automated health checks
+  - Pre/post change-window verification
+  - Alerting scripts that need a fast established/down tally
 
 Usage:
-    python mac_table.py -H 192.168.1.1 -u admin -p secret
-    python mac_table.py -H 192.168.1.1 -u admin -p secret --vlan 100
-    python mac_table.py -H 192.168.1.1 -u admin -p secret --interface Gi0/1
-    python mac_table.py -H 192.168.1.1 -u admin -p secret --type DYNAMIC --json
+    python bgp_summary.py -H 192.168.1.1 -u admin -p secret
+    python bgp_summary.py -H 10.0.0.1 -u admin -k ~/.ssh/id_rsa --json
+    python bgp_summary.py -H 10.0.0.1 -u admin -p secret --filter down
 
 Prerequisites:
     pip install paramiko
+    SSH must be enabled on the device; user needs at least privilege 1.
 """
 
 import argparse
+import getpass
 import json
 import logging
 import re
@@ -27,155 +28,179 @@ import sys
 
 import paramiko
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.WARNING)
+log = logging.getLogger(__name__)
+
+# Matches a BGP neighbor line from IOS 'show ip bgp summary':
+# 10.0.0.1  4  65001  1234  5678  100  0  0  00:10:11  50
+_NEIGHBOR_RE = re.compile(
+    r"^(?P<neighbor>\d+\.\d+\.\d+\.\d+)\s+"
+    r"(?P<version>\d)\s+"
+    r"(?P<asn>\d+)\s+"
+    r"(?P<msg_rcvd>\d+)\s+"
+    r"(?P<msg_sent>\d+)\s+"
+    r"(?P<tbl_ver>\d+)\s+"
+    r"(?P<in_q>\d+)\s+"
+    r"(?P<out_q>\d+)\s+"
+    r"(?P<updown>\S+)\s+"
+    r"(?P<state_pfx>\S+)$"
 )
-logger = logging.getLogger(__name__)
 
 
-def connect(host, port, username, password, timeout):
+def connect(host, username, password=None, key_file=None, port=22, timeout=15):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
+    kwargs = dict(
         hostname=host,
         port=port,
         username=username,
-        password=password,
         timeout=timeout,
-        look_for_keys=False,
+        look_for_keys=bool(key_file),
         allow_agent=False,
     )
+    if key_file:
+        kwargs["key_filename"] = key_file
+    else:
+        kwargs["password"] = password
+    client.connect(**kwargs)
     return client
 
 
-def run_command(client, command, read_timeout=15):
-    _, stdout, stderr = client.exec_command(command, timeout=read_timeout)
+def run_command(client, command, timeout=30):
+    _, stdout, stderr = client.exec_command(command, timeout=timeout)
     output = stdout.read().decode("utf-8", errors="replace")
-    err = stderr.read().decode("utf-8", errors="replace")
-    if err.strip():
-        logger.debug("stderr: %s", err.strip())
+    err = stderr.read().decode("utf-8", errors="replace").strip()
+    if err:
+        log.warning("stderr from device: %s", err)
     return output
 
 
-def parse_mac_table(output):
-    entries = []
-    # Matches Cisco IOS lines:  100  aabb.cc00.0100  DYNAMIC  Gi0/1
-    pattern = re.compile(
-        r"^\s*(\d+|All)\s+"
-        r"([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+"
-        r"(\S+)\s+"
-        r"(\S+)",
-        re.MULTILINE,
-    )
-    for match in pattern.finditer(output):
-        entries.append({
-            "vlan": match.group(1),
-            "mac": match.group(2).lower(),
-            "type": match.group(3).upper(),
-            "interface": match.group(4),
+def parse_bgp_summary(raw):
+    router_id = None
+    local_as = None
+    neighbors = []
+
+    for line in raw.splitlines():
+        m = re.search(r"BGP router identifier (\S+), local AS number (\d+)", line)
+        if m:
+            router_id = m.group(1)
+            local_as = m.group(2)
+            continue
+
+        m = _NEIGHBOR_RE.match(line.strip())
+        if not m:
+            continue
+
+        state_pfx = m.group("state_pfx")
+        try:
+            prefix_count = int(state_pfx)
+            state = "Established"
+        except ValueError:
+            prefix_count = None
+            state = state_pfx  # Idle, Active, Connect, OpenSent, OpenConfirm
+
+        neighbors.append({
+            "neighbor": m.group("neighbor"),
+            "asn": int(m.group("asn")),
+            "updown": m.group("updown"),
+            "state": state,
+            "prefixes_received": prefix_count,
+            "msg_rcvd": int(m.group("msg_rcvd")),
+            "msg_sent": int(m.group("msg_sent")),
         })
-    return entries
+
+    return {"router_id": router_id, "local_as": local_as, "neighbors": neighbors}
 
 
-def filter_entries(entries, vlan=None, interface=None, entry_type=None):
-    if vlan is not None:
-        entries = [e for e in entries if e["vlan"] == str(vlan)]
-    if interface:
-        prefix = interface.lower()
-        entries = [e for e in entries if e["interface"].lower().startswith(prefix)]
-    if entry_type:
-        entries = [e for e in entries if e["type"] == entry_type.upper()]
-    return entries
+def print_table(data):
+    neighbors = data["neighbors"]
+    router_id = data.get("router_id", "unknown")
+    local_as = data.get("local_as", "unknown")
 
+    print(f"Router ID : {router_id}   Local AS : {local_as}")
 
-def print_table(entries):
-    if not entries:
-        print("No matching MAC address table entries.")
+    if not neighbors:
+        print("No BGP neighbors found in output.")
         return
-    col_iface = max(len(e["interface"]) for e in entries)
-    col_iface = max(col_iface, 9)
-    header = f"{'VLAN':<6}  {'MAC Address':<17}  {'Type':<10}  {'Interface':<{col_iface}}"
-    print(header)
-    print("-" * len(header))
-    for e in entries:
-        print(
-            f"{e['vlan']:<6}  {e['mac']:<17}  {e['type']:<10}  {e['interface']:<{col_iface}}"
-        )
-    print(f"\nTotal: {len(entries)} entries")
+
+    hdr = f"{'Neighbor':<16} {'Peer AS':<10} {'State':<14} {'Up/Down':<12} {'Pfx Rcvd':>8}"
+    bar = "-" * len(hdr)
+    print(bar)
+    print(hdr)
+    print(bar)
+    for n in neighbors:
+        pfx = str(n["prefixes_received"]) if n["prefixes_received"] is not None else "-"
+        print(f"{n['neighbor']:<16} {n['asn']:<10} {n['state']:<14} {n['updown']:<12} {pfx:>8}")
+    print(bar)
+
+    total = len(neighbors)
+    up = sum(1 for n in neighbors if n["state"] == "Established")
+    print(f"Summary : {total} neighbors   {up} Established   {total - up} not Established")
 
 
-def build_parser():
+def build_arg_parser():
     p = argparse.ArgumentParser(
-        description="Retrieve and parse the MAC address table from a network device."
+        description="Parse BGP neighbor state from a Cisco IOS/IOS-XE router."
     )
-    p.add_argument("-H", "--host", required=True, help="Device hostname or IP")
+    p.add_argument("-H", "--host", required=True, help="Device IP or hostname")
     p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", required=True, help="SSH password")
+    p.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
+    p.add_argument("-k", "--key-file", default=None, dest="key_file",
+                   help="Path to SSH private key")
     p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("--vlan", help="Filter results to a specific VLAN ID")
-    p.add_argument("--interface", help="Filter by interface name prefix (e.g. Gi0/1)")
+    p.add_argument("--json", action="store_true", dest="json_out",
+                   help="Emit JSON instead of a table")
     p.add_argument(
-        "--type",
-        dest="entry_type",
-        choices=["DYNAMIC", "STATIC"],
-        help="Filter by entry type",
+        "--filter",
+        choices=["established", "down", "all"],
+        default="all",
+        help="Limit output to a neighbor subset (default: all)",
     )
-    p.add_argument("--json", action="store_true", dest="as_json", help="Output as JSON")
-    p.add_argument("--timeout", type=int, default=10, help="SSH connect timeout (seconds)")
-    p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     return p
 
 
-def main():
-    args = build_parser().parse_args()
+if __name__ == "__main__":
+    args = build_arg_parser().parse_args()
 
-    if args.debug:
+    if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-        logging.getLogger("paramiko").setLevel(logging.DEBUG)
-    else:
-        logging.getLogger("paramiko").setLevel(logging.WARNING)
+
+    if not args.password and not args.key_file:
+        args.password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
 
     try:
-        logger.info("Connecting to %s:%d", args.host, args.port)
-        client = connect(args.host, args.port, args.username, args.password, args.timeout)
+        log.debug("Connecting to %s:%d as %s", args.host, args.port, args.username)
+        client = connect(
+            args.host,
+            args.username,
+            password=args.password,
+            key_file=args.key_file,
+            port=args.port,
+        )
     except paramiko.AuthenticationException:
-        logger.error("Authentication failed for %s@%s", args.username, args.host)
+        print(f"ERROR: Authentication failed for {args.username}@{args.host}", file=sys.stderr)
         sys.exit(1)
     except (paramiko.SSHException, OSError) as exc:
-        logger.error("Connection error: %s", exc)
+        print(f"ERROR: Cannot connect to {args.host}: {exc}", file=sys.stderr)
         sys.exit(1)
 
     try:
-        logger.info("Fetching MAC address table from %s", args.host)
-        output = run_command(client, "show mac address-table")
-        if "Invalid input" in output or "% Unknown" in output:
-            logger.debug("Retrying with alternate command syntax")
-            output = run_command(client, "show mac-address-table")
+        raw = run_command(client, "show ip bgp summary")
+    except paramiko.SSHException as exc:
+        print(f"ERROR: Command execution failed: {exc}", file=sys.stderr)
+        sys.exit(1)
     finally:
         client.close()
 
-    entries = parse_mac_table(output)
-    if not entries:
-        logger.warning(
-            "No entries parsed — output may not match expected format. "
-            "Re-run with --debug to see raw output."
-        )
-        if args.debug:
-            print(output)
-        sys.exit(1)
+    data = parse_bgp_summary(raw)
 
-    logger.info("Parsed %d total entries", len(entries))
-    entries = filter_entries(entries, args.vlan, args.interface, args.entry_type)
+    if args.filter == "established":
+        data["neighbors"] = [n for n in data["neighbors"] if n["state"] == "Established"]
+    elif args.filter == "down":
+        data["neighbors"] = [n for n in data["neighbors"] if n["state"] != "Established"]
 
-    if args.as_json:
-        print(json.dumps(entries, indent=2))
+    if args.json_out:
+        print(json.dumps(data, indent=2))
     else:
-        print_table(entries)
-
-
-if __name__ == "__main__":
-    main()
-```
-
-**What this does:** Retrieves `show mac address-table` output via paramiko, parses each entry with a regex (VLAN / MAC / type / interface columns), then lets you filter by VLAN, interface prefix, or entry type (DYNAMIC/STATIC). Falls back to the hyphenated command syntax if the first fails. Output is either a formatted column table or JSON. ~160 lines, no overlap with the existing scripts.
+        print_table(data)
