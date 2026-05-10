@@ -1,202 +1,228 @@
-The write was blocked by permissions. Here is the complete script content — paste it into `password_rotation.py` in your repo:
+SSH Key Lifecycle Manager for Network Devices
 
-```python
-"""
-password_rotation.py - Network Device Password Rotation via Paramiko
-
-Connects to one or more Cisco IOS/IOS-XE devices and rotates the enable
-secret and/or a named local user's password. After each rotation the script
-immediately re-authenticates with the new credential to verify it works,
-then logs a pass/fail result per device.
+Manages SSH public key authentication on network devices: deploy keys for
+password-less access, verify key-based login works, audit installed keys,
+and remove stale keys. Useful for transitioning device fleets from password
+auth to key-based auth, auditing key hygiene, or rotating compromised keys.
 
 Usage:
-    # Single device
-    python password_rotation.py -d 192.168.1.1 -u admin -p OldPass \
-        --new-password NewPass123 --username-to-rotate netops
+    # Deploy your public key using password auth
+    python credential_vault_v3.py --host 192.168.1.1 --username admin \
+        --password secret --action deploy --pubkey ~/.ssh/id_rsa.pub
 
-    # Multiple devices from file (one IP per line)
-    python password_rotation.py -f devices.txt -u admin -p OldPass \
-        --new-password NewPass123 --enable --username-to-rotate netops
+    # Verify key-based login succeeds after deployment
+    python credential_vault_v3.py --host 192.168.1.1 --username admin \
+        --key ~/.ssh/id_rsa --action verify
 
-    # Rotate enable secret only
-    python password_rotation.py -d 192.168.1.1 -u admin -p OldPass \
-        --enable-secret OldEnable --new-enable-secret NewEnable --enable
+    # Audit which keys are installed (accepts password or key auth)
+    python credential_vault_v3.py --host 192.168.1.1 --username admin \
+        --password secret --action audit
+
+    # Remove a specific key by its public key file
+    python credential_vault_v3.py --host 192.168.1.1 --username admin \
+        --password secret --action remove --pubkey ~/.ssh/id_rsa_old.pub
 
 Prerequisites:
     pip install paramiko
+    Target must have sshd running and support authorized_keys (Linux-based
+    network devices, Cisco NX-OS with bash shell, Arista EOS, Juniper JunOS).
+    For Cisco IOS, SSH key auth requires 'ip ssh pubkey-chain' configuration.
 """
 
 import argparse
 import logging
 import sys
-import time
+from pathlib import Path
 
 import paramiko
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
 
-def _exec(shell, command: str, wait: float = 1.5) -> str:
-    shell.send(command + "\n")
-    time.sleep(wait)
-    output = ""
-    while shell.recv_ready():
-        output += shell.recv(4096).decode("utf-8", errors="replace")
-    return output
-
-
-def _open_shell(host: str, username: str, password: str, timeout: int = 10):
+def _connect(host, port, username, password=None, key_path=None, timeout=15):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        host,
-        username=username,
-        password=password,
-        timeout=timeout,
-        look_for_keys=False,
-        allow_agent=False,
+    kwargs = {
+        "hostname": host,
+        "port": port,
+        "username": username,
+        "timeout": timeout,
+        "look_for_keys": False,
+        "allow_agent": False,
+    }
+    if key_path:
+        kwargs["key_filename"] = str(key_path)
+    if password:
+        kwargs["password"] = password
+    client.connect(**kwargs)
+    return client
+
+
+def _run(client, command, timeout=10):
+    _, stdout, stderr = client.exec_command(command, timeout=timeout)
+    return (
+        stdout.read().decode(errors="replace").strip(),
+        stderr.read().decode(errors="replace").strip(),
     )
-    shell = client.invoke_shell(width=200, height=50)
-    time.sleep(1.0)
-    shell.recv(4096)
-    return client, shell
 
 
-def rotate_device(
-    host: str,
-    username: str,
-    password: str,
-    new_password: str | None,
-    username_to_rotate: str | None,
-    enable_secret: str | None,
-    new_enable_secret: str | None,
-    use_enable: bool,
-    timeout: int,
-) -> bool:
-    log.info("[%s] Connecting …", host)
+def deploy_key(host, port, username, password, pubkey_path, timeout):
+    pubkey_text = Path(pubkey_path).read_text().strip()
+    client = _connect(host, port, username, password=password, timeout=timeout)
     try:
-        client, shell = _open_shell(host, username, password, timeout)
-    except Exception as exc:
-        log.error("[%s] Connection failed: %s", host, exc)
-        return False
-
-    try:
-        _exec(shell, "terminal length 0")
-
-        if use_enable and enable_secret:
-            out = _exec(shell, "enable")
-            if "Password" in out:
-                _exec(shell, enable_secret)
-
-        _exec(shell, "configure terminal")
-
-        if username_to_rotate and new_password:
-            cmd = f"username {username_to_rotate} privilege 15 secret {new_password}"
-            _exec(shell, cmd)
-            log.info("[%s] Rotated password for user '%s'", host, username_to_rotate)
-
-        if new_enable_secret:
-            _exec(shell, f"enable secret {new_enable_secret}")
-            log.info("[%s] Rotated enable secret", host)
-
-        _exec(shell, "end")
-        _exec(shell, "write memory", wait=3.0)
-        client.close()
-    except Exception as exc:
-        log.error("[%s] Rotation commands failed: %s", host, exc)
-        client.close()
-        return False
-
-    # Verify new credential
-    verify_user = username_to_rotate or username
-    verify_pass = new_password or password
-    log.info("[%s] Verifying new credentials …", host)
-    try:
-        vc, vs = _open_shell(host, verify_user, verify_pass, timeout)
-        _exec(vs, "show version", wait=2.0)
-        vc.close()
-        log.info("[%s] Verification PASSED", host)
+        _run(client, "mkdir -p ~/.ssh && chmod 700 ~/.ssh")
+        out, err = _run(
+            client,
+            "cat ~/.ssh/authorized_keys 2>/dev/null || true",
+        )
+        if pubkey_text in out:
+            log.info("Key already present on %s — no change needed", host)
+            return True
+        sftp = client.open_sftp()
+        existing = out + "\n" if out else ""
+        with sftp.open(".ssh/authorized_keys", "w") as f:
+            f.write(existing + pubkey_text + "\n")
+        sftp.close()
+        _run(client, "chmod 600 ~/.ssh/authorized_keys")
+        log.info("Key deployed to %s@%s", username, host)
         return True
     except Exception as exc:
-        log.error("[%s] Verification FAILED — new credential rejected: %s", host, exc)
+        log.error("Deploy failed on %s: %s", host, exc)
+        return False
+    finally:
+        client.close()
+
+
+def verify_key_auth(host, port, username, key_path, timeout):
+    try:
+        client = _connect(host, port, username, key_path=key_path, timeout=timeout)
+        out, _ = _run(client, "echo KEY_AUTH_OK")
+        client.close()
+        if "KEY_AUTH_OK" in out:
+            log.info("Key auth verified for %s@%s", username, host)
+            return True
+        log.warning("Unexpected response from %s during verify: %s", host, out)
+        return False
+    except paramiko.AuthenticationException:
+        log.error("Key auth FAILED for %s@%s — key not accepted by device", username, host)
+        return False
+    except Exception as exc:
+        log.error("Verify error on %s: %s", host, exc)
         return False
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Rotate passwords on Cisco IOS/IOS-XE devices."
+def audit_keys(host, port, username, password=None, key_path=None, timeout=15):
+    client = _connect(
+        host, port, username, password=password, key_path=key_path, timeout=timeout
     )
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("-d", "--device", help="Single device IP or hostname")
-    target.add_argument("-f", "--file", help="File with one device IP per line")
+    try:
+        out, _ = _run(client, "cat ~/.ssh/authorized_keys 2>/dev/null || true")
+        keys = [
+            line for line in out.splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        if not keys:
+            log.info("No authorized keys found for %s@%s", username, host)
+            return []
+        log.info("%d key(s) installed for %s@%s:", len(keys), username, host)
+        for i, k in enumerate(keys, 1):
+            parts = k.split()
+            if len(parts) >= 2:
+                summary = f"{parts[0]} ...{parts[1][-20:]} {' '.join(parts[2:])}"
+            else:
+                summary = k[:80]
+            print(f"  [{i}] {summary.strip()}")
+        return keys
+    except Exception as exc:
+        log.error("Audit failed on %s: %s", host, exc)
+        return []
+    finally:
+        client.close()
 
-    parser.add_argument("-u", "--username", required=True, help="SSH login username")
-    parser.add_argument("-p", "--password", required=True, help="Current SSH password")
-    parser.add_argument("--new-password", help="New password for --username-to-rotate")
-    parser.add_argument(
-        "--username-to-rotate",
-        help="Local username whose password should be rotated",
+
+def remove_key(host, port, username, password, pubkey_path, timeout):
+    pubkey_text = Path(pubkey_path).read_text().strip()
+    client = _connect(host, port, username, password=password, timeout=timeout)
+    try:
+        out, _ = _run(client, "cat ~/.ssh/authorized_keys 2>/dev/null || true")
+        original = [l for l in out.splitlines() if l.strip()]
+        filtered = [l for l in original if l.strip() != pubkey_text]
+        if len(filtered) == len(original):
+            log.warning("Key not found in authorized_keys on %s — nothing removed", host)
+            return True
+        sftp = client.open_sftp()
+        with sftp.open(".ssh/authorized_keys", "w") as f:
+            f.write("\n".join(filtered) + "\n" if filtered else "")
+        sftp.close()
+        log.info("Key removed from %s@%s (%d remaining)", username, host, len(filtered))
+        return True
+    except Exception as exc:
+        log.error("Remove failed on %s: %s", host, exc)
+        return False
+    finally:
+        client.close()
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="SSH public key lifecycle manager for network devices"
     )
-    parser.add_argument(
-        "--enable", action="store_true", help="Enter enable mode before configuring"
+    p.add_argument("--host", required=True, help="Device IP or hostname")
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("--username", required=True, help="SSH username")
+    p.add_argument("--password", help="Password (required for deploy, audit, remove)")
+    p.add_argument("--key", help="Private key path (required for verify)")
+    p.add_argument("--pubkey", help="Public key file path (required for deploy, remove)")
+    p.add_argument(
+        "--action",
+        required=True,
+        choices=["deploy", "verify", "audit", "remove"],
     )
-    parser.add_argument("--enable-secret", help="Current enable secret")
-    parser.add_argument("--new-enable-secret", help="New enable secret to set")
-    parser.add_argument(
-        "--timeout", type=int, default=10, help="SSH connection timeout (default 10s)"
-    )
-    args = parser.parse_args()
+    p.add_argument("--timeout", type=int, default=15, help="SSH connect timeout (seconds)")
+    p.add_argument("--debug", action="store_true")
+    return p.parse_args()
 
-    if not args.new_password and not args.new_enable_secret:
-        parser.error("At least one of --new-password or --new-enable-secret is required")
 
-    devices: list[str] = []
-    if args.device:
-        devices = [args.device]
-    else:
-        try:
-            with open(args.file) as fh:
-                devices = [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
-        except OSError as exc:
-            log.error("Cannot read device file: %s", exc)
-            sys.exit(1)
+def main():
+    args = parse_args()
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        paramiko.util.log_to_file("/dev/stderr")
 
-    if not devices:
-        log.error("No devices to process")
-        sys.exit(1)
+    if args.action == "deploy":
+        if not args.password or not args.pubkey:
+            log.error("--password and --pubkey are required for deploy")
+            sys.exit(2)
+        ok = deploy_key(args.host, args.port, args.username, args.password, args.pubkey, args.timeout)
 
-    results: dict[str, bool] = {}
-    for host in devices:
-        results[host] = rotate_device(
-            host=host,
-            username=args.username,
-            password=args.password,
-            new_password=args.new_password,
-            username_to_rotate=args.username_to_rotate,
-            enable_secret=args.enable_secret,
-            new_enable_secret=args.new_enable_secret,
-            use_enable=args.enable,
-            timeout=args.timeout,
+    elif args.action == "verify":
+        if not args.key:
+            log.error("--key (private key path) is required for verify")
+            sys.exit(2)
+        ok = verify_key_auth(args.host, args.port, args.username, args.key, args.timeout)
+
+    elif args.action == "audit":
+        if not args.password and not args.key:
+            log.error("--password or --key is required for audit")
+            sys.exit(2)
+        result = audit_keys(
+            args.host, args.port, args.username,
+            password=args.password, key_path=args.key, timeout=args.timeout,
         )
+        ok = result is not None
 
-    passed = sum(1 for v in results.values() if v)
-    failed = len(results) - passed
-    print(f"\nSummary: {passed} succeeded, {failed} failed out of {len(results)} devices")
-    if failed:
-        print("Failed devices:")
-        for host, ok in results.items():
-            if not ok:
-                print(f"  {host}")
-        sys.exit(1)
+    elif args.action == "remove":
+        if not args.password or not args.pubkey:
+            log.error("--password and --pubkey are required for remove")
+            sys.exit(2)
+        ok = remove_key(args.host, args.port, args.username, args.password, args.pubkey, args.timeout)
+
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":
     main()
-```
-
-The script rotates local-user passwords and/or the enable secret on Cisco IOS/IOS-XE devices, then immediately re-authenticates to verify the new credential landed — a distinct operation from the existing vault scripts that store/retrieve credentials.
