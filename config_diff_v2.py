@@ -1,214 +1,239 @@
-This is a code generation task — the script goes to the user's GitHub portfolio repo, not this working directory. Outputting the script directly:
+```python
+"""config_audit.py — Network Device Configuration Compliance Auditor
 
-```
-"""
-running_startup_diff.py - Detect unsaved configuration changes on network devices.
-
-Connects to one or more Cisco IOS/IOS-XE devices via SSH and diffs running-config
-against startup-config to find changes that haven't been written to NVRAM. Useful
-for auditing change-management compliance (every approved change should end with
-'write memory') or pre-maintenance safety checks.
+Purpose:
+    Connect to a network device via SSH, retrieve the running configuration,
+    and evaluate it against a YAML compliance policy that defines required
+    and prohibited configuration patterns.  Outputs a severity-grouped report
+    suitable for automated pipelines or human review.
 
 Usage:
-    Single device:
-        python running_startup_diff.py -d 192.168.1.1 -u admin -p secret
-
-    Multiple devices from file (one IP/hostname per line):
-        python running_startup_diff.py -f devices.txt -u admin
-
-    Save report to file:
-        python running_startup_diff.py -f devices.txt -u admin -o report.txt
+    python config_audit.py -d 192.168.1.1 -u admin -p secret -c policy.yaml
+    python config_audit.py -d 192.168.1.1 -u admin --key ~/.ssh/id_rsa \
+        -c policy.yaml --output report.txt --fail-on-findings
 
 Prerequisites:
-    pip install paramiko
+    pip install paramiko pyyaml
+
+Policy file (YAML):
+    required:
+      - pattern: "service password-encryption"
+        description: "Passwords must be encrypted"
+        severity: HIGH
+      - pattern: "logging \\d+\\.\\d+\\.\\d+\\.\\d+"
+        description: "Remote syslog server required"
+        severity: CRITICAL
+    prohibited:
+      - pattern: "^username .+ privilege 15 password 0"
+        description: "Cleartext privilege-15 passwords forbidden"
+        severity: CRITICAL
+      - pattern: "ip http server$"
+        description: "Unencrypted HTTP management must be disabled"
+        severity: HIGH
 """
 
 import argparse
-import difflib
 import logging
+import re
 import sys
 import time
-from getpass import getpass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 import paramiko
+import yaml
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-SSH_TIMEOUT = 10
-COMMAND_WAIT = 3.0
+SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 
 
-def ssh_connect(host: str, username: str, password: str, port: int) -> paramiko.SSHClient:
+@dataclass
+class PolicyRule:
+    pattern: str
+    description: str
+    severity: str = "HIGH"
+
+
+@dataclass
+class CompliancePolicy:
+    required: list = field(default_factory=list)
+    prohibited: list = field(default_factory=list)
+
+
+@dataclass
+class AuditFinding:
+    rule_type: str
+    description: str
+    pattern: str
+    severity: str
+    matched_lines: list = field(default_factory=list)
+
+
+def load_policy(policy_path: str) -> CompliancePolicy:
+    with open(policy_path) as fh:
+        data = yaml.safe_load(fh)
+    policy = CompliancePolicy()
+    for item in data.get("required", []):
+        policy.required.append(PolicyRule(
+            pattern=item["pattern"],
+            description=item["description"],
+            severity=item.get("severity", "HIGH").upper(),
+        ))
+    for item in data.get("prohibited", []):
+        policy.prohibited.append(PolicyRule(
+            pattern=item["pattern"],
+            description=item["description"],
+            severity=item.get("severity", "HIGH").upper(),
+        ))
+    return policy
+
+
+def fetch_running_config(host: str, port: int, username: str,
+                         password: Optional[str], key_path: Optional[str],
+                         timeout: int) -> str:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        host,
-        port=port,
-        username=username,
-        password=password,
-        timeout=SSH_TIMEOUT,
-        look_for_keys=False,
-        allow_agent=False,
-    )
-    return client
+    kwargs = dict(hostname=host, port=port, username=username,
+                  timeout=timeout, look_for_keys=False, allow_agent=False)
+    if key_path:
+        kwargs["key_filename"] = key_path
+    else:
+        kwargs["password"] = password
 
-
-def send_command(shell: paramiko.Channel, command: str, wait: float = COMMAND_WAIT) -> str:
-    shell.send(command + "\n")
-    time.sleep(wait)
-    output = ""
-    while shell.recv_ready():
-        output += shell.recv(65535).decode("utf-8", errors="replace")
-    return output
-
-
-def fetch_config(shell: paramiko.Channel, command: str) -> list[str]:
-    raw = send_command(shell, command)
-    lines = []
-    for line in raw.splitlines():
-        stripped = line.rstrip()
-        # Drop the echoed command and IOS prompt lines
-        if stripped.endswith("#") or stripped.endswith(">"):
-            continue
-        if stripped.lstrip().startswith(command.split()[0]):
-            continue
-        lines.append(stripped)
-    return lines
-
-
-def check_device(host: str, username: str, password: str, port: int) -> dict:
-    result = {"host": host, "status": "ok", "diff": [], "error": None}
-    client = None
     try:
-        log.info("Connecting to %s", host)
-        client = ssh_connect(host, username, password, port)
+        client.connect(**kwargs)
+        log.info("Connected to %s:%d", host, port)
         shell = client.invoke_shell()
-        time.sleep(1.0)
-        shell.recv(65535)  # flush login banner and initial prompt
-
-        send_command(shell, "terminal length 0", wait=1.0)
-
-        running = fetch_config(shell, "show running-config")
-        startup = fetch_config(shell, "show startup-config")
-
-        diff = list(
-            difflib.unified_diff(
-                startup,
-                running,
-                fromfile=f"{host}/startup-config",
-                tofile=f"{host}/running-config",
-                lineterm="",
-            )
-        )
-        result["diff"] = diff
-
-        if diff:
-            log.warning("%s: %d line(s) differ — unsaved changes present", host, len(diff))
-        else:
-            log.info("%s: running and startup configs match", host)
-
-    except paramiko.AuthenticationException:
-        result["status"] = "auth_failed"
-        result["error"] = "Authentication failed"
-        log.error("%s: authentication failed", host)
-    except (paramiko.SSHException, OSError) as exc:
-        result["status"] = "connection_error"
-        result["error"] = str(exc)
-        log.error("%s: %s", host, exc)
+        shell.settimeout(timeout)
+        time.sleep(1)
+        shell.recv(4096)
+        shell.send("terminal length 0\n")
+        time.sleep(0.5)
+        shell.recv(4096)
+        shell.send("show running-config\n")
+        time.sleep(4)
+        buf = b""
+        while shell.recv_ready():
+            buf += shell.recv(65535)
+            time.sleep(0.2)
+        return buf.decode("utf-8", errors="replace")
     finally:
-        if client:
-            client.close()
-
-    return result
+        client.close()
 
 
-def format_report(results: list[dict]) -> str:
-    clean = [r for r in results if r["status"] == "ok" and not r["diff"]]
-    dirty = [r for r in results if r["status"] == "ok" and r["diff"]]
-    failed = [r for r in results if r["status"] != "ok"]
+def audit(config: str, policy: CompliancePolicy) -> list:
+    lines = config.splitlines()
+    findings = []
+    for rule in policy.required:
+        hits = [ln for ln in lines if re.search(rule.pattern, ln)]
+        if not hits:
+            findings.append(AuditFinding(
+                rule_type="required", description=rule.description,
+                pattern=rule.pattern, severity=rule.severity,
+            ))
+    for rule in policy.prohibited:
+        hits = [ln for ln in lines if re.search(rule.pattern, ln)]
+        if hits:
+            findings.append(AuditFinding(
+                rule_type="prohibited", description=rule.description,
+                pattern=rule.pattern, severity=rule.severity,
+                matched_lines=hits,
+            ))
+    findings.sort(key=lambda f: SEVERITY_ORDER.get(f.severity, 99))
+    return findings
 
-    lines = [
-        "=" * 60,
-        "Running vs Startup Config Diff Report",
-        "=" * 60,
-        "",
-        f"Devices checked   : {len(results)}",
-        f"  In sync         : {len(clean)}",
-        f"  Unsaved changes : {len(dirty)}",
-        f"  Unreachable     : {len(failed)}",
-        "",
-    ]
 
-    if dirty:
-        lines.append("--- Devices with unsaved changes ---")
-        for r in dirty:
-            lines.append(f"\n{r['host']}:")
-            lines.extend(r["diff"])
+def build_report(host: str, findings: list) -> str:
+    sep = "=" * 62
+    lines = [sep, f"Config Compliance Audit — {host}", sep,
+             f"Findings: {len(findings)}", ""]
+    if not findings:
+        lines.append("PASS — no compliance violations detected.")
+        return "\n".join(lines)
 
-    if failed:
-        lines.append("\n--- Failed connections ---")
-        for r in failed:
-            lines.append(f"  {r['host']}: {r['error']}")
-
-    if clean:
-        lines.append("\n--- Clean devices (running == startup) ---")
-        for r in clean:
-            lines.append(f"  {r['host']}")
-
+    current_sev = None
+    for f in findings:
+        if f.severity != current_sev:
+            current_sev = f.severity
+            lines.append(f"[{current_sev}]")
+        tag = "MISSING" if f.rule_type == "required" else "VIOLATION"
+        lines.append(f"  [{tag}] {f.description}")
+        lines.append(f"          pattern : {f.pattern}")
+        for ml in f.matched_lines[:3]:
+            lines.append(f"          found   : {ml.strip()}")
+        lines.append("")
     return "\n".join(lines)
 
 
-def load_hosts(path: str) -> list[str]:
-    return [
-        line.strip()
-        for line in Path(path).read_text().splitlines()
-        if line.strip() and not line.startswith("#")
-    ]
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Diff running-config vs startup-config to detect unsaved changes."
+    p = argparse.ArgumentParser(
+        description="Audit a device's running-config against a compliance policy"
     )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("-d", "--device", help="Single device IP or hostname")
-    group.add_argument("-f", "--file", help="File with device IPs, one per line")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("-o", "--output", help="Write report to this file path")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    return parser.parse_args()
+    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", default=None, help="SSH password")
+    p.add_argument("--key", metavar="FILE", help="SSH private key file")
+    p.add_argument("-c", "--policy", required=True, help="YAML compliance policy")
+    p.add_argument("--port", type=int, default=22, help="SSH port (default 22)")
+    p.add_argument("--timeout", type=int, default=30, help="SSH timeout seconds")
+    p.add_argument("--output", metavar="FILE", help="Write report to file")
+    p.add_argument("--fail-on-findings", action="store_true",
+                   help="Exit 1 if any violations found (CI-friendly)")
+    p.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    return p.parse_args()
 
 
-if __name__ == "__main__":
+def main() -> int:
     args = parse_args()
-
-    if args.debug:
+    if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-        logging.getLogger("paramiko").setLevel(logging.DEBUG)
+    if not args.password and not args.key:
+        log.error("Provide --password or --key")
+        return 2
+    if not Path(args.policy).exists():
+        log.error("Policy file not found: %s", args.policy)
+        return 2
 
-    password = args.password or getpass(f"Password for {args.username}: ")
-    hosts = [args.device] if args.device else load_hosts(args.file)
+    try:
+        policy = load_policy(args.policy)
+    except (yaml.YAMLError, KeyError) as exc:
+        log.error("Policy parse error: %s", exc)
+        return 2
 
-    if not hosts:
-        log.error("No hosts to check")
-        sys.exit(1)
+    log.info("Policy: %d required, %d prohibited rules",
+             len(policy.required), len(policy.prohibited))
 
-    results = [check_device(h, args.username, password, args.port) for h in hosts]
-    report = format_report(results)
-    print(report)
+    try:
+        config = fetch_running_config(
+            host=args.device, port=args.port, username=args.username,
+            password=args.password, key_path=args.key, timeout=args.timeout,
+        )
+    except paramiko.AuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.device)
+        return 1
+    except (paramiko.SSHException, OSError) as exc:
+        log.error("Connection error: %s", exc)
+        return 1
+
+    findings = audit(config, policy)
+    report = build_report(args.device, findings)
 
     if args.output:
         Path(args.output).write_text(report)
-        log.info("Report written to %s", args.output)
+        log.info("Report saved to %s", args.output)
+    else:
+        print(report)
 
-    dirty_count = sum(1 for r in results if r["status"] == "ok" and r["diff"])
-    sys.exit(1 if dirty_count else 0)
+    return 1 if (args.fail_on_findings and findings) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 ```
