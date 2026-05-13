@@ -1,213 +1,201 @@
 ```python
 """
-bgp_session_monitor.py - BGP Neighbor Session Monitor
+route_change_monitor.py - Detect routing table changes against a saved baseline.
 
 Purpose:
-    Connects to a Cisco IOS/IOS-XE device via SSH and reports BGP neighbor
-    state, remote AS number, received prefix count, and session uptime.
-    Supports per-VRF queries, single-neighbor filtering, JSON output, and
-    an alerting exit code for use in monitoring pipelines.
+    Connects to a network device via SSH, captures the current routing table,
+    and compares it against a previously saved baseline snapshot. Useful for
+    post-change validation, detecting unexpected route withdrawals or additions,
+    and confirming convergence after maintenance windows.
 
 Usage:
-    python bgp_session_monitor.py -d 192.168.1.1 -u admin -p secret
-    python bgp_session_monitor.py -d 192.168.1.1 -u admin --key ~/.ssh/id_rsa
-    python bgp_session_monitor.py -d 192.168.1.1 -u admin -p secret --vrf MGMT
-    python bgp_session_monitor.py -d 192.168.1.1 -u admin -p secret --json
-    python bgp_session_monitor.py -d 192.168.1.1 -u admin -p secret --alert-on-down
+    # Save a baseline:
+    python route_change_monitor.py -H 192.168.1.1 -u admin -p secret --save-baseline
+
+    # Compare against saved baseline:
+    python route_change_monitor.py -H 192.168.1.1 -u admin -p secret
+
+    # Use a custom baseline file:
+    python route_change_monitor.py -H 192.168.1.1 -u admin -p secret --baseline routes_before.json
 
 Prerequisites:
     pip install paramiko
-    SSH must be enabled on the device. User requires privilege level 1 or above.
-    Tested against Cisco IOS 15.x and IOS-XE 16.x/17.x.
 """
 
 import argparse
-import getpass
 import json
 import logging
 import re
 import sys
 import time
+from pathlib import Path
 
 import paramiko
 
-logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger(__name__)
 
 
-def ssh_connect(host, port, username, password=None, key_file=None, timeout=10):
+def ssh_run(host, port, username, password, command, timeout=30):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = {
-        "hostname": host,
-        "port": port,
-        "username": username,
-        "timeout": timeout,
-        "look_for_keys": bool(key_file),
-        "allow_agent": False,
-    }
-    if key_file:
-        kwargs["key_filename"] = key_file
-    elif password:
-        kwargs["password"] = password
-    else:
-        raise ValueError("Provide --password or --key")
     try:
-        client.connect(**kwargs)
-        logger.info("Connected to %s:%d", host, port)
-        return client
-    except paramiko.AuthenticationException:
-        logger.error("Authentication failed for %s@%s", username, host)
-        raise
-    except paramiko.SSHException as exc:
-        logger.error("SSH negotiation failed for %s: %s", host, exc)
-        raise
+        client.connect(
+            host,
+            port=port,
+            username=username,
+            password=password,
+            timeout=timeout,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+        _, stdout, stderr = client.exec_command(command, timeout=timeout)
+        output = stdout.read().decode(errors="replace")
+        err = stderr.read().decode(errors="replace").strip()
+        if err:
+            log.warning("stderr: %s", err)
+        return output
+    finally:
+        client.close()
 
 
-def run_command(client, command, timeout=30):
-    channel = client.get_transport().open_session()
-    channel.settimeout(timeout)
-    channel.exec_command(command)
-    output = b""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if channel.recv_ready():
-            output += channel.recv(65535)
-        if channel.exit_status_ready():
-            while channel.recv_ready():
-                output += channel.recv(65535)
-            break
-        time.sleep(0.1)
-    channel.close()
-    return output.decode("utf-8", errors="replace")
-
-
-def parse_bgp_summary(raw):
-    router_id, local_as = None, None
-    header_match = re.search(
-        r"BGP router identifier (\d+\.\d+\.\d+\.\d+), local AS number (\d+)", raw
-    )
-    if header_match:
-        router_id = header_match.group(1)
-        local_as = int(header_match.group(2))
-
-    # Cisco IOS BGP summary neighbor line:
-    # Neighbor  V  AS  MsgRcvd  MsgSent  TblVer  InQ  OutQ  Up/Down  State/PfxRcd
-    pattern = re.compile(
-        r"^(\d+\.\d+\.\d+\.\d+)\s+\d+\s+(\d+)\s+\d+\s+\d+\s+\S+\s+\d+\s+\d+\s+(\S+)\s+(\S+)",
+def parse_routes(raw_output):
+    """Extract prefix/next-hop pairs from Cisco IOS 'show ip route' output."""
+    routes = {}
+    # Matches lines like: C 10.0.0.0/8 is directly connected, GigabitEthernet0/0
+    # or: S    192.168.1.0/24 [1/0] via 10.0.0.1
+    prefix_re = re.compile(
+        r"^\s*[A-Z*>i]\S*\s+"
+        r"((?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?)"
+        r"(?:\s+\[[\d/]+\])?"
+        r"(?:\s+via\s+(\S+))?",
         re.MULTILINE,
     )
-    neighbors = []
-    for m in pattern.finditer(raw):
-        neighbor, remote_as, uptime, state_or_pfx = m.groups()
-        try:
-            prefix_count = int(state_or_pfx)
-            state = "Established"
-        except ValueError:
-            prefix_count = 0
-            state = state_or_pfx  # Idle, Active, Connect, OpenSent, etc.
-        neighbors.append({
-            "neighbor": neighbor,
-            "remote_as": int(remote_as),
-            "uptime": uptime,
-            "state": state,
-            "prefixes_received": prefix_count,
-        })
-    return {"router_id": router_id, "local_as": local_as, "neighbors": neighbors}
+    for match in prefix_re.finditer(raw_output):
+        prefix = match.group(1)
+        nexthop = match.group(2) or "directly-connected"
+        routes[prefix] = nexthop
+    return routes
 
 
-def display_results(data, host):
-    print(f"\nBGP Summary — {host}")
-    print(f"  Router-ID : {data['router_id'] or 'unknown'}")
-    print(f"  Local AS  : {data['local_as'] or 'unknown'}")
-    neighbors = data["neighbors"]
-    if not neighbors:
-        print("  No BGP neighbors found or BGP not configured.")
-        return
-    print()
-    print(f"  {'Neighbor':<18}{'Remote-AS':<12}{'State':<16}{'Pfx-Rcvd':<10}{'Uptime'}")
-    print("  " + "-" * 68)
-    down = 0
-    for n in neighbors:
-        flag = " *" if n["state"] != "Established" else ""
-        print(
-            f"  {n['neighbor']:<18}{n['remote_as']:<12}{n['state']:<16}"
-            f"{n['prefixes_received']:<10}{n['uptime']}{flag}"
-        )
-        if n["state"] != "Established":
-            down += 1
-    print(f"\n  Total: {len(neighbors)} neighbor(s), {down} not established")
-    if down:
-        print("  (* = session not established)")
+def diff_routes(baseline, current):
+    added = {p: current[p] for p in current if p not in baseline}
+    removed = {p: baseline[p] for p in baseline if p not in current}
+    changed = {
+        p: {"before": baseline[p], "after": current[p]}
+        for p in current
+        if p in baseline and current[p] != baseline[p]
+    }
+    return added, removed, changed
 
 
-def build_args():
-    p = argparse.ArgumentParser(
-        description="BGP neighbor session monitor via SSH (Cisco IOS/IOS-XE)"
+def main():
+    parser = argparse.ArgumentParser(
+        description="Monitor routing table changes against a saved baseline."
     )
-    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
-    p.add_argument("--key", dest="key_file", help="Path to SSH private key")
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("--vrf", help="VRF name to query BGP summary within")
-    p.add_argument("--neighbor", help="Filter output to a specific neighbor IP")
-    p.add_argument("--json", dest="as_json", action="store_true", help="Output as JSON")
-    p.add_argument(
-        "--alert-on-down",
+    parser.add_argument("-H", "--host", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument(
+        "--command",
+        default="show ip route",
+        help="Routing table command (default: 'show ip route')",
+    )
+    parser.add_argument(
+        "--baseline",
+        default=None,
+        help="Baseline JSON file path (default: <host>_routes_baseline.json)",
+    )
+    parser.add_argument(
+        "--save-baseline",
         action="store_true",
-        help="Exit with code 1 if any BGP session is not Established",
+        help="Capture current routes as the new baseline and exit",
     )
-    p.add_argument("--timeout", type=int, default=10, help="SSH connect timeout in seconds")
-    return p.parse_args()
+    parser.add_argument(
+        "--timeout", type=int, default=30, help="SSH timeout in seconds (default: 30)"
+    )
+    parser.add_argument(
+        "--exit-code",
+        action="store_true",
+        help="Exit with code 1 if any changes are detected",
+    )
+    args = parser.parse_args()
+
+    baseline_path = Path(args.baseline or f"{args.host}_routes_baseline.json")
+
+    log.info("Connecting to %s:%d", args.host, args.port)
+    try:
+        raw = ssh_run(
+            args.host,
+            args.port,
+            args.username,
+            args.password,
+            args.command,
+            args.timeout,
+        )
+    except paramiko.AuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.host)
+        sys.exit(2)
+    except (paramiko.SSHException, OSError) as exc:
+        log.error("Connection error: %s", exc)
+        sys.exit(2)
+
+    current_routes = parse_routes(raw)
+    log.info("Parsed %d routes from device", len(current_routes))
+
+    if args.save_baseline:
+        payload = {
+            "host": args.host,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "routes": current_routes,
+        }
+        baseline_path.write_text(json.dumps(payload, indent=2))
+        log.info("Baseline saved to %s (%d routes)", baseline_path, len(current_routes))
+        sys.exit(0)
+
+    if not baseline_path.exists():
+        log.error(
+            "No baseline found at %s. Run with --save-baseline first.", baseline_path
+        )
+        sys.exit(2)
+
+    baseline_data = json.loads(baseline_path.read_text())
+    baseline_routes = baseline_data.get("routes", {})
+    baseline_ts = baseline_data.get("timestamp", "unknown")
+    log.info("Loaded baseline from %s (captured %s)", baseline_path, baseline_ts)
+
+    added, removed, changed = diff_routes(baseline_routes, current_routes)
+
+    if not added and not removed and not changed:
+        print("No routing table changes detected.")
+        sys.exit(0)
+
+    if added:
+        print(f"\nADDED ({len(added)}):")
+        for prefix, nexthop in sorted(added.items()):
+            print(f"  + {prefix}  via {nexthop}")
+
+    if removed:
+        print(f"\nREMOVED ({len(removed)}):")
+        for prefix, nexthop in sorted(removed.items()):
+            print(f"  - {prefix}  via {nexthop}")
+
+    if changed:
+        print(f"\nNEXT-HOP CHANGED ({len(changed)}):")
+        for prefix, hops in sorted(changed.items()):
+            print(f"  ~ {prefix}  {hops['before']} -> {hops['after']}")
+
+    total = len(added) + len(removed) + len(changed)
+    print(f"\nSummary: {total} change(s) detected vs baseline from {baseline_ts}")
+
+    if args.exit_code:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    args = build_args()
-
-    if not args.password and not args.key_file:
-        args.password = getpass.getpass(f"Password for {args.username}@{args.device}: ")
-
-    try:
-        client = ssh_connect(
-            args.device, args.port, args.username, args.password, args.key_file, args.timeout
-        )
-    except Exception as exc:
-        logger.error("Connection failed: %s", exc)
-        sys.exit(1)
-
-    try:
-        vrf_clause = f"vrf {args.vrf} " if args.vrf else ""
-        command = f"show ip bgp {vrf_clause}summary"
-        logger.debug("Executing: %s", command)
-        raw = run_command(client, command)
-
-        if not raw.strip() or "% Invalid" in raw or "% BGP not active" in raw:
-            logger.error("Command returned an error or BGP is not configured:\n%s", raw[:300])
-            sys.exit(1)
-
-        data = parse_bgp_summary(raw)
-
-        if args.neighbor:
-            data["neighbors"] = [n for n in data["neighbors"] if n["neighbor"] == args.neighbor]
-            if not data["neighbors"]:
-                logger.warning("Neighbor %s not found in BGP summary", args.neighbor)
-
-        if args.as_json:
-            print(json.dumps(data, indent=2))
-        else:
-            display_results(data, args.device)
-
-        if args.alert_on_down:
-            down = [n for n in data["neighbors"] if n["state"] != "Established"]
-            if down:
-                logger.warning(
-                    "%d session(s) not established: %s",
-                    len(down),
-                    ", ".join(n["neighbor"] for n in down),
-                )
-                sys.exit(1)
-    finally:
-        client.close()
-        logger.debug("SSH connection closed")
+    main()
 ```
