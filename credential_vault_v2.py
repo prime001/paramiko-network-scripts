@@ -1,228 +1,264 @@
-SSH Key Lifecycle Manager for Network Devices
+The write was blocked — the user asked for script content output only anyway. Here's the complete script:
 
-Manages SSH public key authentication on network devices: deploy keys for
-password-less access, verify key-based login works, audit installed keys,
-and remove stale keys. Useful for transitioning device fleets from password
-auth to key-based auth, auditing key hygiene, or rotating compromised keys.
+```
+"""
+credential_vault_v3.py - Encrypted credential vault with SSH key support and live validation.
+
+Stores device credentials encrypted on disk using Fernet (AES-128-CBC). Supports both
+password and SSH private-key authentication. Validates credentials against live devices
+via Paramiko and updates stored entries after confirmed password rotations.
 
 Usage:
-    # Deploy your public key using password auth
-    python credential_vault_v3.py --host 192.168.1.1 --username admin \
-        --password secret --action deploy --pubkey ~/.ssh/id_rsa.pub
+    # Add password-based entry
+    python credential_vault_v3.py add --device 192.168.1.1 --username admin --password s3cr3t
 
-    # Verify key-based login succeeds after deployment
-    python credential_vault_v3.py --host 192.168.1.1 --username admin \
-        --key ~/.ssh/id_rsa --action verify
+    # Add SSH key entry
+    python credential_vault_v3.py add --device 192.168.1.1 --username admin --key ~/.ssh/id_rsa
 
-    # Audit which keys are installed (accepts password or key auth)
-    python credential_vault_v3.py --host 192.168.1.1 --username admin \
-        --password secret --action audit
+    # Validate credentials against all stored devices
+    python credential_vault_v3.py validate
 
-    # Remove a specific key by its public key file
-    python credential_vault_v3.py --host 192.168.1.1 --username admin \
-        --password secret --action remove --pubkey ~/.ssh/id_rsa_old.pub
+    # Validate a single device
+    python credential_vault_v3.py validate --device 192.168.1.1
+
+    # Update stored password after rotating it on the device
+    python credential_vault_v3.py rotate --device 192.168.1.1 --new-password N3wP@ss
+
+    # List stored devices (credentials masked)
+    python credential_vault_v3.py list
+
+    # Export vault manifest as JSON or CSV (passwords never included)
+    python credential_vault_v3.py export --format json
+
+    # Remove an entry
+    python credential_vault_v3.py delete --device 192.168.1.1
 
 Prerequisites:
-    pip install paramiko
-    Target must have sshd running and support authorized_keys (Linux-based
-    network devices, Cisco NX-OS with bash shell, Arista EOS, Juniper JunOS).
-    For Cisco IOS, SSH key auth requires 'ip ssh pubkey-chain' configuration.
+    pip install paramiko cryptography
 """
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
+from typing import Optional
 
 import paramiko
+from cryptography.fernet import Fernet, InvalidToken
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
-log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+DEFAULT_VAULT_PATH = Path.home() / ".ssh" / "net_vault.enc"
+DEFAULT_KEY_PATH = Path.home() / ".ssh" / "net_vault.key"
+DEFAULT_PORT = 22
+DEFAULT_TIMEOUT = 10
 
 
-def _connect(host, port, username, password=None, key_path=None, timeout=15):
+def _get_fernet(key_path: Path) -> Fernet:
+    if key_path.exists():
+        return Fernet(key_path.read_bytes())
+    key = Fernet.generate_key()
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    key_path.write_bytes(key)
+    key_path.chmod(0o600)
+    logger.info("New vault key created: %s", key_path)
+    return Fernet(key)
+
+
+def _load_vault(vault_path: Path, fernet: Fernet) -> dict:
+    if not vault_path.exists():
+        return {}
+    try:
+        return json.loads(fernet.decrypt(vault_path.read_bytes()))
+    except InvalidToken:
+        logger.error("Vault decryption failed — wrong key or corrupted file")
+        sys.exit(1)
+
+
+def _save_vault(vault_path: Path, fernet: Fernet, data: dict) -> None:
+    vault_path.parent.mkdir(parents=True, exist_ok=True)
+    vault_path.write_bytes(fernet.encrypt(json.dumps(data).encode()))
+    vault_path.chmod(0o600)
+
+
+def _connect(host: str, port: int, username: str,
+             password: Optional[str], key_path: Optional[str],
+             timeout: int) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = {
-        "hostname": host,
-        "port": port,
-        "username": username,
-        "timeout": timeout,
-        "look_for_keys": False,
-        "allow_agent": False,
-    }
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # acceptable in closed lab nets
+    kwargs = dict(hostname=host, port=port, username=username,
+                  timeout=timeout, allow_agent=False, look_for_keys=False)
     if key_path:
-        kwargs["key_filename"] = str(key_path)
-    if password:
+        kwargs["key_filename"] = key_path
+    else:
         kwargs["password"] = password
     client.connect(**kwargs)
     return client
 
 
-def _run(client, command, timeout=10):
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    return (
-        stdout.read().decode(errors="replace").strip(),
-        stderr.read().decode(errors="replace").strip(),
+def _entry_connect(host: str, entry: dict, timeout: int) -> paramiko.SSHClient:
+    return _connect(
+        host=host,
+        port=entry.get("port", DEFAULT_PORT),
+        username=entry["username"],
+        password=entry.get("password"),
+        key_path=entry.get("key_path"),
+        timeout=timeout,
     )
 
 
-def deploy_key(host, port, username, password, pubkey_path, timeout):
-    pubkey_text = Path(pubkey_path).read_text().strip()
-    client = _connect(host, port, username, password=password, timeout=timeout)
-    try:
-        _run(client, "mkdir -p ~/.ssh && chmod 700 ~/.ssh")
-        out, err = _run(
-            client,
-            "cat ~/.ssh/authorized_keys 2>/dev/null || true",
-        )
-        if pubkey_text in out:
-            log.info("Key already present on %s — no change needed", host)
-            return True
-        sftp = client.open_sftp()
-        existing = out + "\n" if out else ""
-        with sftp.open(".ssh/authorized_keys", "w") as f:
-            f.write(existing + pubkey_text + "\n")
-        sftp.close()
-        _run(client, "chmod 600 ~/.ssh/authorized_keys")
-        log.info("Key deployed to %s@%s", username, host)
+# ---------- subcommand handlers ----------
+
+def cmd_add(args, vault: dict) -> bool:
+    if not args.password and not args.key:
+        logger.error("Provide --password or --key")
+        sys.exit(1)
+    entry = {"username": args.username, "port": args.port,
+             "auth_type": "key" if args.key else "password"}
+    if args.password:
+        entry["password"] = args.password
+    if args.key:
+        entry["key_path"] = str(Path(args.key).expanduser())
+    vault[args.device] = entry
+    logger.info("Stored credentials for %s (%s)", args.device, entry["auth_type"])
+    return True
+
+
+def cmd_validate(args, vault: dict) -> bool:
+    devices = [args.device] if args.device else list(vault.keys())
+    if not devices:
+        logger.info("Vault is empty — nothing to validate")
         return True
-    except Exception as exc:
-        log.error("Deploy failed on %s: %s", host, exc)
-        return False
-    finally:
-        client.close()
+    ok = failed = 0
+    for host in devices:
+        if host not in vault:
+            logger.warning("No entry for %s", host)
+            continue
+        try:
+            _entry_connect(host, vault[host], args.timeout).close()
+            logger.info("%-22s OK", host)
+            ok += 1
+        except paramiko.AuthenticationException:
+            logger.warning("%-22s AUTH FAILED", host)
+            failed += 1
+        except Exception as exc:
+            logger.error("%-22s ERROR: %s", host, exc)
+            failed += 1
+    logger.info("Result: %d ok, %d failed out of %d", ok, failed, len(devices))
+    return failed == 0
 
 
-def verify_key_auth(host, port, username, key_path, timeout):
+def cmd_rotate(args, vault: dict) -> bool:
+    """Verify the new password works against the device, then update the vault."""
+    if args.device not in vault:
+        logger.error("No entry for %s", args.device)
+        sys.exit(1)
+    entry = vault[args.device]
+    if entry.get("auth_type") == "key":
+        logger.error("Password rotation is not applicable to key-based entries")
+        sys.exit(1)
     try:
-        client = _connect(host, port, username, key_path=key_path, timeout=timeout)
-        out, _ = _run(client, "echo KEY_AUTH_OK")
-        client.close()
-        if "KEY_AUTH_OK" in out:
-            log.info("Key auth verified for %s@%s", username, host)
-            return True
-        log.warning("Unexpected response from %s during verify: %s", host, out)
-        return False
+        _connect(args.device, entry.get("port", DEFAULT_PORT),
+                 entry["username"], args.new_password, None, args.timeout).close()
+        vault[args.device]["password"] = args.new_password
+        logger.info("New password verified and stored for %s@%s",
+                    entry["username"], args.device)
+        return True
     except paramiko.AuthenticationException:
-        log.error("Key auth FAILED for %s@%s — key not accepted by device", username, host)
-        return False
+        logger.error("New password rejected by %s — vault NOT updated", args.device)
+        sys.exit(1)
     except Exception as exc:
-        log.error("Verify error on %s: %s", host, exc)
-        return False
+        logger.error("Could not reach %s: %s", args.device, exc)
+        sys.exit(1)
 
 
-def audit_keys(host, port, username, password=None, key_path=None, timeout=15):
-    client = _connect(
-        host, port, username, password=password, key_path=key_path, timeout=timeout
-    )
-    try:
-        out, _ = _run(client, "cat ~/.ssh/authorized_keys 2>/dev/null || true")
-        keys = [
-            line for line in out.splitlines()
-            if line.strip() and not line.startswith("#")
-        ]
-        if not keys:
-            log.info("No authorized keys found for %s@%s", username, host)
-            return []
-        log.info("%d key(s) installed for %s@%s:", len(keys), username, host)
-        for i, k in enumerate(keys, 1):
-            parts = k.split()
-            if len(parts) >= 2:
-                summary = f"{parts[0]} ...{parts[1][-20:]} {' '.join(parts[2:])}"
-            else:
-                summary = k[:80]
-            print(f"  [{i}] {summary.strip()}")
-        return keys
-    except Exception as exc:
-        log.error("Audit failed on %s: %s", host, exc)
-        return []
-    finally:
-        client.close()
-
-
-def remove_key(host, port, username, password, pubkey_path, timeout):
-    pubkey_text = Path(pubkey_path).read_text().strip()
-    client = _connect(host, port, username, password=password, timeout=timeout)
-    try:
-        out, _ = _run(client, "cat ~/.ssh/authorized_keys 2>/dev/null || true")
-        original = [l for l in out.splitlines() if l.strip()]
-        filtered = [l for l in original if l.strip() != pubkey_text]
-        if len(filtered) == len(original):
-            log.warning("Key not found in authorized_keys on %s — nothing removed", host)
-            return True
-        sftp = client.open_sftp()
-        with sftp.open(".ssh/authorized_keys", "w") as f:
-            f.write("\n".join(filtered) + "\n" if filtered else "")
-        sftp.close()
-        log.info("Key removed from %s@%s (%d remaining)", username, host, len(filtered))
+def cmd_list(args, vault: dict) -> bool:
+    if not vault:
+        print("Vault is empty.")
         return True
-    except Exception as exc:
-        log.error("Remove failed on %s: %s", host, exc)
-        return False
-    finally:
-        client.close()
+    fmt = "{:<22} {:<16} {:<6} {}"
+    print(fmt.format("Device", "Username", "Port", "Auth"))
+    print("-" * 52)
+    for host, e in sorted(vault.items()):
+        print(fmt.format(host, e.get("username", "?"),
+                         e.get("port", DEFAULT_PORT), e.get("auth_type", "?")))
+    return True
 
 
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="SSH public key lifecycle manager for network devices"
-    )
-    p.add_argument("--host", required=True, help="Device IP or hostname")
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("--username", required=True, help="SSH username")
-    p.add_argument("--password", help="Password (required for deploy, audit, remove)")
-    p.add_argument("--key", help="Private key path (required for verify)")
-    p.add_argument("--pubkey", help="Public key file path (required for deploy, remove)")
-    p.add_argument(
-        "--action",
-        required=True,
-        choices=["deploy", "verify", "audit", "remove"],
-    )
-    p.add_argument("--timeout", type=int, default=15, help="SSH connect timeout (seconds)")
-    p.add_argument("--debug", action="store_true")
-    return p.parse_args()
+def cmd_export(args, vault: dict) -> bool:
+    safe = {h: {k: ("***" if k == "password" else v) for k, v in e.items()}
+            for h, e in vault.items()}
+    if args.format == "json":
+        print(json.dumps(safe, indent=2))
+    else:
+        print("device,username,port,auth_type")
+        for host, e in sorted(safe.items()):
+            print(f"{host},{e.get('username','')},{e.get('port', DEFAULT_PORT)},{e.get('auth_type','')}")
+    return True
 
 
-def main():
-    args = parse_args()
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-        paramiko.util.log_to_file("/dev/stderr")
+def cmd_delete(args, vault: dict) -> bool:
+    if args.device not in vault:
+        logger.warning("No entry for %s", args.device)
+        return True
+    del vault[args.device]
+    logger.info("Deleted credentials for %s", args.device)
+    return True
 
-    if args.action == "deploy":
-        if not args.password or not args.pubkey:
-            log.error("--password and --pubkey are required for deploy")
-            sys.exit(2)
-        ok = deploy_key(args.host, args.port, args.username, args.password, args.pubkey, args.timeout)
 
-    elif args.action == "verify":
-        if not args.key:
-            log.error("--key (private key path) is required for verify")
-            sys.exit(2)
-        ok = verify_key_auth(args.host, args.port, args.username, args.key, args.timeout)
+# ---------- CLI ----------
 
-    elif args.action == "audit":
-        if not args.password and not args.key:
-            log.error("--password or --key is required for audit")
-            sys.exit(2)
-        result = audit_keys(
-            args.host, args.port, args.username,
-            password=args.password, key_path=args.key, timeout=args.timeout,
-        )
-        ok = result is not None
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Encrypted network credential vault")
+    p.add_argument("--vault", default=str(DEFAULT_VAULT_PATH))
+    p.add_argument("--key-file", default=str(DEFAULT_KEY_PATH))
+    sub = p.add_subparsers(dest="command", required=True)
 
-    elif args.action == "remove":
-        if not args.password or not args.pubkey:
-            log.error("--password and --pubkey are required for remove")
-            sys.exit(2)
-        ok = remove_key(args.host, args.port, args.username, args.password, args.pubkey, args.timeout)
+    a = sub.add_parser("add", help="Add or overwrite a credential entry")
+    a.add_argument("--device", required=True)
+    a.add_argument("--username", required=True)
+    a.add_argument("--password")
+    a.add_argument("--key", metavar="PATH", help="SSH private key file")
+    a.add_argument("--port", type=int, default=DEFAULT_PORT)
 
-    sys.exit(0 if ok else 1)
+    v = sub.add_parser("validate", help="Test credentials against device(s)")
+    v.add_argument("--device", help="Single host (default: all)")
+    v.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
 
+    r = sub.add_parser("rotate", help="Verify new password then update vault")
+    r.add_argument("--device", required=True)
+    r.add_argument("--new-password", required=True)
+    r.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+
+    sub.add_parser("list", help="List stored devices (no secrets shown)")
+
+    e = sub.add_parser("export", help="Export manifest with passwords masked")
+    e.add_argument("--format", choices=["json", "csv"], default="json")
+
+    d = sub.add_parser("delete", help="Remove a credential entry")
+    d.add_argument("--device", required=True)
+
+    return p
+
+
+MUTATING = {"add", "rotate", "delete"}
+HANDLERS = {
+    "add": cmd_add, "validate": cmd_validate, "rotate": cmd_rotate,
+    "list": cmd_list, "export": cmd_export, "delete": cmd_delete,
+}
 
 if __name__ == "__main__":
-    main()
+    args = build_parser().parse_args()
+    fernet = _get_fernet(Path(args.key_file).expanduser())
+    vault_path = Path(args.vault).expanduser()
+    vault = _load_vault(vault_path, fernet)
+
+    HANDLERS[args.command](args, vault)
+
+    if args.command in MUTATING:
+        _save_vault(vault_path, fernet, vault)
+```
+
+Key differentiators from v1/v2: Fernet encryption at rest, SSH private key auth support alongside passwords, and the `rotate` subcommand validates the new credential against the live device before updating the vault (so you never store a wrong password after a failed rotation).
