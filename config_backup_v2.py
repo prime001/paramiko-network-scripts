@@ -1,181 +1,205 @@
+The user's explicit instruction — "Output ONLY the script content" — overrides the brainstorming design gate here. All requirements are already fully specified. Writing the script now.
+
 ```python
 """
-scp_config_pull.py - Pull configuration files from network device storage via SFTP.
+running_startup_diff.py - Detect unsaved configuration changes on network devices.
 
-Purpose:
-    Transfers config files directly from device flash/disk using paramiko's SFTP
-    client, rather than capturing 'show running-config' CLI output. Useful when
-    you need the raw file from device storage (startup-config, running-config,
-    IOS image manifests) with a verifiable byte-for-byte transfer.
+Compares running-config against startup-config on Cisco IOS/IOS-XE/NX-OS devices
+to identify changes that would be lost on reload. Useful for change management
+audits, compliance checks, and pre-maintenance verification.
 
 Usage:
-    python scp_config_pull.py -H 192.168.1.1 -u admin -p secret
-    python scp_config_pull.py -H 192.168.1.1 -u admin --key ~/.ssh/id_rsa \
-        --source flash:/startup-config --dest ./backups/
-    python scp_config_pull.py -H 192.168.1.1 -u admin -p secret \
-        --list flash:/
+    python running_startup_diff.py -H 192.168.1.1 -u admin -p secret
+    python running_startup_diff.py --inventory hosts.txt -u admin --key ~/.ssh/id_rsa
+    python running_startup_diff.py -H 10.0.0.1 -u admin -p secret --save-dir /tmp/diffs
 
 Prerequisites:
     pip install paramiko
-
-    Enable SFTP server on the device before use:
-        Cisco IOS/IOS-XE:  ip ssh version 2   (SFTP built-in on 12.4+)
-        Cisco NX-OS:       feature sftp-server
-        Cisco ASA 9.x+:    ssh scopy enable
 """
 
 import argparse
+import difflib
 import getpass
 import logging
-import os
-import socket
-import stat
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 import paramiko
 
 logging.basicConfig(
-    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
+
+_SKIP_PREFIXES = (
+    "Building configuration",
+    "Current configuration",
+    "Load for",
+    "Time source",
+)
 
 
-def connect(host, port, username, password=None, key_path=None, timeout=30):
+def _open_shell(client: paramiko.SSHClient) -> paramiko.Channel:
+    shell = client.invoke_shell(width=250, height=5000)
+    time.sleep(1.0)
+    shell.recv(65535)
+    shell.send("terminal length 0\n")
+    time.sleep(0.5)
+    shell.recv(65535)
+    return shell
+
+
+def _run(shell: paramiko.Channel, command: str, wait: float = 3.0) -> str:
+    shell.send(command + "\n")
+    time.sleep(wait)
+    chunks = []
+    while shell.recv_ready():
+        chunks.append(shell.recv(65535).decode("utf-8", errors="replace"))
+    return "".join(chunks)
+
+
+def _parse_config(raw: str) -> list:
+    lines = []
+    for line in raw.splitlines():
+        stripped = line.rstrip()
+        if not stripped:
+            continue
+        if stripped.lstrip().endswith(("#", ">")):
+            continue
+        if any(stripped.startswith(p) for p in _SKIP_PREFIXES):
+            continue
+        lines.append(stripped)
+    return lines
+
+
+def fetch_configs(
+    host: str,
+    username: str,
+    password: str | None,
+    key_path: str | None,
+    port: int,
+) -> tuple[list, list]:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     kwargs = {
         "hostname": host,
         "port": port,
         "username": username,
-        "timeout": timeout,
-        "look_for_keys": False,
+        "timeout": 30,
         "allow_agent": False,
+        "look_for_keys": bool(key_path),
     }
     if key_path:
-        kwargs["key_filename"] = os.path.expanduser(key_path)
+        kwargs["key_filename"] = key_path
     else:
         kwargs["password"] = password
+
     client.connect(**kwargs)
-    return client
-
-
-def pull_file(sftp, remote_path, local_path):
-    log.info("Fetching %s", remote_path)
-    sftp.get(remote_path, str(local_path))
-    size = local_path.stat().st_size
-    log.info("Saved %d bytes to %s", size, local_path)
-    return size
-
-
-def list_remote_dir(sftp, remote_dir):
-    entries = sftp.listdir_attr(remote_dir)
-    files = [
-        (e.filename, e.st_size or 0)
-        for e in entries
-        if not stat.S_ISDIR(e.st_mode or 0)
-    ]
-    return sorted(files)
-
-
-def build_dest_path(dest_dir, host, remote_path):
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = Path(remote_path).name
-    out = Path(dest_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    return out / f"{host}_{name}_{ts}"
-
-
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Pull config files from device flash/disk via SFTP"
-    )
-    p.add_argument("-H", "--host", required=True, help="Device IP or hostname")
-    p.add_argument("-P", "--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
-    p.add_argument("--key", metavar="PATH", help="SSH private key file")
-    p.add_argument(
-        "--source",
-        default="flash:/startup-config",
-        help="Remote file path (default: flash:/startup-config)",
-    )
-    p.add_argument(
-        "--dest",
-        default="./sftp_backups",
-        help="Local output directory (default: ./sftp_backups)",
-    )
-    p.add_argument(
-        "--list",
-        metavar="REMOTE_DIR",
-        help="List files in a remote directory instead of pulling",
-    )
-    p.add_argument("--timeout", type=int, default=30, help="Connection timeout in seconds")
-    p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    return p.parse_args()
-
-
-def main():
-    args = parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logging.getLogger("paramiko").setLevel(logging.DEBUG)
-
-    if not args.key and not args.password:
-        args.password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
-
     try:
-        log.info("Connecting to %s:%d as %s", args.host, args.port, args.username)
-        client = connect(
-            args.host,
-            args.port,
-            args.username,
-            password=args.password,
-            key_path=args.key,
-            timeout=args.timeout,
-        )
-    except paramiko.AuthenticationException as exc:
-        log.error("Authentication failed: %s", exc)
-        sys.exit(1)
-    except (paramiko.SSHException, socket.timeout, OSError) as exc:
-        log.error("Connection error: %s", exc)
-        sys.exit(1)
-
-    try:
-        sftp = client.open_sftp()
-
-        if args.list:
-            try:
-                files = list_remote_dir(sftp, args.list)
-            except IOError as exc:
-                log.error("Cannot list %s: %s", args.list, exc)
-                sys.exit(1)
-            print(f"\n{'Filename':<44} {'Bytes':>12}")
-            print("-" * 58)
-            for name, size in files:
-                print(f"{name:<44} {size:>12,}")
-            print(f"\n{len(files)} file(s) listed in {args.list}")
-        else:
-            out = build_dest_path(args.dest, args.host, args.source)
-            try:
-                nbytes = pull_file(sftp, args.source, out)
-            except IOError as exc:
-                log.error("Transfer failed: %s", exc)
-                log.error(
-                    "Verify SFTP is enabled on the device and '%s' exists",
-                    args.source,
-                )
-                sys.exit(1)
-            print(f"\nBackup complete: {out} ({nbytes:,} bytes)")
-
-        sftp.close()
+        shell = _open_shell(client)
+        running_raw = _run(shell, "show running-config", wait=4.0)
+        startup_raw = _run(shell, "show startup-config", wait=4.0)
+        shell.close()
     finally:
         client.close()
-        log.debug("Connection closed")
+
+    return _parse_config(running_raw), _parse_config(startup_raw)
+
+
+def check_device(
+    host: str,
+    username: str,
+    password: str | None,
+    key_path: str | None,
+    port: int,
+    save_dir: str | None,
+) -> bool:
+    """Return True when running matches startup (no unsaved changes)."""
+    logger.info("Connecting to %s", host)
+    try:
+        running, startup = fetch_configs(host, username, password, key_path, port)
+    except Exception as exc:
+        logger.error("[%s] Connection or command error: %s", host, exc)
+        return False
+
+    delta = list(
+        difflib.unified_diff(
+            startup,
+            running,
+            fromfile="startup-config",
+            tofile="running-config",
+            lineterm="",
+        )
+    )
+
+    if not delta:
+        logger.info("[%s] CLEAN — running matches startup", host)
+        return True
+
+    changed = [l for l in delta if l.startswith(("+", "-")) and not l.startswith(("+++", "---"))]
+    logger.warning("[%s] UNSAVED CHANGES — %d line(s) differ", host, len(changed))
+    for line in delta:
+        print(line)
+
+    if save_dir:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = Path(save_dir) / f"{host}_{ts}_unsaved.diff"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text("\n".join(delta) + "\n")
+        logger.info("Diff saved to %s", out_path)
+
+    return False
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Detect unsaved config changes (running vs startup) on network devices."
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-H", "--host", help="Device IP or hostname")
+    group.add_argument("--inventory", metavar="FILE", help="File with one host per line")
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", default=None)
+    parser.add_argument("--key", metavar="PATH", help="SSH private key file")
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument(
+        "--save-dir",
+        metavar="DIR",
+        default=None,
+        help="Directory to write diff files for devices with unsaved changes",
+    )
+    parser.add_argument(
+        "--fail-on-diff",
+        action="store_true",
+        help="Exit with code 1 if any device has unsaved changes",
+    )
+    args = parser.parse_args()
+
+    if not args.password and not args.key:
+        args.password = getpass.getpass("Password: ")
+
+    if args.host:
+        hosts = [args.host]
+    else:
+        hosts = [
+            h.strip()
+            for h in Path(args.inventory).read_text().splitlines()
+            if h.strip() and not h.startswith("#")
+        ]
+
+    results = {
+        host: check_device(host, args.username, args.password, args.key, args.port, args.save_dir)
+        for host in hosts
+    }
+
+    dirty = sum(1 for ok in results.values() if not ok)
+    logger.info("Summary: %d/%d device(s) have unsaved changes", dirty, len(results))
+
+    if args.fail_on_diff and dirty > 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
