@@ -1,205 +1,214 @@
-The user explicitly instructed "Output ONLY the script content, no markdown fences, no explanation" — that's a direct user instruction that overrides the brainstorming skill's design-first gate. Writing the script now.
-
 ```python
 """
-ssh_key_manager.py - SSH Public Key Deployment and Audit for Network Devices
+credential_rotator.py - Rotate passwords on network devices via SSH
 
-Purpose:
-    Deploy, audit, and revoke SSH public keys on Cisco IOS/IOS-XE devices
-    via paramiko. Enables key-based authentication management without storing
-    passwords long-term; complements credential vaults by reducing reliance
-    on password auth for routine access.
+Connects to one or more network devices using current credentials,
+issues vendor-appropriate password-change commands, then verifies
+the new credentials work before reporting success.
 
 Usage:
-    python ssh_key_manager.py --host 192.168.1.1 --user admin --action audit
-    python ssh_key_manager.py --host 192.168.1.1 --user admin \\
-        --action deploy --key-file ~/.ssh/id_rsa.pub --target-user netops
-    python ssh_key_manager.py --host 192.168.1.1 --user admin \\
-        --action revoke --target-user netops
+    python credential_rotator.py --host 192.168.1.1 --username admin \
+        --current-password OldPass1 --new-password NewPass2
+
+    python credential_rotator.py --inventory hosts.txt --username admin \
+        --current-password OldPass1 --new-password NewPass2 \
+        --vendor cisco-ios
 
 Prerequisites:
     pip install paramiko
-    Device must have SSH v2 enabled: ip ssh version 2
-    Admin account with privilege 15
+    SSH must be enabled on all target devices (port 22 by default).
+    Account must have privilege to change its own password.
 """
 
 import argparse
-import getpass
 import logging
-import re
 import sys
 import time
+from typing import Optional
 
 import paramiko
 
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
     level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
+
+VENDOR_PROFILES = {
+    "cisco-ios": {
+        "config_enter": ["configure terminal"],
+        "change_user": "username {username} privilege 15 secret {new_password}",
+        "change_enable": "enable secret {new_password}",
+        "config_exit": ["end", "write memory"],
+    },
+    "cisco-nxos": {
+        "config_enter": ["configure terminal"],
+        "change_user": "username {username} password {new_password} role network-admin",
+        "config_exit": ["end", "copy running-config startup-config"],
+    },
+    "juniper": {
+        "config_enter": ["configure"],
+        "change_user": (
+            "set system login user {username} "
+            "authentication plain-text-password-value {new_password}"
+        ),
+        "config_exit": ["commit", "exit"],
+    },
+}
 
 
-def connect(host: str, port: int, username: str, password: str) -> paramiko.SSHClient:
+def _open_ssh(
+    host: str, username: str, password: str, port: int, timeout: int
+) -> Optional[paramiko.SSHClient]:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=host,
-        port=port,
-        username=username,
-        password=password,
-        look_for_keys=False,
-        allow_agent=False,
-        timeout=15,
-    )
-    log.info("Connected to %s:%d as %s", host, port, username)
-    return client
-
-
-def send_command(shell: paramiko.Channel, command: str, wait: float = 1.5) -> str:
-    shell.send(command + "\n")
-    time.sleep(wait)
-    chunks = []
-    while shell.recv_ready():
-        chunks.append(shell.recv(4096).decode("utf-8", errors="replace"))
-    return "".join(chunks)
-
-
-def audit_keys(shell: paramiko.Channel, target_user: str) -> list[str]:
-    output = send_command(shell, f"show run | section username {target_user}")
-    keys = []
-    # Cisco IOS stores RSA keys inline: username <u> sshkey <base64-blob>
-    for line in output.splitlines():
-        m = re.match(r"\s*username\s+\S+\s+sshkey\s+(\S+)", line)
-        if m:
-            keys.append(m.group(1))
-    return keys
-
-
-def deploy_key(shell: paramiko.Channel, target_user: str, pubkey_path: str) -> bool:
     try:
-        raw = open(pubkey_path).read().strip()
-    except OSError as exc:
-        log.error("Cannot read key file: %s", exc)
-        return False
-
-    # Extract base64 blob; Cisco key-string takes the raw base64 only
-    parts = raw.split()
-    if len(parts) < 2 or parts[0] not in ("ssh-rsa", "ssh-ed25519", "ecdsa-sha2-nistp256"):
-        log.error("Unrecognized public key format in %s", pubkey_path)
-        return False
-    key_blob = parts[1]
-
-    commands = [
-        "ip ssh pubkey-chain",
-        f" username {target_user}",
-        " key-string",
-        key_blob,
-        " exit",
-        "exit",
-    ]
-    for cmd in commands:
-        output = send_command(shell, cmd, wait=0.5)
-        if "%" in output or "Invalid input" in output:
-            log.error("Device rejected command '%s': %s", cmd.strip(), output.strip())
-            return False
-
-    log.info("Public key deployed for device user '%s'", target_user)
-    return True
-
-
-def revoke_keys(shell: paramiko.Channel, target_user: str) -> bool:
-    commands = [
-        "ip ssh pubkey-chain",
-        f" username {target_user}",
-        " no key-string",
-        " exit",
-        "exit",
-    ]
-    for cmd in commands:
-        output = send_command(shell, cmd, wait=0.5)
-        if "%" in output:
-            log.error("Device rejected command '%s': %s", cmd.strip(), output.strip())
-            return False
-
-    log.info("All SSH keys revoked for device user '%s'", target_user)
-    return True
-
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Manage SSH public keys on Cisco network devices"
-    )
-    p.add_argument("--host", required=True, help="Device hostname or IP")
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("--user", required=True, help="Admin login username")
-    p.add_argument("--password", help="Admin password (prompted if omitted)")
-    p.add_argument(
-        "--action",
-        required=True,
-        choices=["audit", "deploy", "revoke"],
-        help="audit: list keys | deploy: push key | revoke: remove all keys",
-    )
-    p.add_argument(
-        "--target-user",
-        help="Device username whose keys to manage (defaults to --user)",
-    )
-    p.add_argument("--key-file", help="SSH public key file path (required for deploy)")
-    return p
-
-
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
-
-    password = args.password or getpass.getpass(f"Password for {args.user}@{args.host}: ")
-    target_user = args.target_user or args.user
-
-    try:
-        client = connect(args.host, args.port, args.user, password)
+        client.connect(
+            host,
+            port=port,
+            username=username,
+            password=password,
+            timeout=timeout,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+        return client
     except paramiko.AuthenticationException:
-        log.error("Authentication failed for %s@%s", args.user, args.host)
-        return 1
-    except (paramiko.SSHException, OSError) as exc:
-        log.error("Connection failed: %s", exc)
-        return 1
-
-    rc = 0
-    try:
-        shell = client.invoke_shell(width=200, height=50)
-        time.sleep(1.0)
-        shell.recv(4096)  # discard banner
-        send_command(shell, "terminal length 0", wait=0.5)
-
-        if args.action == "audit":
-            keys = audit_keys(shell, target_user)
-            if not keys:
-                print(f"No SSH public keys configured for user '{target_user}'")
-            else:
-                print(f"SSH public keys for '{target_user}' ({len(keys)} found):")
-                for i, blob in enumerate(keys, 1):
-                    print(f"  [{i}] {blob[:48]}...")
-
-        elif args.action == "deploy":
-            if not args.key_file:
-                log.error("--key-file is required for the deploy action")
-                rc = 1
-            elif not deploy_key(shell, target_user, args.key_file):
-                rc = 1
-
-        elif args.action == "revoke":
-            if not revoke_keys(shell, target_user):
-                rc = 1
-
+        logger.error("[%s] Authentication failed", host)
     except paramiko.SSHException as exc:
-        log.error("SSH error during %s: %s", args.action, exc)
-        rc = 1
+        logger.error("[%s] SSH error: %s", host, exc)
+    except OSError as exc:
+        logger.error("[%s] Network error: %s", host, exc)
+    return None
+
+
+def _send_commands(channel: paramiko.Channel, commands: list, delay: float = 0.6) -> str:
+    output = ""
+    for cmd in commands:
+        channel.send(cmd + "\n")
+        time.sleep(delay)
+        while channel.recv_ready():
+            output += channel.recv(4096).decode("utf-8", errors="replace")
+    return output
+
+
+def rotate_password(
+    host: str,
+    username: str,
+    current_password: str,
+    new_password: str,
+    vendor: str = "cisco-ios",
+    port: int = 22,
+    timeout: int = 10,
+) -> bool:
+    """Rotate the login password on one device. Returns True on success."""
+    profile = VENDOR_PROFILES.get(vendor)
+    if not profile:
+        logger.error("Unknown vendor '%s'. Choices: %s", vendor, list(VENDOR_PROFILES))
+        return False
+
+    logger.info("[%s] Connecting with current credentials", host)
+    client = _open_ssh(host, username, current_password, port, timeout)
+    if client is None:
+        return False
+
+    try:
+        shell = client.invoke_shell()
+        time.sleep(1)
+        shell.recv(4096)  # drain login banner
+
+        cmds = list(profile["config_enter"])
+        if "change_user" in profile:
+            cmds.append(
+                profile["change_user"].format(
+                    username=username, new_password=new_password
+                )
+            )
+        if "change_enable" in profile:
+            cmds.append(profile["change_enable"].format(new_password=new_password))
+        cmds += profile["config_exit"]
+
+        output = _send_commands(shell, cmds)
+        logger.debug("[%s] Rotation output:\n%s", host, output)
+
+        for indicator in ("% Error", "Invalid input", "% Bad"):
+            if indicator.lower() in output.lower():
+                logger.error("[%s] Device reported an error during rotation", host)
+                return False
     finally:
         client.close()
-        log.info("Connection closed")
 
-    return rc
+    logger.info("[%s] Verifying new credentials", host)
+    verify = _open_ssh(host, username, new_password, port, timeout)
+    if verify is None:
+        logger.error("[%s] Verification failed — new credentials rejected", host)
+        return False
+    verify.close()
+    logger.info("[%s] Rotation verified successfully", host)
+    return True
+
+
+def _load_inventory(path: str) -> list:
+    hosts = []
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    hosts.append(line)
+    except OSError as exc:
+        logger.error("Cannot read inventory file: %s", exc)
+        sys.exit(1)
+    return hosts
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Rotate SSH/login passwords on network devices"
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--host", help="Single device IP or hostname")
+    group.add_argument("--inventory", metavar="FILE", help="File with one host per line")
+    parser.add_argument("--username", required=True)
+    parser.add_argument("--current-password", required=True)
+    parser.add_argument("--new-password", required=True)
+    parser.add_argument(
+        "--vendor",
+        default="cisco-ios",
+        choices=list(VENDOR_PROFILES),
+        help="Device OS (default: cisco-ios)",
+    )
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument("--timeout", type=int, default=10, help="SSH timeout in seconds")
+    parser.add_argument("--debug", action="store_true")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    args = _parse_args()
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    hosts = [args.host] if args.host else _load_inventory(args.inventory)
+    if not hosts:
+        logger.error("No hosts to process")
+        sys.exit(1)
+
+    succeeded, failed = [], []
+    for host in hosts:
+        ok = rotate_password(
+            host=host,
+            username=args.username,
+            current_password=args.current_password,
+            new_password=args.new_password,
+            vendor=args.vendor,
+            port=args.port,
+            timeout=args.timeout,
+        )
+        (succeeded if ok else failed).append(host)
+
+    print(f"\nDone: {len(succeeded)} rotated, {len(failed)} failed")
+    if failed:
+        print("Failed:", ", ".join(failed))
+        sys.exit(1)
 ```
