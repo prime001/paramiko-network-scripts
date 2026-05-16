@@ -1,226 +1,178 @@
-The brainstorming skill applies to feature design work with the user, but here the spec is fully defined — the user wants script output only, no dialogue. Writing directly.
-
 ```python
 """
-interface_error_monitor.py - Monitor interface error counters on network devices.
+Interface Error Rate Monitor - Sample and analyze interface error counters over time.
 
 Purpose:
-    Connects to a Cisco IOS/IOS-XE device via SSH and collects per-interface
-    error counters (input errors, CRC, output drops, interface resets). Flags
-    any interface where a counter meets or exceeds a configurable threshold and
-    prints a formatted summary. Useful for proactive fault detection before
-    errors cause service impact.
+    Connect to a Cisco IOS/IOS-XE device via SSH, collect interface error counters
+    at two points in time separated by a configurable interval, and report per-second
+    error rates. Flags interfaces exceeding a configurable threshold for input errors,
+    CRC errors, output drops, runts, and giants.
 
 Usage:
     python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret
-    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret \\
-        --threshold 50 --output errors.json
+    python interface_error_monitor.py -d 192.168.1.1 -u admin --key ~/.ssh/id_rsa
+    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret \
+        --interval 30 --threshold 0.5 --interface GigabitEthernet
 
 Prerequisites:
     pip install paramiko
-    SSH must be enabled on the target device. The account needs privilege
-    sufficient to run 'show interfaces'.
+    SSH access to a Cisco IOS/IOS-XE device with 'show interfaces' privilege
 """
 
 import argparse
-import json
+import getpass
 import logging
 import re
-import sys
 import time
 
 import paramiko
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
-COMMAND = "show interfaces"
-RECV_TIMEOUT = 15
-BUFFER_SIZE = 65535
+COUNTER_PATTERNS = {
+    "input_errors": re.compile(r"(\d+) input errors"),
+    "crc": re.compile(r"(\d+) CRC"),
+    "output_drops": re.compile(r"(\d+) output drops"),
+    "input_drops": re.compile(r"(\d+) input drops"),
+    "runts": re.compile(r"(\d+) runts"),
+    "giants": re.compile(r"(\d+) giants"),
+}
 
-RE_IFACE = re.compile(r"^(\S+)\s+is\s+(up|down|administratively down)", re.MULTILINE)
-RE_INPUT_ERRORS = re.compile(r"(\d+) input errors")
-RE_CRC = re.compile(r"(\d+) CRC")
-RE_OUTPUT_DROPS = re.compile(r"(\d+) output drops")
-RE_RESETS = re.compile(r"(\d+) interface resets")
-RE_RUNTS = re.compile(r"(\d+) runts")
-RE_GIANTS = re.compile(r"(\d+) giants")
+IFACE_HEADER = re.compile(r"^(\S+) is (up|down|administratively down)", re.MULTILINE)
 
 
-def ssh_connect(host: str, username: str, password: str, port: int) -> paramiko.SSHClient:
+def ssh_connect(host, port, username, password=None, key_file=None):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(
-            hostname=host,
-            port=port,
-            username=username,
-            password=password,
-            timeout=10,
-            look_for_keys=False,
-            allow_agent=False,
-        )
-        log.info("Connected to %s", host)
-        return client
-    except paramiko.AuthenticationException:
-        log.error("Authentication failed for %s@%s", username, host)
-        sys.exit(1)
-    except Exception as exc:
-        log.error("Connection to %s failed: %s", host, exc)
-        sys.exit(1)
+    kwargs = {"hostname": host, "port": port, "username": username, "timeout": 10}
+    if key_file:
+        kwargs["key_filename"] = key_file
+    else:
+        kwargs["password"] = password
+    client.connect(**kwargs)
+    return client
 
 
-def run_command(client: paramiko.SSHClient, command: str) -> str:
-    channel = client.invoke_shell()
-    channel.settimeout(RECV_TIMEOUT)
-    time.sleep(1)
-    channel.recv(BUFFER_SIZE)  # flush login banner
-
-    channel.send("terminal length 0\n")
-    time.sleep(0.5)
-    channel.recv(BUFFER_SIZE)
-
-    channel.send(f"{command}\n")
-
-    output = b""
-    deadline = time.time() + RECV_TIMEOUT
-    while time.time() < deadline:
-        if channel.recv_ready():
-            output += channel.recv(BUFFER_SIZE)
-            if output.rstrip().endswith(b"#"):
-                break
-        else:
-            time.sleep(0.2)
-
-    channel.close()
-    return output.decode("utf-8", errors="replace")
+def run_command(client, command, timeout=20):
+    _, stdout, _ = client.exec_command(command, timeout=timeout)
+    return stdout.read().decode("utf-8", errors="replace")
 
 
-def _extract(pattern: re.Pattern, text: str) -> int:
-    m = pattern.search(text)
-    return int(m.group(1)) if m else 0
-
-
-def parse_interfaces(raw: str) -> list[dict]:
-    blocks = re.split(r"(?=^\S+\s+is\s+(?:up|down|administratively down))", raw, flags=re.MULTILINE)
-    results = []
+def parse_counters(output, iface_filter=None):
+    """Split 'show interfaces' output into blocks and extract error counters."""
+    blocks = re.split(r"(?=^\S)", output, flags=re.MULTILINE)
+    result = {}
     for block in blocks:
-        m = RE_IFACE.search(block)
+        m = IFACE_HEADER.match(block)
         if not m:
             continue
-        results.append(
-            {
-                "interface": m.group(1),
-                "status": m.group(2),
-                "input_errors": _extract(RE_INPUT_ERRORS, block),
-                "crc_errors": _extract(RE_CRC, block),
-                "output_drops": _extract(RE_OUTPUT_DROPS, block),
-                "resets": _extract(RE_RESETS, block),
-                "runts": _extract(RE_RUNTS, block),
-                "giants": _extract(RE_GIANTS, block),
-            }
-        )
-    return results
+        iface = m.group(1)
+        if iface_filter and iface_filter.lower() not in iface.lower():
+            continue
+        counters = {}
+        for key, pattern in COUNTER_PATTERNS.items():
+            hit = pattern.search(block)
+            counters[key] = int(hit.group(1)) if hit else 0
+        result[iface] = counters
+    return result
 
 
-def worst_counter(iface: dict) -> int:
-    return max(
-        iface["input_errors"],
-        iface["crc_errors"],
-        iface["output_drops"],
-        iface["resets"],
-        iface["runts"],
-        iface["giants"],
-    )
+def compute_rates(before, after, elapsed):
+    """Return per-second delta for each counter, clamped to zero for counter resets."""
+    rates = {}
+    for iface in before:
+        if iface not in after:
+            continue
+        rates[iface] = {
+            key: max(0, after[iface].get(key, 0) - before[iface].get(key, 0)) / elapsed
+            for key in COUNTER_PATTERNS
+        }
+    return rates
 
 
-def print_report(interfaces: list[dict], threshold: int, host: str) -> int:
-    flagged = [i for i in interfaces if worst_counter(i) >= threshold]
+def print_report(rates, threshold):
+    flagged, clean = [], []
+    for iface, counters in sorted(rates.items()):
+        if counters["input_errors"] + counters["output_drops"] >= threshold:
+            flagged.append((iface, counters))
+        else:
+            clean.append(iface)
 
-    print(f"\nInterface Error Report  —  {host}")
-    print(f"Threshold : {threshold:,}   |   Interfaces polled : {len(interfaces)}")
-    print(f"Flagged   : {len(flagged)}\n")
+    if flagged:
+        print(f"\n{'='*62}")
+        print(f"  INTERFACES WITH ERROR RATE >= {threshold:.2f}/s")
+        print(f"{'='*62}")
+        for iface, c in flagged:
+            active = {k: v for k, v in c.items() if v > 0}
+            stats = "  ".join(f"{k}: {v:.2f}/s" for k, v in active.items())
+            print(f"  {iface:<35} {stats or 'no active counters'}")
 
-    if not flagged:
-        print("  All interfaces are below the error threshold.")
-        return 0
-
-    col = "{:<28} {:<22} {:>11} {:>8} {:>11} {:>8} {:>7} {:>7}"
-    header = col.format(
-        "Interface", "Status", "Input Err", "CRC", "Out Drops", "Resets", "Runts", "Giants"
-    )
-    print(header)
-    print("-" * len(header))
-
-    for iface in sorted(flagged, key=worst_counter, reverse=True):
-        print(
-            col.format(
-                iface["interface"],
-                iface["status"],
-                f"{iface['input_errors']:,}",
-                f"{iface['crc_errors']:,}",
-                f"{iface['output_drops']:,}",
-                f"{iface['resets']:,}",
-                f"{iface['runts']:,}",
-                f"{iface['giants']:,}",
-            )
-        )
-
+    print(f"\nClean interfaces ({len(clean)}): {', '.join(clean) or 'none'}")
     return len(flagged)
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(
-        description="Report interface error counters exceeding a threshold."
+        description="Sample interface error counters on a network device and report rates."
     )
-    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
     parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    parser.add_argument("--key", help="Path to SSH private key file")
     parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
     parser.add_argument(
-        "--threshold",
-        type=int,
-        default=10,
-        help="Flag interfaces with any counter at or above this value (default: 10)",
+        "--interval", type=int, default=10,
+        help="Seconds between counter samples (default: 10)",
     )
-    parser.add_argument("--output", metavar="FILE", help="Write full results to a JSON file")
-    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--threshold", type=float, default=1.0,
+        help="Errors/s rate to flag an interface (default: 1.0)",
+    )
+    parser.add_argument(
+        "--interface",
+        help="Substring filter for interface names (e.g. 'GigabitEthernet')",
+    )
     args = parser.parse_args()
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logging.getLogger("paramiko").setLevel(logging.DEBUG)
+    if not args.key and not args.password:
+        args.password = getpass.getpass(f"Password for {args.username}@{args.device}: ")
 
-    client = ssh_connect(args.device, args.username, args.password, args.port)
+    logger.info("Connecting to %s:%d", args.device, args.port)
     try:
-        log.info("Running '%s'", COMMAND)
-        raw = run_command(client, COMMAND)
+        client = ssh_connect(
+            args.device, args.port, args.username,
+            password=args.password, key_file=args.key,
+        )
+    except paramiko.AuthenticationException:
+        logger.error("Authentication failed for %s@%s", args.username, args.device)
+        raise SystemExit(1)
+    except Exception as exc:
+        logger.error("Connection failed: %s", exc)
+        raise SystemExit(1)
+
+    try:
+        logger.info("Collecting first sample...")
+        before = parse_counters(run_command(client, "show interfaces"), args.interface)
+        t1 = time.monotonic()
+
+        if not before:
+            logger.error("No matching interfaces found. Check device or --interface filter.")
+            raise SystemExit(1)
+
+        logger.info("Waiting %d seconds before second sample...", args.interval)
+        time.sleep(args.interval)
+
+        logger.info("Collecting second sample...")
+        after = parse_counters(run_command(client, "show interfaces"), args.interface)
+        elapsed = time.monotonic() - t1
     finally:
         client.close()
 
-    interfaces = parse_interfaces(raw)
-    if not interfaces:
-        log.error("No interfaces parsed — verify device type and SSH output")
-        sys.exit(1)
-
-    log.info("Parsed %d interfaces", len(interfaces))
-    flagged_count = print_report(interfaces, args.threshold, args.device)
-
-    if args.output:
-        payload = {
-            "device": args.device,
-            "threshold": args.threshold,
-            "interfaces": interfaces,
-        }
-        with open(args.output, "w") as fh:
-            json.dump(payload, fh, indent=2)
-        log.info("Results written to %s", args.output)
-
-    sys.exit(1 if flagged_count else 0)
+    rates = compute_rates(before, after, elapsed)
+    logger.info("Sampled %d interfaces over %.1f seconds", len(rates), elapsed)
+    flagged = print_report(rates, args.threshold)
+    raise SystemExit(0 if flagged == 0 else 2)
 
 
 if __name__ == "__main__":
