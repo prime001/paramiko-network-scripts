@@ -1,27 +1,27 @@
-The user's explicit instruction is "Output ONLY the script content" — that takes precedence over the brainstorming dialogue flow. Writing the script directly.
-
-```
+```python
 """
-cdp_neighbor_discovery.py - CDP/LLDP Neighbor Discovery via SSH
+mac_table.py - Switch MAC Address Table Collector
 
-Purpose:
-    Discovers directly connected neighbors on Cisco IOS/NX-OS devices using
-    CDP (Cisco Discovery Protocol) or LLDP. Useful for topology documentation,
-    change control, and network auditing when no NMS is available.
+Connects to a Cisco IOS/IOS-XE switch via SSH and retrieves the MAC address
+table, parsing entries by VLAN, MAC address, entry type, and port. Distinct
+from arp_table.py which maps IP→MAC; this maps MAC→switchport for L2 tracing.
 
 Usage:
-    python cdp_neighbor_discovery.py -d 192.168.1.1 -u admin
-    python cdp_neighbor_discovery.py -d 192.168.1.1 -u admin -p secret --protocol lldp
-    python cdp_neighbor_discovery.py -d 192.168.1.1 -u admin --key ~/.ssh/id_rsa --csv out.csv
+    python mac_table.py -d 192.168.1.1 -u admin -p secret
+    python mac_table.py -d 192.168.1.1 -u admin --key ~/.ssh/id_rsa --vlan 10
+    python mac_table.py -d 192.168.1.1 -u admin -p secret --format csv -o macs.csv
+    python mac_table.py -d 192.168.1.1 -u admin -p secret --interface Gi0/1
 
 Prerequisites:
     pip install paramiko
-    SSH access to device; CDP or LLDP must be enabled globally
+    SSH must be enabled on the target device.
+    Read-only privilege (show commands) is sufficient.
 """
 
 import argparse
 import csv
 import getpass
+import json
 import logging
 import re
 import sys
@@ -29,194 +29,192 @@ import time
 
 import paramiko
 
-logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 
-def ssh_connect(host, port, username, password=None, key_file=None, timeout=15):
+def ssh_connect(host, username, password=None, key_path=None, port=22, timeout=10):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = dict(
-        hostname=host,
-        port=port,
-        username=username,
-        timeout=timeout,
-        look_for_keys=False,
-        allow_agent=False,
-    )
-    if key_file:
-        kwargs["key_filename"] = key_file
-    else:
+    kwargs = {
+        "hostname": host,
+        "port": port,
+        "username": username,
+        "timeout": timeout,
+        "look_for_keys": bool(key_path),
+        "allow_agent": False,
+    }
+    if key_path:
+        kwargs["key_filename"] = key_path
+    elif password:
         kwargs["password"] = password
+    else:
+        raise ValueError("Either --password or --key must be provided")
     client.connect(**kwargs)
     return client
 
 
-def run_command(shell, command, wait=2.0):
+def run_show_command(client, command, settle=1.5):
+    shell = client.invoke_shell()
+    shell.settimeout(20)
+    time.sleep(0.4)
+    if shell.recv_ready():
+        shell.recv(4096)
+
+    shell.send("terminal length 0\n")
+    time.sleep(0.3)
+    if shell.recv_ready():
+        shell.recv(4096)
+
     shell.send(command + "\n")
-    time.sleep(wait)
-    buf = b""
-    while shell.recv_ready():
-        buf += shell.recv(65535)
-    return buf.decode("utf-8", errors="replace")
+    time.sleep(settle)
+
+    output = ""
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if shell.recv_ready():
+            output += shell.recv(8192).decode("utf-8", errors="replace")
+            time.sleep(0.2)
+        else:
+            break
+
+    shell.close()
+    return output
 
 
-def parse_cdp_neighbors(output):
-    """Parse 'show cdp neighbors detail' into a list of neighbor dicts."""
-    neighbors = []
-    for block in re.split(r"-{10,}", output):
-        if "Device ID" not in block:
-            continue
-        neighbor = {}
-        m = re.search(r"Device ID:\s*(\S+)", block)
-        if m:
-            neighbor["device_id"] = m.group(1)
-        m = re.search(r"IP address:\s*(\S+)", block, re.IGNORECASE)
-        if m:
-            neighbor["ip_address"] = m.group(1)
-        m = re.search(r"Platform:\s*([^,]+)", block)
-        if m:
-            neighbor["platform"] = m.group(1).strip()
-        m = re.search(r"Capabilities:\s*(.+)", block)
-        if m:
-            neighbor["capabilities"] = m.group(1).strip()
-        m = re.search(r"Interface:\s*(\S+),\s*Port ID.*?:\s*(\S+)", block)
-        if m:
-            neighbor["local_interface"] = m.group(1).rstrip(",")
-            neighbor["remote_interface"] = m.group(2)
-        m = re.search(r"Version\s*:\s*\n?(.*?)(?:\n\n|\Z)", block, re.DOTALL)
-        if m:
-            first_line = m.group(1).strip().splitlines()
-            neighbor["version"] = first_line[0] if first_line else ""
-        if "device_id" in neighbor:
-            neighbors.append(neighbor)
-    return neighbors
+def parse_mac_table(output):
+    """Parse Cisco IOS 'show mac address-table' output into a list of dicts."""
+    entries = []
+    # Matches lines like:   10  aabb.cc00.0100  DYNAMIC  Gi0/1
+    pattern = re.compile(
+        r"^\s*(\d+)\s+"
+        r"([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+"
+        r"(\w+)\s+"
+        r"([\w/.\-]+)",
+        re.MULTILINE,
+    )
+    for m in pattern.finditer(output):
+        vlan, mac, entry_type, port = m.groups()
+        entries.append({
+            "vlan": int(vlan),
+            "mac": mac.lower(),
+            "type": entry_type.upper(),
+            "port": port,
+        })
+    return entries
 
 
-def parse_lldp_neighbors(output):
-    """Parse 'show lldp neighbors detail' into a list of neighbor dicts."""
-    neighbors = []
-    for block in re.split(r"(?=Local Intf:)", output):
-        if "System Name" not in block and "Port id" not in block:
-            continue
-        neighbor = {}
-        m = re.search(r"Local Intf:\s*(\S+)", block)
-        if m:
-            neighbor["local_interface"] = m.group(1)
-        m = re.search(r"System Name:\s*(\S+)", block)
-        if m:
-            neighbor["device_id"] = m.group(1)
-        m = re.search(r"(\d+\.\d+\.\d+\.\d+)", block)
-        if m:
-            neighbor["ip_address"] = m.group(1)
-        m = re.search(r"Port id:\s*(\S+)", block)
-        if m:
-            neighbor["remote_interface"] = m.group(1)
-        m = re.search(r"System Capabilities:\s*(.+)", block)
-        if m:
-            neighbor["capabilities"] = m.group(1).strip()
-        m = re.search(r"System Description:\s*\n?(.*?)(?:\n\n|\Z)", block, re.DOTALL)
-        if m:
-            first_line = m.group(1).strip().splitlines()
-            neighbor["version"] = first_line[0] if first_line else ""
-        neighbor.setdefault("device_id", "unknown")
-        if "local_interface" in neighbor:
-            neighbors.append(neighbor)
-    return neighbors
+def apply_filters(entries, vlan=None, interface=None, entry_type=None):
+    if vlan is not None:
+        entries = [e for e in entries if e["vlan"] == vlan]
+    if interface:
+        needle = interface.lower()
+        entries = [e for e in entries if needle in e["port"].lower()]
+    if entry_type:
+        entries = [e for e in entries if e["type"] == entry_type.upper()]
+    return entries
 
 
-def collect_neighbors(host, port, username, password, key_file, protocol):
-    log.info("Connecting to %s:%d", host, port)
-    client = ssh_connect(host, port, username, password=password, key_file=key_file)
-    shell = client.invoke_shell(width=250, height=200)
-    time.sleep(1)
-    shell.recv(65535)
-
-    run_command(shell, "terminal length 0", wait=1.0)
-    shell.recv(65535)
-
-    if protocol == "cdp":
-        log.info("Running: show cdp neighbors detail")
-        output = run_command(shell, "show cdp neighbors detail", wait=3.0)
-        neighbors = parse_cdp_neighbors(output)
-    else:
-        log.info("Running: show lldp neighbors detail")
-        output = run_command(shell, "show lldp neighbors detail", wait=3.0)
-        neighbors = parse_lldp_neighbors(output)
-
-    client.close()
-    return neighbors
-
-
-def print_report(host, neighbors, protocol):
-    print(f"\nNeighbor Discovery Report — {host} ({protocol.upper()})")
-    print("=" * 80)
-    if not neighbors:
-        print("No neighbors found.")
+def print_table(entries):
+    if not entries:
+        print("No entries matched.")
         return
-    print(f"{'Device ID':<30} {'Local Intf':<14} {'Remote Intf':<14} {'IP Address':<16} Platform")
-    print("-" * 80)
-    for n in neighbors:
-        platform = n.get("platform") or n.get("capabilities", "")
-        print(
-            f"{n.get('device_id', ''):<30} "
-            f"{n.get('local_interface', ''):<14} "
-            f"{n.get('remote_interface', ''):<14} "
-            f"{n.get('ip_address', ''):<16} "
-            f"{platform}"
-        )
-    print(f"\nTotal neighbors: {len(neighbors)}")
+    print(f"{'VLAN':<6} {'MAC Address':<18} {'Type':<10} Port")
+    print("-" * 50)
+    for e in entries:
+        print(f"{e['vlan']:<6} {e['mac']:<18} {e['type']:<10} {e['port']}")
+    print(f"\n{len(entries)} entries")
 
 
-def write_csv(path, host, neighbors):
-    fields = ["device", "device_id", "ip_address", "local_interface",
-              "remote_interface", "platform", "capabilities", "version"]
+def write_csv(entries, path):
     with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        for n in neighbors:
-            writer.writerow({"device": host, **n})
-    log.info("CSV written to %s", path)
+        w = csv.DictWriter(f, fieldnames=["vlan", "mac", "type", "port"])
+        w.writeheader()
+        w.writerows(entries)
+    log.info("Wrote %d entries to %s", len(entries), path)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(description="Retrieve switch MAC address table via SSH")
+    p.add_argument("-d", "--device", required=True, help="Device hostname or IP")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", default=None, help="SSH password")
+    p.add_argument("--key", default=None, metavar="PATH", help="SSH private key path")
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("--vlan", type=int, default=None, help="Filter by VLAN ID")
+    p.add_argument("--interface", default=None, help="Filter by interface (partial match)")
+    p.add_argument(
+        "--type", dest="entry_type", choices=["DYNAMIC", "STATIC"],
+        default=None, help="Filter by entry type",
+    )
+    p.add_argument(
+        "--format", choices=["table", "json", "csv"], default="table",
+        help="Output format (default: table)",
+    )
+    p.add_argument("-o", "--output", default=None, help="Output file for csv/json")
+    p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return p
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Discover CDP/LLDP neighbors on network devices via SSH"
-    )
-    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", default=None, help="SSH password")
-    parser.add_argument("--key", dest="key_file", default=None, help="SSH private key path")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument(
-        "--protocol", choices=["cdp", "lldp"], default="cdp",
-        help="Discovery protocol (default: cdp)",
-    )
-    parser.add_argument("--csv", dest="csv_file", default=None, help="Export results to CSV")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    args = parser.parse_args()
+    args = build_parser().parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger("paramiko").setLevel(logging.DEBUG)
 
-    if not args.password and not args.key_file:
+    if not args.password and not args.key:
         args.password = getpass.getpass(f"Password for {args.username}@{args.device}: ")
 
+    log.info("Connecting to %s:%d", args.device, args.port)
     try:
-        neighbors = collect_neighbors(
-            args.device, args.port, args.username,
-            args.password, args.key_file, args.protocol,
+        client = ssh_connect(
+            host=args.device,
+            username=args.username,
+            password=args.password,
+            key_path=args.key,
+            port=args.port,
         )
     except paramiko.AuthenticationException:
         log.error("Authentication failed for %s@%s", args.username, args.device)
         sys.exit(1)
     except (paramiko.SSHException, OSError) as exc:
-        log.error("Connection error: %s", exc)
+        log.error("Connection failed: %s", exc)
         sys.exit(1)
 
-    print_report(args.device, neighbors, args.protocol)
-    if args.csv_file:
-        write_csv(args.csv_file, args.device, neighbors)
+    try:
+        log.info("Running 'show mac address-table'")
+        raw = run_show_command(client, "show mac address-table")
+    except Exception as exc:
+        log.error("Command execution failed: %s", exc)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    entries = parse_mac_table(raw)
+    if not entries:
+        log.warning("No MAC table entries parsed — verify device type and connectivity")
+        log.debug("Raw output:\n%s", raw)
+
+    entries = apply_filters(entries, vlan=args.vlan, interface=args.interface, entry_type=args.entry_type)
+
+    if args.format == "table":
+        print_table(entries)
+    elif args.format == "json":
+        payload = json.dumps(entries, indent=2)
+        if args.output:
+            with open(args.output, "w") as f:
+                f.write(payload)
+            log.info("JSON written to %s", args.output)
+        else:
+            print(payload)
+    elif args.format == "csv":
+        if args.output:
+            write_csv(entries, args.output)
+        else:
+            w = csv.DictWriter(sys.stdout, fieldnames=["vlan", "mac", "type", "port"])
+            w.writeheader()
+            w.writerows(entries)
 
 
 if __name__ == "__main__":
