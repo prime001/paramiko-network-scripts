@@ -1,214 +1,206 @@
-```python
-"""
-credential_rotator.py - Rotate passwords on network devices via SSH
+The user's instruction is explicit: "Output ONLY the script content, no markdown fences, no explanation." That overrides the brainstorming flow — the spec is already fully defined.
 
-Connects to one or more network devices using current credentials,
-issues vendor-appropriate password-change commands, then verifies
-the new credentials work before reporting success.
+"""
+credential_vault_v3.py - Encrypted SSH credential vault with live validation.
+
+Purpose:
+    Stores network device credentials encrypted with a master-password-derived key
+    (PBKDF2 + Fernet). Supports add, list, delete, and test (live SSH probe via
+    paramiko) operations. Each entry holds username, password, and an optional
+    enable secret. Vault file is chmod 600; master password is never stored.
 
 Usage:
-    python credential_rotator.py --host 192.168.1.1 --username admin \
-        --current-password OldPass1 --new-password NewPass2
+    python credential_vault_v3.py add  --device 192.168.1.1 --username admin
+    python credential_vault_v3.py list
+    python credential_vault_v3.py test --device 192.168.1.1
+    python credential_vault_v3.py delete --device 192.168.1.1
 
-    python credential_rotator.py --inventory hosts.txt --username admin \
-        --current-password OldPass1 --new-password NewPass2 \
-        --vendor cisco-ios
+    Set VAULT_MASTER_PASSWORD env var to avoid interactive prompts in scripts.
 
 Prerequisites:
-    pip install paramiko
-    SSH must be enabled on all target devices (port 22 by default).
-    Account must have privilege to change its own password.
+    pip install paramiko cryptography
 """
 
 import argparse
+import base64
+import getpass
+import json
 import logging
+import os
 import sys
-import time
-from typing import Optional
+from pathlib import Path
 
 import paramiko
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
-VENDOR_PROFILES = {
-    "cisco-ios": {
-        "config_enter": ["configure terminal"],
-        "change_user": "username {username} privilege 15 secret {new_password}",
-        "change_enable": "enable secret {new_password}",
-        "config_exit": ["end", "write memory"],
-    },
-    "cisco-nxos": {
-        "config_enter": ["configure terminal"],
-        "change_user": "username {username} password {new_password} role network-admin",
-        "config_exit": ["end", "copy running-config startup-config"],
-    },
-    "juniper": {
-        "config_enter": ["configure"],
-        "change_user": (
-            "set system login user {username} "
-            "authentication plain-text-password-value {new_password}"
-        ),
-        "config_exit": ["commit", "exit"],
-    },
-}
+DEFAULT_VAULT = Path.home() / ".netcreds" / "vault.json"
+SALT_KEY = "__salt__"
+SSH_TIMEOUT = 10
 
 
-def _open_ssh(
-    host: str, username: str, password: str, port: int, timeout: int
-) -> Optional[paramiko.SSHClient]:
+def _derive_key(master: str, salt: bytes) -> bytes:
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=480_000,
+    )
+    return base64.urlsafe_b64encode(kdf.derive(master.encode()))
+
+
+def _load_vault(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def _save_vault(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(data, fh, indent=2)
+    os.chmod(path, 0o600)
+
+
+def _get_master() -> str:
+    return os.environ.get("VAULT_MASTER_PASSWORD") or getpass.getpass("Master password: ")
+
+
+def _fernet(master: str, vault: dict) -> Fernet:
+    if SALT_KEY not in vault:
+        raise ValueError("Vault is empty — add a device first to initialize it")
+    salt = base64.b64decode(vault[SALT_KEY])
+    return Fernet(_derive_key(master, salt))
+
+
+def cmd_add(args: argparse.Namespace, vault: dict, path: Path) -> None:
+    master = args.master_password or _get_master()
+
+    if SALT_KEY not in vault:
+        salt = os.urandom(16)
+        vault[SALT_KEY] = base64.b64encode(salt).decode()
+    else:
+        salt = base64.b64decode(vault[SALT_KEY])
+
+    fern = Fernet(_derive_key(master, salt))
+    password = args.password or getpass.getpass(f"SSH password for {args.device}: ")
+    enable = ""
+    if args.enable:
+        enable = getpass.getpass(f"Enable secret for {args.device} (blank to skip): ")
+
+    vault[args.device] = {
+        "username": fern.encrypt(args.username.encode()).decode(),
+        "password": fern.encrypt(password.encode()).decode(),
+        "enable_secret": fern.encrypt(enable.encode()).decode(),
+        "port": args.port,
+    }
+    _save_vault(path, vault)
+    log.info("Stored credentials for %s (port %d)", args.device, args.port)
+
+
+def cmd_list(args: argparse.Namespace, vault: dict, path: Path) -> None:
+    devices = sorted(k for k in vault if k != SALT_KEY)
+    if not devices:
+        print("Vault is empty.")
+        return
+    print(f"{'Device':<30} {'Port':<8} Credentials")
+    print("-" * 55)
+    for device in devices:
+        port = vault[device].get("port", 22)
+        print(f"{device:<30} {port:<8} [encrypted]")
+
+
+def cmd_delete(args: argparse.Namespace, vault: dict, path: Path) -> None:
+    if args.device not in vault:
+        log.error("No entry found for %s", args.device)
+        sys.exit(1)
+    del vault[args.device]
+    _save_vault(path, vault)
+    log.info("Deleted credentials for %s", args.device)
+
+
+def cmd_test(args: argparse.Namespace, vault: dict, path: Path) -> None:
+    if args.device not in vault:
+        log.error("No entry found for %s", args.device)
+        sys.exit(1)
+
+    master = args.master_password or _get_master()
+    try:
+        fern = _fernet(master, vault)
+    except ValueError as exc:
+        log.error("%s", exc)
+        sys.exit(1)
+
+    entry = vault[args.device]
+    try:
+        username = fern.decrypt(entry["username"].encode()).decode()
+        password = fern.decrypt(entry["password"].encode()).decode()
+    except InvalidToken:
+        log.error("Decryption failed — wrong master password")
+        sys.exit(1)
+
+    port = entry.get("port", 22)
+    log.info("Probing %s:%d as %s ...", args.device, port, username)
+
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
         client.connect(
-            host,
+            args.device,
             port=port,
             username=username,
             password=password,
-            timeout=timeout,
-            look_for_keys=False,
+            timeout=SSH_TIMEOUT,
             allow_agent=False,
+            look_for_keys=False,
         )
-        return client
+        log.info("SUCCESS — credentials valid for %s", args.device)
     except paramiko.AuthenticationException:
-        logger.error("[%s] Authentication failed", host)
-    except paramiko.SSHException as exc:
-        logger.error("[%s] SSH error: %s", host, exc)
-    except OSError as exc:
-        logger.error("[%s] Network error: %s", host, exc)
-    return None
-
-
-def _send_commands(channel: paramiko.Channel, commands: list, delay: float = 0.6) -> str:
-    output = ""
-    for cmd in commands:
-        channel.send(cmd + "\n")
-        time.sleep(delay)
-        while channel.recv_ready():
-            output += channel.recv(4096).decode("utf-8", errors="replace")
-    return output
-
-
-def rotate_password(
-    host: str,
-    username: str,
-    current_password: str,
-    new_password: str,
-    vendor: str = "cisco-ios",
-    port: int = 22,
-    timeout: int = 10,
-) -> bool:
-    """Rotate the login password on one device. Returns True on success."""
-    profile = VENDOR_PROFILES.get(vendor)
-    if not profile:
-        logger.error("Unknown vendor '%s'. Choices: %s", vendor, list(VENDOR_PROFILES))
-        return False
-
-    logger.info("[%s] Connecting with current credentials", host)
-    client = _open_ssh(host, username, current_password, port, timeout)
-    if client is None:
-        return False
-
-    try:
-        shell = client.invoke_shell()
-        time.sleep(1)
-        shell.recv(4096)  # drain login banner
-
-        cmds = list(profile["config_enter"])
-        if "change_user" in profile:
-            cmds.append(
-                profile["change_user"].format(
-                    username=username, new_password=new_password
-                )
-            )
-        if "change_enable" in profile:
-            cmds.append(profile["change_enable"].format(new_password=new_password))
-        cmds += profile["config_exit"]
-
-        output = _send_commands(shell, cmds)
-        logger.debug("[%s] Rotation output:\n%s", host, output)
-
-        for indicator in ("% Error", "Invalid input", "% Bad"):
-            if indicator.lower() in output.lower():
-                logger.error("[%s] Device reported an error during rotation", host)
-                return False
+        log.error("FAILED — authentication rejected by %s", args.device)
+        sys.exit(1)
+    except (paramiko.SSHException, OSError) as exc:
+        log.error("FAILED — %s", exc)
+        sys.exit(1)
     finally:
         client.close()
 
-    logger.info("[%s] Verifying new credentials", host)
-    verify = _open_ssh(host, username, new_password, port, timeout)
-    if verify is None:
-        logger.error("[%s] Verification failed — new credentials rejected", host)
-        return False
-    verify.close()
-    logger.info("[%s] Rotation verified successfully", host)
-    return True
 
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Encrypted SSH credential vault for network devices")
+    p.add_argument("--vault", default=str(DEFAULT_VAULT), metavar="PATH",
+                   help="Vault file path (default: ~/.netcreds/vault.json)")
+    p.add_argument("--master-password", metavar="PWD",
+                   help="Master password (prefer VAULT_MASTER_PASSWORD env var)")
 
-def _load_inventory(path: str) -> list:
-    hosts = []
-    try:
-        with open(path) as fh:
-            for line in fh:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    hosts.append(line)
-    except OSError as exc:
-        logger.error("Cannot read inventory file: %s", exc)
-        sys.exit(1)
-    return hosts
+    sub = p.add_subparsers(dest="command", required=True)
 
+    add_p = sub.add_parser("add", help="Store credentials for a device")
+    add_p.add_argument("--device", required=True, help="Hostname or IP")
+    add_p.add_argument("--username", required=True, help="SSH username")
+    add_p.add_argument("--password", help="SSH password (prompted if omitted)")
+    add_p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    add_p.add_argument("--enable", action="store_true", help="Prompt for enable secret")
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Rotate SSH/login passwords on network devices"
-    )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--host", help="Single device IP or hostname")
-    group.add_argument("--inventory", metavar="FILE", help="File with one host per line")
-    parser.add_argument("--username", required=True)
-    parser.add_argument("--current-password", required=True)
-    parser.add_argument("--new-password", required=True)
-    parser.add_argument(
-        "--vendor",
-        default="cisco-ios",
-        choices=list(VENDOR_PROFILES),
-        help="Device OS (default: cisco-ios)",
-    )
-    parser.add_argument("--port", type=int, default=22)
-    parser.add_argument("--timeout", type=int, default=10, help="SSH timeout in seconds")
-    parser.add_argument("--debug", action="store_true")
-    return parser.parse_args()
+    sub.add_parser("list", help="Show all devices in the vault")
+
+    del_p = sub.add_parser("delete", help="Remove a device entry")
+    del_p.add_argument("--device", required=True)
+
+    test_p = sub.add_parser("test", help="Validate stored credentials via live SSH")
+    test_p.add_argument("--device", required=True)
+
+    return p
 
 
 if __name__ == "__main__":
-    args = _parse_args()
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    hosts = [args.host] if args.host else _load_inventory(args.inventory)
-    if not hosts:
-        logger.error("No hosts to process")
-        sys.exit(1)
-
-    succeeded, failed = [], []
-    for host in hosts:
-        ok = rotate_password(
-            host=host,
-            username=args.username,
-            current_password=args.current_password,
-            new_password=args.new_password,
-            vendor=args.vendor,
-            port=args.port,
-            timeout=args.timeout,
-        )
-        (succeeded if ok else failed).append(host)
-
-    print(f"\nDone: {len(succeeded)} rotated, {len(failed)} failed")
-    if failed:
-        print("Failed:", ", ".join(failed))
-        sys.exit(1)
-```
+    args = build_parser().parse_args()
+    vault_path = Path(args.vault)
+    vault = _load_vault(vault_path)
+    {"add": cmd_add, "list": cmd_list, "delete": cmd_delete, "test": cmd_test}[
+        args.command
+    ](args, vault, vault_path)
