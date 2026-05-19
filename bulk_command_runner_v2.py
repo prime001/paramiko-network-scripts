@@ -1,27 +1,27 @@
 ```python
 """
-Device Configuration Auditor - Verify network devices comply with baseline requirements.
+Device Log Collector and Aggregator
 
-Purpose:
-    Connects to network devices via SSH and audits configuration for required settings
-    such as NTP, SNMP, syslog, and logging. Generates a compliance report.
-
-Usage:
-    python device_config_auditor.py --host 192.168.1.1 --username admin \
-        --password <password> --checks ntp,snmp,syslog
+Connects to network devices via SSH, collects system logs, and aggregates
+them for analysis and reporting. Supports filtering by severity level and
+keyword search across multiple devices.
 
 Prerequisites:
-    - paramiko library installed (pip install paramiko)
-    - SSH access to target devices
-    - Valid credentials with read access to device config
+    - paramiko: pip install paramiko
+    - SSH access to devices with valid credentials
+    - Devices must support 'show log' or 'display log' command
 
-Author: Network Automation Portfolio
+Usage:
+    python device_log_collector.py -d 192.168.1.1 -u admin -p password
+    python device_log_collector.py -f devices.txt -s ERROR -o report.json
+    python device_log_collector.py -d 10.0.0.5 -u admin -p pass -k "failure"
 """
 
 import argparse
+import json
 import logging
 import sys
-from typing import Dict, List, Tuple
+from typing import List, Dict, Any
 
 import paramiko
 
@@ -33,54 +33,28 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class ConfigAuditor:
-    """Audits device configuration for compliance with baseline requirements."""
-
-    CHECKS = {
-        'ntp': [
-            'ntp server',
-            'ntp authenticate',
-        ],
-        'snmp': [
-            'snmp-server community',
-            'snmp-server trap-source',
-        ],
-        'syslog': [
-            'logging host',
-            'logging source-interface',
-        ],
-        'logging': [
-            'logging buffered',
-            'logging console',
-        ],
-        'ssh': [
-            'ip ssh version 2',
-            'transport input ssh',
-        ]
-    }
+class DeviceLogCollector:
+    """SSH-based log collector for network devices."""
 
     def __init__(self, host: str, username: str, password: str, timeout: int = 10):
-        """Initialize SSH client and connection parameters."""
         self.host = host
         self.username = username
         self.password = password
         self.timeout = timeout
-        self.client = paramiko.SSHClient()
-        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        self.config_lines = []
+        self.client = None
 
     def connect(self) -> bool:
         """Establish SSH connection to device."""
         try:
-            logger.info(f"Connecting to {self.host}...")
+            self.client = paramiko.SSHClient()
+            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             self.client.connect(
                 self.host,
                 username=self.username,
                 password=self.password,
-                timeout=self.timeout,
-                banner_timeout=15
+                timeout=self.timeout
             )
-            logger.info(f"Successfully connected to {self.host}")
+            logger.info(f"Connected to {self.host}")
             return True
         except paramiko.AuthenticationException:
             logger.error(f"Authentication failed for {self.host}")
@@ -89,130 +63,158 @@ class ConfigAuditor:
             logger.error(f"SSH error connecting to {self.host}: {e}")
             return False
         except Exception as e:
-            logger.error(f"Unexpected error connecting to {self.host}: {e}")
+            logger.error(f"Failed to connect to {self.host}: {e}")
             return False
 
-    def get_config(self) -> bool:
-        """Retrieve running configuration from device."""
+    def get_logs(self, lines: int = 100) -> List[str]:
+        """Retrieve system logs from device via SSH."""
+        if not self.client:
+            logger.error("Not connected to device")
+            return []
+
         try:
-            _, stdout, stderr = self.client.exec_command('show run')
-            output = stdout.read().decode().strip()
-            error = stderr.read().decode().strip()
-
-            if error and 'invalid command' in error.lower():
-                logger.warning(f"Device {self.host} may not support 'show run'")
-                return False
-
-            self.config_lines = output.split('\n')
-            logger.info(f"Retrieved {len(self.config_lines)} config lines")
-            return True
+            _, stdout, _ = self.client.exec_command(f"show log tail {lines}")
+            output = stdout.read().decode('utf-8', errors='ignore')
+            return [line for line in output.strip().split('\n') if line]
         except Exception as e:
-            logger.error(f"Failed to retrieve config: {e}")
-            return False
+            logger.error(f"Failed to retrieve logs from {self.host}: {e}")
+            return []
 
-    def audit_check(self, check_name: str) -> Tuple[str, bool, List[str]]:
-        """Audit a specific configuration check."""
-        required_keywords = self.CHECKS.get(check_name, [])
+    def parse_logs(self, raw_logs: List[str]) -> List[Dict[str, Any]]:
+        """Parse raw log lines into structured format."""
+        parsed = []
+        for line in raw_logs:
+            severity = self._extract_severity(line)
+            parsed.append({
+                'raw': line,
+                'severity': severity,
+                'message': line
+            })
+        return parsed
 
-        if not required_keywords:
-            return check_name, False, ["Unknown check"]
+    @staticmethod
+    def _extract_severity(line: str) -> str:
+        """Extract log severity level from log line."""
+        line_upper = line.upper()
+        for severity in ['CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG']:
+            if severity in line_upper:
+                return severity
+        return 'INFO'
 
-        found_items = []
-        for keyword in required_keywords:
-            for line in self.config_lines:
-                if keyword.lower() in line.lower():
-                    found_items.append(line.strip())
-                    break
+    def filter_logs(self, logs: List[Dict], severity: str = None,
+                   search_text: str = None) -> List[Dict]:
+        """Filter logs by severity and/or search keyword."""
+        filtered = logs
 
-        is_compliant = len(found_items) == len(required_keywords)
-        return check_name, is_compliant, found_items
+        if severity:
+            filtered = [l for l in filtered
+                       if l['severity'] == severity.upper()]
 
-    def run_audit(self, checks: List[str]) -> Dict[str, Dict]:
-        """Run all requested configuration audits."""
-        results = {}
+        if search_text:
+            filtered = [l for l in filtered
+                       if search_text.lower() in l['raw'].lower()]
 
-        if not self.connect():
-            return results
+        return filtered
 
-        if not self.get_config():
+    def disconnect(self):
+        """Close SSH connection."""
+        if self.client:
             self.client.close()
-            return results
+            logger.info(f"Disconnected from {self.host}")
 
-        for check in checks:
-            if check in self.CHECKS:
-                check_name, is_compliant, items = self.audit_check(check)
-                results[check_name] = {
-                    'compliant': is_compliant,
-                    'found_items': items,
-                    'required_count': len(self.CHECKS[check])
-                }
-            else:
-                logger.warning(f"Unknown check: {check}")
 
-        self.client.close()
-        return results
-
-    def print_report(self, results: Dict[str, Dict]) -> None:
-        """Print formatted compliance report."""
-        if not results:
-            print("No audit results to report.")
-            return
-
-        print(f"\n{'='*60}")
-        print(f"Configuration Audit Report - {self.host}")
-        print(f"{'='*60}\n")
-
-        compliant_count = sum(1 for r in results.values() if r['compliant'])
-        total_checks = len(results)
-
-        for check_name, result in results.items():
-            status = "✓ PASS" if result['compliant'] else "✗ FAIL"
-            print(f"{check_name:15} {status:10} ({len(result['found_items'])}/{result['required_count']} items)")
-            for item in result['found_items']:
-                print(f"  └─ {item[:70]}")
-
-        print(f"\n{'='*60}")
-        print(f"Summary: {compliant_count}/{total_checks} checks passed")
-        print(f"{'='*60}\n")
+def load_devices_from_file(filepath: str) -> List[str]:
+    """Load list of device IPs/hostnames from file."""
+    try:
+        with open(filepath) as f:
+            return [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        logger.error(f"Device file not found: {filepath}")
+        return []
 
 
 def main():
-    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Audit network device configuration compliance"
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument('--host', required=True, help='Target device IP or hostname')
-    parser.add_argument('--username', required=True, help='SSH username')
-    parser.add_argument('--password', required=True, help='SSH password')
-    parser.add_argument(
-        '--checks',
-        default='ntp,snmp,logging',
-        help='Comma-separated list of checks to run (default: ntp,snmp,logging)'
-    )
-    parser.add_argument('--timeout', type=int, default=10, help='SSH timeout in seconds')
-    parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
+    parser.add_argument('-d', '--device', help='Device IP or hostname')
+    parser.add_argument('-f', '--file', help='File with list of devices')
+    parser.add_argument('-u', '--username', required=True, help='SSH username')
+    parser.add_argument('-p', '--password', required=True, help='SSH password')
+    parser.add_argument('-l', '--lines', type=int, default=100,
+                       help='Number of log lines to retrieve (default: 100)')
+    parser.add_argument('-s', '--severity', help='Filter by severity (CRITICAL, ERROR, WARNING, INFO, DEBUG)')
+    parser.add_argument('-k', '--keyword', help='Search logs for keyword')
+    parser.add_argument('-o', '--output', help='Output file (JSON format)')
+    parser.add_argument('-t', '--timeout', type=int, default=10,
+                       help='SSH timeout in seconds (default: 10)')
 
     args = parser.parse_args()
 
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
+    if not args.device and not args.file:
+        parser.error("Specify either --device or --file")
 
-    checks = [c.strip() for c in args.checks.split(',')]
+    devices = []
+    if args.device:
+        devices = [args.device]
+    elif args.file:
+        devices = load_devices_from_file(args.file)
+        if not devices:
+            return 1
 
-    auditor = ConfigAuditor(
-        host=args.host,
-        username=args.username,
-        password=args.password,
-        timeout=args.timeout
-    )
+    all_results = {}
 
-    results = auditor.run_audit(checks)
-    auditor.print_report(results)
+    for device in devices:
+        collector = DeviceLogCollector(
+            device, args.username, args.password, args.timeout
+        )
 
-    if results and not all(r['compliant'] for r in results.values()):
-        sys.exit(1)
+        if not collector.connect():
+            all_results[device] = {'status': 'failed', 'error': 'Connection failed'}
+            continue
+
+        raw_logs = collector.get_logs(args.lines)
+        parsed_logs = collector.parse_logs(raw_logs)
+        filtered_logs = collector.filter_logs(
+            parsed_logs, args.severity, args.keyword
+        )
+
+        all_results[device] = {
+            'status': 'success',
+            'total_logs': len(parsed_logs),
+            'filtered_count': len(filtered_logs),
+            'logs': filtered_logs
+        }
+
+        logger.info(
+            f"{device}: {len(filtered_logs)}/{len(parsed_logs)} logs matching filters"
+        )
+        collector.disconnect()
+
+    if args.output:
+        try:
+            with open(args.output, 'w') as f:
+                json.dump(all_results, f, indent=2)
+            logger.info(f"Results saved to {args.output}")
+        except IOError as e:
+            logger.error(f"Failed to write output file: {e}")
+            return 1
+    else:
+        for device, data in all_results.items():
+            print(f"\n{'='*70}")
+            print(f"Device: {device} | Status: {data['status']}")
+            if data['status'] == 'success':
+                print(f"Logs: {data['filtered_count']}/{data['total_logs']}")
+                print(f"{'='*70}")
+                for log in data['logs'][:25]:
+                    print(log['raw'])
+            else:
+                print(f"Error: {data.get('error', 'Unknown error')}")
+
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())
 ```
