@@ -1,231 +1,252 @@
 ```python
 """
-arp_anomaly_detector.py - ARP table anomaly detection via Paramiko
+arp_anomaly_detector.py - ARP Table Anomaly Detection via Paramiko
 
 Purpose:
-    Connects to a network device, retrieves the ARP table, and analyzes
-    entries for operational anomalies: duplicate IP addresses (IP conflicts
-    or ARP spoofing), duplicate MACs (one host advertising multiple IPs),
-    and incomplete entries. Optionally diffs against a saved baseline to
-    surface new or removed hosts.
+    Retrieves the ARP table from a Cisco IOS/IOS-XE device and performs
+    anomaly analysis: duplicate IP-to-MAC mappings (potential ARP spoofing),
+    duplicate MAC-to-IP mappings (flapping or misconfiguration), and
+    incomplete entries. Optionally saves a baseline and diffs subsequent
+    runs to surface new, removed, or changed entries.
 
 Usage:
-    python arp_anomaly_detector.py -d 192.168.1.1 -u admin -p secret
-    python arp_anomaly_detector.py -d 10.0.0.1 -u admin -k ~/.ssh/id_rsa \
-        --save-baseline baseline.json
-    python arp_anomaly_detector.py -d 10.0.0.1 -u admin -p secret \
-        --baseline baseline.json --csv report.csv
+    python arp_anomaly_detector.py -d 192.168.1.1 -u admin
+    python arp_anomaly_detector.py -d 192.168.1.1 -u admin --save-baseline baseline.json
+    python arp_anomaly_detector.py -d 192.168.1.1 -u admin --compare-baseline baseline.json
+    python arp_anomaly_detector.py -d 192.168.1.1 -u admin --json
 
 Prerequisites:
     pip install paramiko
-    SSH access to target device with privilege to run 'show arp'.
-    Tested against Cisco IOS/IOS-XE. Exits non-zero when anomalies are found
-    (useful for scripted alerting pipelines).
+    Device must support 'show ip arp' (Cisco IOS/IOS-XE)
+    SSH must be enabled on the target device
+
+Exit codes:
+    0 - clean (no anomalies or only LOW severity)
+    1 - runtime error
+    2 - HIGH severity anomaly detected (suitable for monitoring pipelines)
 """
 
 import argparse
-import csv
 import json
 import logging
 import re
 import sys
 from collections import defaultdict
+from getpass import getpass
 from pathlib import Path
 
 import paramiko
 
-logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
 log = logging.getLogger(__name__)
 
+_ARP_RE = re.compile(
+    r"^(?P<protocol>\S+)\s+"
+    r"(?P<ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+"
+    r"(?P<age>\S+)\s+"
+    r"(?P<mac>[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}|-)\s+"
+    r"(?P<encap>\S+)\s+"
+    r"(?P<iface>\S+)",
+    re.IGNORECASE,
+)
 
-def ssh_run(host, port, username, password, key_file, command, timeout=30):
+
+def ssh_run(host, port, username, password, command, timeout):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = dict(
-        hostname=host, port=port, username=username,
-        timeout=timeout, look_for_keys=False, allow_agent=False,
-    )
-    if key_file:
-        kwargs["key_filename"] = key_file
-        kwargs["look_for_keys"] = True
-    else:
-        kwargs["password"] = password
     try:
-        client.connect(**kwargs)
+        client.connect(
+            host,
+            port=port,
+            username=username,
+            password=password,
+            timeout=timeout,
+            look_for_keys=False,
+            allow_agent=False,
+        )
         _, stdout, stderr = client.exec_command(command, timeout=timeout)
-        output = stdout.read().decode()
-        err = stderr.read().decode().strip()
+        output = stdout.read().decode(errors="replace")
+        err = stderr.read().decode(errors="replace").strip()
         if err:
-            log.debug("stderr: %s", err)
+            log.warning("stderr from device: %s", err)
         return output
     finally:
         client.close()
 
 
-def parse_cisco_arp(raw):
-    """Parse 'show arp' from Cisco IOS/IOS-XE into a list of dicts."""
+def parse_arp_table(raw):
     entries = []
-    pattern = re.compile(
-        r"^Internet\s+"
-        r"(\d+\.\d+\.\d+\.\d+)\s+"
-        r"(\d+|-)\s+"
-        r"([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}|Incomplete)\s+"
-        r"(\S+)\s*(\S+)?",
-        re.IGNORECASE,
-    )
     for line in raw.splitlines():
-        m = pattern.match(line.strip())
-        if m:
-            entries.append({
-                "ip": m.group(1),
-                "age": m.group(2),
-                "mac": m.group(3).lower(),
-                "type": m.group(4),
-                "interface": m.group(5) or "",
-            })
+        m = _ARP_RE.match(line.strip())
+        if not m:
+            continue
+        entries.append({
+            "ip": m.group("ip"),
+            "mac": m.group("mac").lower(),
+            "age": m.group("age"),
+            "interface": m.group("iface"),
+            "incomplete": m.group("mac") == "-",
+        })
     return entries
 
 
-def detect_anomalies(entries):
+def analyze(entries):
+    anomalies = []
     ip_to_macs = defaultdict(set)
     mac_to_ips = defaultdict(set)
-    incomplete = []
 
     for e in entries:
-        if e["mac"] == "incomplete":
-            incomplete.append(e["ip"])
+        if e["incomplete"]:
+            anomalies.append({
+                "severity": "LOW",
+                "type": "INCOMPLETE",
+                "detail": f"Incomplete ARP entry for {e['ip']} on {e['interface']}",
+            })
             continue
         ip_to_macs[e["ip"]].add(e["mac"])
         mac_to_ips[e["mac"]].add(e["ip"])
 
-    return {
-        "duplicate_ips": {ip: list(macs) for ip, macs in ip_to_macs.items() if len(macs) > 1},
-        "duplicate_macs": {mac: list(ips) for mac, ips in mac_to_ips.items() if len(ips) > 1},
-        "incomplete": incomplete,
+    for ip, macs in ip_to_macs.items():
+        if len(macs) > 1:
+            anomalies.append({
+                "severity": "HIGH",
+                "type": "IP_CONFLICT",
+                "detail": f"{ip} resolves to multiple MACs: {', '.join(sorted(macs))} — possible ARP spoofing",
+            })
+
+    for mac, ips in mac_to_ips.items():
+        if len(ips) > 1:
+            anomalies.append({
+                "severity": "MEDIUM",
+                "type": "MAC_CONFLICT",
+                "detail": f"{mac} appears on multiple IPs: {', '.join(sorted(ips))}",
+            })
+
+    return anomalies
+
+
+def diff_baseline(current_entries, baseline_path):
+    with open(baseline_path) as f:
+        baseline = json.load(f)
+
+    base_map = {e["ip"]: e["mac"] for e in baseline if not e["incomplete"]}
+    curr_map = {e["ip"]: e["mac"] for e in current_entries if not e["incomplete"]}
+    changes = []
+
+    for ip, mac in curr_map.items():
+        if ip not in base_map:
+            changes.append({"change": "NEW", "ip": ip, "mac": mac})
+        elif base_map[ip] != mac:
+            changes.append({
+                "change": "MAC_CHANGED",
+                "ip": ip,
+                "old_mac": base_map[ip],
+                "new_mac": mac,
+            })
+
+    for ip, mac in base_map.items():
+        if ip not in curr_map:
+            changes.append({"change": "REMOVED", "ip": ip, "mac": mac})
+
+    return changes
+
+
+def print_report(entries, anomalies, changes, use_json):
+    report = {
+        "total_entries": len(entries),
+        "incomplete_count": sum(1 for e in entries if e["incomplete"]),
+        "anomaly_count": len(anomalies),
+        "anomalies": anomalies,
     }
+    if changes is not None:
+        report["baseline_changes"] = changes
 
+    if use_json:
+        report["entries"] = entries
+        print(json.dumps(report, indent=2))
+        return
 
-def diff_baseline(current, baseline_path):
-    path = Path(baseline_path)
-    if not path.exists():
-        log.warning("Baseline %s not found; skipping diff", baseline_path)
-        return None
-    baseline = json.loads(path.read_text())
-    base_set = {(e["ip"], e["mac"]) for e in baseline}
-    curr_set = {(e["ip"], e["mac"]) for e in current if e["mac"] != "incomplete"}
-    return {
-        "new": [{"ip": ip, "mac": mac} for ip, mac in sorted(curr_set - base_set)],
-        "removed": [{"ip": ip, "mac": mac} for ip, mac in sorted(base_set - curr_set)],
-    }
+    print(f"\nARP Table Summary: {report['total_entries']} entries "
+          f"({report['incomplete_count']} incomplete)")
 
-
-def print_report(entries, anomalies, diff=None):
-    print(f"\n{'='*60}\nARP Table — {len(entries)} entries\n{'='*60}")
-    for e in entries:
-        flag = " [INCOMPLETE]" if e["mac"] == "incomplete" else ""
-        print(f"  {e['ip']:<18} {e['mac']:<20} {e['interface']}{flag}")
-
-    print(f"\n{'='*60}\nAnomaly Report\n{'='*60}")
-
-    if anomalies["duplicate_ips"]:
-        print(f"\n[!] Duplicate IPs — possible IP conflict or ARP spoofing ({len(anomalies['duplicate_ips'])}):")
-        for ip, macs in anomalies["duplicate_ips"].items():
-            print(f"    {ip} -> {', '.join(macs)}")
+    if anomalies:
+        print(f"\nANOMALIES ({len(anomalies)}):")
+        for a in sorted(anomalies, key=lambda x: x["severity"]):
+            print(f"  [{a['severity']:6s}] {a['type']}: {a['detail']}")
     else:
-        print("\n[OK] No duplicate IP addresses")
+        print("\nNo anomalies detected.")
 
-    if anomalies["duplicate_macs"]:
-        print(f"\n[!] Duplicate MACs — one host on multiple IPs ({len(anomalies['duplicate_macs'])}):")
-        for mac, ips in anomalies["duplicate_macs"].items():
-            print(f"    {mac} -> {', '.join(ips)}")
-    else:
-        print("\n[OK] No duplicate MAC addresses")
-
-    if anomalies["incomplete"]:
-        print(f"\n[!] Incomplete entries ({len(anomalies['incomplete'])}):")
-        for ip in anomalies["incomplete"]:
-            print(f"    {ip}")
-    else:
-        print("\n[OK] No incomplete ARP entries")
-
-    if diff is not None:
-        print(f"\n{'='*60}\nBaseline Diff\n{'='*60}")
-        if diff["new"]:
-            print(f"\n[+] New entries ({len(diff['new'])}):")
-            for e in diff["new"]:
-                print(f"    {e['ip']:<18} {e['mac']}")
-        if diff["removed"]:
-            print(f"\n[-] Removed entries ({len(diff['removed'])}):")
-            for e in diff["removed"]:
-                print(f"    {e['ip']:<18} {e['mac']}")
-        if not diff["new"] and not diff["removed"]:
-            print("\n[OK] ARP table matches baseline exactly")
+    if changes is not None:
+        if changes:
+            print(f"\nBASELINE DIFF ({len(changes)} changes):")
+            for c in changes:
+                if c["change"] == "NEW":
+                    print(f"  + {c['ip']:18s}  {c['mac']}  (new)")
+                elif c["change"] == "REMOVED":
+                    print(f"  - {c['ip']:18s}  {c['mac']}  (removed)")
+                else:
+                    print(f"  ! {c['ip']:18s}  {c['old_mac']} -> {c['new_mac']}")
+        else:
+            print("\nBaseline diff: no changes.")
 
 
-def build_parser():
-    p = argparse.ArgumentParser(
-        description="Fetch ARP table and detect anomalies (duplicate IPs/MACs, incomplete entries)"
+def main():
+    parser = argparse.ArgumentParser(
+        description="Detect ARP anomalies on Cisco IOS devices via SSH"
     )
-    p.add_argument("-d", "--device", required=True, help="Device hostname or IP")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", default="", help="SSH password")
-    p.add_argument("-k", "--key-file", help="Path to SSH private key")
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("--command", default="show arp", help="ARP command to run")
-    p.add_argument("--csv", metavar="FILE", help="Export ARP table to CSV")
-    p.add_argument("--baseline", metavar="FILE", help="Compare against saved baseline JSON")
-    p.add_argument("--save-baseline", metavar="FILE", help="Save current table as baseline JSON")
-    p.add_argument("--timeout", type=int, default=30, help="SSH timeout seconds")
-    p.add_argument("-v", "--verbose", action="store_true")
-    return p
+    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument("--command", default="show ip arp", help="ARP command override")
+    parser.add_argument("--timeout", type=int, default=15)
+    parser.add_argument("--save-baseline", metavar="FILE", help="Save current ARP table as JSON baseline")
+    parser.add_argument("--compare-baseline", metavar="FILE", help="Diff current table against baseline")
+    parser.add_argument("--json", action="store_true", dest="use_json", help="Emit JSON output")
+    args = parser.parse_args()
 
-
-if __name__ == "__main__":
-    args = build_parser().parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    if not args.password and not args.key_file:
-        import getpass
-        args.password = getpass.getpass("SSH password: ")
+    password = args.password or getpass(f"Password for {args.username}@{args.device}: ")
 
     log.info("Connecting to %s:%d", args.device, args.port)
     try:
-        raw = ssh_run(
-            args.device, args.port, args.username, args.password,
-            args.key_file, args.command, args.timeout,
-        )
+        raw = ssh_run(args.device, args.port, args.username, password, args.command, args.timeout)
     except paramiko.AuthenticationException:
         log.error("Authentication failed for %s@%s", args.username, args.device)
         sys.exit(1)
-    except (paramiko.SSHException, OSError) as exc:
+    except Exception as exc:
         log.error("Connection error: %s", exc)
         sys.exit(1)
 
-    entries = parse_cisco_arp(raw)
+    entries = parse_arp_table(raw)
     if not entries:
-        log.error("No ARP entries parsed — check device type or command output")
-        log.debug("Raw output:\n%s", raw)
+        log.error("No ARP entries parsed — verify device type and command")
         sys.exit(1)
 
     log.info("Parsed %d ARP entries", len(entries))
-    anomalies = detect_anomalies(entries)
-    diff = diff_baseline(entries, args.baseline) if args.baseline else None
-    print_report(entries, anomalies, diff)
 
     if args.save_baseline:
-        clean = [e for e in entries if e["mac"] != "incomplete"]
-        Path(args.save_baseline).write_text(json.dumps(clean, indent=2))
-        log.info("Baseline saved: %s (%d entries)", args.save_baseline, len(clean))
+        Path(args.save_baseline).write_text(json.dumps(entries, indent=2))
+        log.info("Baseline saved to %s", args.save_baseline)
 
-    if args.csv:
-        with open(args.csv, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["ip", "age", "mac", "type", "interface"])
-            writer.writeheader()
-            writer.writerows(entries)
-        log.info("CSV written to %s", args.csv)
+    anomalies = analyze(entries)
 
-    has_critical = bool(anomalies["duplicate_ips"] or anomalies["duplicate_macs"])
-    sys.exit(1 if has_critical else 0)
+    changes = None
+    if args.compare_baseline:
+        if not Path(args.compare_baseline).exists():
+            log.error("Baseline file not found: %s", args.compare_baseline)
+            sys.exit(1)
+        changes = diff_baseline(entries, args.compare_baseline)
+
+    print_report(entries, anomalies, changes, args.use_json)
+
+    if any(a["severity"] == "HIGH" for a in anomalies):
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
 ```
