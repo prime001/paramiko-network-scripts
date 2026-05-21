@@ -1,33 +1,30 @@
-Writing a VLAN audit and provisioning script — distinct from all existing scripts in the repo.
+Writing a VLAN provisioner script — distinct from the existing config_deploy scripts by targeting VLAN lifecycle management specifically (add/remove/list with pre-check).
 
 ```python
-#!/usr/bin/env python3
-"""
-vlan_audit.py - VLAN database audit and provisioning for Cisco IOS switches
-
-Purpose:
-    Query the VLAN database and port assignments on a Cisco IOS switch via SSH.
-    Optionally verify that required VLANs are present and provision any missing ones.
+"""vlan_provisioner.py - Deploy and manage VLANs on Cisco IOS/IOS-XE switches via SSH.
 
 Usage:
-    # Audit only
-    python vlan_audit.py -H 192.168.1.1 -u admin -p secret
+    # List VLANs currently on device
+    python vlan_provisioner.py --host 192.168.1.1 --user admin --action list
 
-    # Verify specific VLANs are present
-    python vlan_audit.py -H 192.168.1.1 -u admin -p secret --required-vlans 10,20,30
+    # Add VLANs from a JSON definition file
+    python vlan_provisioner.py --host 192.168.1.1 --user admin --action add --vlan-file vlans.json
 
-    # Provision missing VLANs (requires enable secret for privilege 15)
-    python vlan_audit.py -H 192.168.1.1 -u admin -p secret \
-        --required-vlans 10,20,30 --provision --enable-secret cisco \
-        --vlan-names "10=mgmt,20=voice,30=data"
+    # Remove one or more VLANs by ID
+    python vlan_provisioner.py --host 192.168.1.1 --user admin --action remove --vlan-id 100 200
+
+    VLAN JSON file format:
+        [{"id": 100, "name": "SERVERS"}, {"id": 200, "name": "VOICE"}]
 
 Prerequisites:
     pip install paramiko
-    SSH must be enabled on the target device.
-    Read-only access suffices for audit; privilege 15 required for --provision.
+    SSH access to target switch with privilege level 15 (or enable configured)
+    Device must support 'show vlan brief' and IOS-style vlan database config mode
 """
 
 import argparse
+import getpass
+import json
 import logging
 import re
 import sys
@@ -35,11 +32,14 @@ import time
 
 import paramiko
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s",
+    level=logging.INFO,
+)
 log = logging.getLogger(__name__)
 
 
-def _connect(host: str, port: int, username: str, password: str) -> paramiko.SSHClient:
+def ssh_connect(host, username, password, port=22, timeout=15):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(
@@ -47,205 +47,177 @@ def _connect(host: str, port: int, username: str, password: str) -> paramiko.SSH
         port=port,
         username=username,
         password=password,
+        timeout=timeout,
         look_for_keys=False,
         allow_agent=False,
-        timeout=15,
     )
     return client
 
 
-def _open_shell(client: paramiko.SSHClient) -> paramiko.Channel:
-    shell = client.invoke_shell(width=220, height=50)
-    shell.settimeout(10)
-    time.sleep(1)
-    _drain(shell)
-    return shell
-
-
-def _drain(shell: paramiko.Channel) -> str:
-    buf = ""
-    try:
-        while shell.recv_ready():
-            buf += shell.recv(4096).decode("utf-8", errors="replace")
-    except Exception:
-        pass
-    return buf
-
-
-def _send(shell: paramiko.Channel, cmd: str, wait: float = 1.5) -> str:
-    shell.send(cmd + "\n")
-    time.sleep(wait)
+def send(shell, command, delay=0.5):
+    shell.send(command + "\n")
+    time.sleep(delay)
     output = ""
-    for _ in range(20):
-        chunk = _drain(shell)
-        output += chunk
-        if re.search(r"[#>]\s*$", output):
-            break
-        time.sleep(0.3)
+    while shell.recv_ready():
+        output += shell.recv(65535).decode("utf-8", errors="replace")
+        time.sleep(0.1)
     return output
 
 
-def _enter_enable(shell: paramiko.Channel, secret: str) -> None:
-    out = _send(shell, "enable", wait=1.0)
-    if "Password" in out:
-        _send(shell, secret, wait=1.0)
-
-
-def _parse_vlan_brief(output: str) -> dict:
-    """Return {vlan_id: {'name': str, 'status': str, 'ports': list}}."""
+def get_existing_vlans(shell):
+    output = send(shell, "show vlan brief", delay=1.0)
     vlans = {}
-    current = None
     for line in output.splitlines():
-        m = re.match(r"^(\d+)\s+(\S+)\s+(active|act/unsup|suspended)\s*(.*)?$", line)
-        if m:
-            vid = int(m.group(1))
-            ports = [p.strip() for p in m.group(4).split(",") if p.strip()]
-            vlans[vid] = {"name": m.group(2), "status": m.group(3), "ports": ports}
-            current = vid
-        elif current and re.match(r"^\s{20,}", line):
-            vlans[current]["ports"].extend(
-                p.strip() for p in line.split(",") if p.strip()
-            )
+        match = re.match(r"^(\d+)\s+(\S+)\s+active", line)
+        if match:
+            vlans[int(match.group(1))] = match.group(2)
     return vlans
 
 
-def _parse_trunk_ports(output: str) -> list:
-    trunks = []
-    capture = False
-    for line in output.splitlines():
-        if re.match(r"^Port\s+Mode\s+Encapsulation", line):
-            capture = True
+def add_vlans(shell, vlan_list):
+    existing = get_existing_vlans(shell)
+    results = []
+
+    send(shell, "configure terminal")
+    for entry in vlan_list:
+        vlan_id = int(entry["id"])
+        vlan_name = entry.get("name", f"VLAN{vlan_id:04d}")
+
+        if vlan_id in existing:
+            log.info("VLAN %d (%s) already exists — skipped", vlan_id, vlan_name)
+            results.append({"id": vlan_id, "name": vlan_name, "status": "skipped"})
             continue
-        if capture:
-            if not line.strip() or line.startswith("Port"):
-                capture = False
-                continue
-            m = re.match(r"^(\S+)\s+", line)
-            if m:
-                trunks.append(m.group(1))
-    return trunks
+
+        send(shell, f"vlan {vlan_id}")
+        send(shell, f"name {vlan_name}")
+        send(shell, "exit")
+        log.info("Added VLAN %d (%s)", vlan_id, vlan_name)
+        results.append({"id": vlan_id, "name": vlan_name, "status": "added"})
+
+    send(shell, "end")
+    send(shell, "write memory", delay=2.0)
+    return results
 
 
-def _provision(
-    shell: paramiko.Channel, missing: list, names: dict
-) -> None:
-    log.info("Entering config mode to provision %d VLAN(s)", len(missing))
-    _send(shell, "configure terminal", wait=1.0)
-    for vid in missing:
-        _send(shell, f"vlan {vid}", wait=0.5)
-        if vid in names:
-            _send(shell, f" name {names[vid]}", wait=0.3)
-        _send(shell, "exit", wait=0.3)
-        log.info("  Provisioned VLAN %d", vid)
-    _send(shell, "end", wait=0.5)
-    _send(shell, "write memory", wait=3.0)
-    log.info("Configuration saved")
+def remove_vlans(shell, vlan_ids):
+    existing = get_existing_vlans(shell)
+    results = []
+
+    send(shell, "configure terminal")
+    for vlan_id in vlan_ids:
+        vlan_id = int(vlan_id)
+
+        if vlan_id == 1:
+            log.warning("Refusing to remove VLAN 1 (native/default)")
+            results.append({"id": vlan_id, "status": "refused"})
+            continue
+
+        if vlan_id not in existing:
+            log.warning("VLAN %d not found — skipped", vlan_id)
+            results.append({"id": vlan_id, "status": "not_found"})
+            continue
+
+        send(shell, f"no vlan {vlan_id}")
+        log.info("Removed VLAN %d (%s)", vlan_id, existing[vlan_id])
+        results.append({"id": vlan_id, "name": existing[vlan_id], "status": "removed"})
+
+    send(shell, "end")
+    send(shell, "write memory", delay=2.0)
+    return results
 
 
-def main() -> int:
-    p = argparse.ArgumentParser(
-        description="Audit and optionally provision VLANs on Cisco IOS switches"
+def list_vlans(shell):
+    vlans = get_existing_vlans(shell)
+    print(f"\n{'ID':<8} {'Name':<32}")
+    print("-" * 40)
+    for vlan_id in sorted(vlans):
+        print(f"{vlan_id:<8} {vlans[vlan_id]:<32}")
+    print(f"\nTotal: {len(vlans)} VLANs\n")
+    return vlans
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Add, remove, or list VLANs on Cisco IOS/IOS-XE switches"
     )
-    p.add_argument("-H", "--host", required=True, help="Device IP or hostname")
-    p.add_argument("-u", "--username", required=True)
-    p.add_argument("-p", "--password", required=True)
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument(
-        "--required-vlans",
-        help="Comma-separated VLAN IDs to verify (e.g. 10,20,30)",
+    parser.add_argument("--host", required=True, help="Device IP or hostname")
+    parser.add_argument("--user", required=True, help="SSH username")
+    parser.add_argument("--password", help="SSH password (prompted if omitted)")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument(
+        "--action",
+        choices=["add", "remove", "list"],
+        required=True,
+        help="Action to perform",
     )
-    p.add_argument(
-        "--provision",
-        action="store_true",
-        help="Create any missing VLANs (requires --required-vlans)",
+    parser.add_argument(
+        "--vlan-file",
+        help="JSON file with VLAN definitions [{id, name}, ...] — required for 'add'",
     )
-    p.add_argument("--enable-secret", default="", help="Enable secret for privilege 15")
-    p.add_argument(
-        "--vlan-names",
-        help="Name map for provisioning: '10=mgmt,20=voice'",
+    parser.add_argument(
+        "--vlan-id",
+        type=int,
+        nargs="+",
+        metavar="ID",
+        help="VLAN ID(s) to remove — required for 'remove'",
     )
-    p.add_argument("--verbose", action="store_true")
-    args = p.parse_args()
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
 
-    logging.getLogger().setLevel(logging.DEBUG if args.verbose else logging.INFO)
-    logging.getLogger("paramiko").setLevel(
-        logging.DEBUG if args.verbose else logging.WARNING
-    )
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    required = []
-    if args.required_vlans:
-        try:
-            required = [int(v.strip()) for v in args.required_vlans.split(",")]
-        except ValueError:
-            log.error("--required-vlans must be comma-separated integers")
-            return 1
+    if args.action == "add" and not args.vlan_file:
+        parser.error("--vlan-file is required when action is 'add'")
+    if args.action == "remove" and not args.vlan_id:
+        parser.error("--vlan-id is required when action is 'remove'")
 
-    vlan_names = {}
-    if args.vlan_names:
-        for pair in args.vlan_names.split(","):
-            if "=" in pair:
-                vid, name = pair.split("=", 1)
-                vlan_names[int(vid.strip())] = name.strip()
+    password = args.password or getpass.getpass(f"Password for {args.user}@{args.host}: ")
 
-    log.info("Connecting to %s:%d", args.host, args.port)
     try:
-        client = _connect(args.host, args.port, args.username, args.password)
-    except paramiko.AuthenticationException:
-        log.error("Authentication failed for user '%s'", args.username)
-        return 1
-    except Exception as exc:
-        log.error("Connection failed: %s", exc)
-        return 1
+        log.info("Connecting to %s:%d", args.host, args.port)
+        client = ssh_connect(args.host, args.user, password, args.port)
+        shell = client.invoke_shell()
+        time.sleep(1)
+        shell.recv(65535)  # drain banner/MOTD
 
-    try:
-        shell = _open_shell(client)
-        if args.provision and args.enable_secret:
-            _enter_enable(shell, args.enable_secret)
-        _send(shell, "terminal length 0", wait=0.5)
+        send(shell, "terminal length 0")
 
-        vlans = _parse_vlan_brief(_send(shell, "show vlan brief", wait=2.0))
-        trunks = _parse_trunk_ports(_send(shell, "show interfaces trunk", wait=2.0))
+        if args.action == "list":
+            list_vlans(shell)
 
-        print(f"\n{'='*62}")
-        print(f"VLAN Audit — {args.host}")
-        print(f"{'='*62}")
-        print(f"{'ID':<6} {'Name':<20} {'Status':<12} Ports")
-        print(f"{'-'*6} {'-'*20} {'-'*12} {'-'*20}")
-        for vid in sorted(vlans):
-            v = vlans[vid]
-            ports_str = ", ".join(v["ports"][:4])
-            if len(v["ports"]) > 4:
-                ports_str += f" (+{len(v['ports']) - 4} more)"
-            print(f"{vid:<6} {v['name']:<20} {v['status']:<12} {ports_str}")
+        elif args.action == "add":
+            with open(args.vlan_file) as f:
+                vlan_list = json.load(f)
+            results = add_vlans(shell, vlan_list)
+            added = sum(1 for r in results if r["status"] == "added")
+            skipped = sum(1 for r in results if r["status"] == "skipped")
+            log.info("Complete: %d added, %d skipped", added, skipped)
 
-        print(f"\nTrunk ports: {', '.join(trunks) if trunks else 'none detected'}")
-        print(f"Total VLANs: {len(vlans)}")
+        elif args.action == "remove":
+            results = remove_vlans(shell, args.vlan_id)
+            removed = sum(1 for r in results if r["status"] == "removed")
+            log.info("Complete: %d removed", removed)
 
-        if required:
-            existing = set(vlans)
-            missing = [v for v in required if v not in existing]
-            present = [v for v in required if v in existing]
-            print(f"\nRequired VLAN check ({len(required)} VLANs):")
-            for vid in present:
-                print(f"  [OK]      VLAN {vid} — {vlans[vid]['name']}")
-            for vid in missing:
-                print(f"  [MISSING] VLAN {vid}")
-            if missing and args.provision:
-                _provision(shell, missing, vlan_names)
-                print(f"\nProvisioned: {missing}")
-            elif missing:
-                print(f"\n{len(missing)} VLAN(s) missing. Add --provision to create them.")
-
-        print()
-        return 0
-
-    except Exception as exc:
-        log.error("Audit failed: %s", exc)
-        return 1
-    finally:
         client.close()
+
+    except FileNotFoundError as exc:
+        log.error("File not found: %s", exc)
+        sys.exit(1)
+    except json.JSONDecodeError as exc:
+        log.error("Invalid JSON in VLAN file: %s", exc)
+        sys.exit(1)
+    except paramiko.AuthenticationException:
+        log.error("Authentication failed for %s@%s", args.user, args.host)
+        sys.exit(1)
+    except paramiko.SSHException as exc:
+        log.error("SSH error: %s", exc)
+        sys.exit(1)
+    except OSError as exc:
+        log.error("Connection failed: %s", exc)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
 ```
