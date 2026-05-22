@@ -1,206 +1,228 @@
-The user's instruction is explicit: "Output ONLY the script content, no markdown fences, no explanation." That overrides the brainstorming flow — the spec is already fully defined.
+ntp_status.py — NTP Synchronization Status Checker
 
-"""
-credential_vault_v3.py - Encrypted SSH credential vault with live validation.
-
-Purpose:
-    Stores network device credentials encrypted with a master-password-derived key
-    (PBKDF2 + Fernet). Supports add, list, delete, and test (live SSH probe via
-    paramiko) operations. Each entry holds username, password, and an optional
-    enable secret. Vault file is chmod 600; master password is never stored.
+Connects to Cisco IOS/IOS-XE devices via SSH and reports NTP synchronization
+state, stratum, and reference clock. Optionally verifies that a required set
+of NTP servers is configured and that each device is actively synchronized.
 
 Usage:
-    python credential_vault_v3.py add  --device 192.168.1.1 --username admin
-    python credential_vault_v3.py list
-    python credential_vault_v3.py test --device 192.168.1.1
-    python credential_vault_v3.py delete --device 192.168.1.1
-
-    Set VAULT_MASTER_PASSWORD env var to avoid interactive prompts in scripts.
+    python ntp_status.py -d 192.168.1.1 -u admin -p secret
+    python ntp_status.py -d 192.168.1.1 -u admin --key ~/.ssh/id_rsa
+    python ntp_status.py --host-file devices.txt -u admin --expected 10.0.0.1 10.0.0.2
 
 Prerequisites:
-    pip install paramiko cryptography
+    pip install paramiko
+
+Exit code is 0 only when every device is reachable, synchronized, and
+(if --expected is given) has all required NTP servers configured.
 """
 
 import argparse
-import base64
 import getpass
-import json
 import logging
-import os
+import re
 import sys
-from pathlib import Path
 
 import paramiko
-from cryptography.fernet import Fernet, InvalidToken
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
 log = logging.getLogger(__name__)
 
-DEFAULT_VAULT = Path.home() / ".netcreds" / "vault.json"
-SALT_KEY = "__salt__"
-SSH_TIMEOUT = 10
 
-
-def _derive_key(master: str, salt: bytes) -> bytes:
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=480_000,
-    )
-    return base64.urlsafe_b64encode(kdf.derive(master.encode()))
-
-
-def _load_vault(path: Path) -> dict:
-    if not path.exists():
-        return {}
-    with open(path) as fh:
-        return json.load(fh)
-
-
-def _save_vault(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as fh:
-        json.dump(data, fh, indent=2)
-    os.chmod(path, 0o600)
-
-
-def _get_master() -> str:
-    return os.environ.get("VAULT_MASTER_PASSWORD") or getpass.getpass("Master password: ")
-
-
-def _fernet(master: str, vault: dict) -> Fernet:
-    if SALT_KEY not in vault:
-        raise ValueError("Vault is empty — add a device first to initialize it")
-    salt = base64.b64decode(vault[SALT_KEY])
-    return Fernet(_derive_key(master, salt))
-
-
-def cmd_add(args: argparse.Namespace, vault: dict, path: Path) -> None:
-    master = args.master_password or _get_master()
-
-    if SALT_KEY not in vault:
-        salt = os.urandom(16)
-        vault[SALT_KEY] = base64.b64encode(salt).decode()
-    else:
-        salt = base64.b64decode(vault[SALT_KEY])
-
-    fern = Fernet(_derive_key(master, salt))
-    password = args.password or getpass.getpass(f"SSH password for {args.device}: ")
-    enable = ""
-    if args.enable:
-        enable = getpass.getpass(f"Enable secret for {args.device} (blank to skip): ")
-
-    vault[args.device] = {
-        "username": fern.encrypt(args.username.encode()).decode(),
-        "password": fern.encrypt(password.encode()).decode(),
-        "enable_secret": fern.encrypt(enable.encode()).decode(),
-        "port": args.port,
-    }
-    _save_vault(path, vault)
-    log.info("Stored credentials for %s (port %d)", args.device, args.port)
-
-
-def cmd_list(args: argparse.Namespace, vault: dict, path: Path) -> None:
-    devices = sorted(k for k in vault if k != SALT_KEY)
-    if not devices:
-        print("Vault is empty.")
-        return
-    print(f"{'Device':<30} {'Port':<8} Credentials")
-    print("-" * 55)
-    for device in devices:
-        port = vault[device].get("port", 22)
-        print(f"{device:<30} {port:<8} [encrypted]")
-
-
-def cmd_delete(args: argparse.Namespace, vault: dict, path: Path) -> None:
-    if args.device not in vault:
-        log.error("No entry found for %s", args.device)
-        sys.exit(1)
-    del vault[args.device]
-    _save_vault(path, vault)
-    log.info("Deleted credentials for %s", args.device)
-
-
-def cmd_test(args: argparse.Namespace, vault: dict, path: Path) -> None:
-    if args.device not in vault:
-        log.error("No entry found for %s", args.device)
-        sys.exit(1)
-
-    master = args.master_password or _get_master()
-    try:
-        fern = _fernet(master, vault)
-    except ValueError as exc:
-        log.error("%s", exc)
-        sys.exit(1)
-
-    entry = vault[args.device]
-    try:
-        username = fern.decrypt(entry["username"].encode()).decode()
-        password = fern.decrypt(entry["password"].encode()).decode()
-    except InvalidToken:
-        log.error("Decryption failed — wrong master password")
-        sys.exit(1)
-
-    port = entry.get("port", 22)
-    log.info("Probing %s:%d as %s ...", args.device, port, username)
-
+def ssh_connect(host, username, password=None, key_file=None, port=22, timeout=10):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    kwargs = dict(
+        hostname=host,
+        port=port,
+        username=username,
+        timeout=timeout,
+        allow_agent=False,
+        look_for_keys=False,
+    )
+    if key_file:
+        kwargs["key_filename"] = key_file
+        kwargs["look_for_keys"] = True
+    elif password:
+        kwargs["password"] = password
+    client.connect(**kwargs)
+    return client
+
+
+def run_command(client, command, timeout=15):
+    _, stdout, _ = client.exec_command(command, timeout=timeout)
+    return stdout.read().decode("utf-8", errors="replace")
+
+
+def parse_ntp_status(output):
+    """Return sync state, stratum, and reference from 'show ntp status'."""
+    result = {
+        "synchronized": False,
+        "clock_state": "unknown",
+        "stratum": None,
+        "reference": None,
+    }
+    m = re.search(r"Clock is (\w+)", output)
+    if m:
+        result["clock_state"] = m.group(1).lower()
+        result["synchronized"] = result["clock_state"] == "synchronized"
+
+    m = re.search(r"stratum\s+(\d+)", output, re.IGNORECASE)
+    if m:
+        result["stratum"] = int(m.group(1))
+
+    m = re.search(r"reference is\s+(\S+)", output, re.IGNORECASE)
+    if m:
+        result["reference"] = m.group(1)
+
+    return result
+
+
+def parse_ntp_associations(output):
+    """Return set of peer IPs from 'show ntp associations'."""
+    servers = set()
+    for line in output.splitlines():
+        if not line.strip() or "address" in line.lower() or "===" in line:
+            continue
+        stripped = re.sub(r"^[~*+\-x#\s]+", "", line)
+        m = re.match(r"(\d{1,3}(?:\.\d{1,3}){3})", stripped)
+        if m:
+            servers.add(m.group(1))
+    return servers
+
+
+def check_device(host, username, password, key_file, port, expected_servers, timeout):
+    result = {
+        "host": host,
+        "reachable": False,
+        "synchronized": False,
+        "clock_state": "unknown",
+        "stratum": None,
+        "reference": None,
+        "configured_servers": set(),
+        "missing_servers": set(),
+        "error": None,
+    }
     try:
-        client.connect(
-            args.device,
-            port=port,
-            username=username,
-            password=password,
-            timeout=SSH_TIMEOUT,
-            allow_agent=False,
-            look_for_keys=False,
-        )
-        log.info("SUCCESS — credentials valid for %s", args.device)
-    except paramiko.AuthenticationException:
-        log.error("FAILED — authentication rejected by %s", args.device)
-        sys.exit(1)
-    except (paramiko.SSHException, OSError) as exc:
-        log.error("FAILED — %s", exc)
-        sys.exit(1)
-    finally:
+        client = ssh_connect(host, username, password, key_file, port, timeout)
+        status_out = run_command(client, "show ntp status")
+        assoc_out = run_command(client, "show ntp associations")
         client.close()
 
+        result["reachable"] = True
+        result.update(parse_ntp_status(status_out))
+        result["configured_servers"] = parse_ntp_associations(assoc_out)
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Encrypted SSH credential vault for network devices")
-    p.add_argument("--vault", default=str(DEFAULT_VAULT), metavar="PATH",
-                   help="Vault file path (default: ~/.netcreds/vault.json)")
-    p.add_argument("--master-password", metavar="PWD",
-                   help="Master password (prefer VAULT_MASTER_PASSWORD env var)")
+        if expected_servers:
+            result["missing_servers"] = set(expected_servers) - result["configured_servers"]
 
-    sub = p.add_subparsers(dest="command", required=True)
+    except paramiko.AuthenticationException:
+        result["error"] = "Authentication failed"
+    except (paramiko.SSHException, OSError) as exc:
+        result["error"] = str(exc)
 
-    add_p = sub.add_parser("add", help="Store credentials for a device")
-    add_p.add_argument("--device", required=True, help="Hostname or IP")
-    add_p.add_argument("--username", required=True, help="SSH username")
-    add_p.add_argument("--password", help="SSH password (prompted if omitted)")
-    add_p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    add_p.add_argument("--enable", action="store_true", help="Prompt for enable secret")
+    return result
 
-    sub.add_parser("list", help="Show all devices in the vault")
 
-    del_p = sub.add_parser("delete", help="Remove a device entry")
-    del_p.add_argument("--device", required=True)
+def print_report(results, expected_servers):
+    width = 62
+    print("\n" + "=" * width)
+    print(f"{'NTP Status Report':^{width}}")
+    print("=" * width)
 
-    test_p = sub.add_parser("test", help="Validate stored credentials via live SSH")
-    test_p.add_argument("--device", required=True)
+    for r in results:
+        if not r["reachable"]:
+            print(f"\n[UNREACHABLE] {r['host']} — {r['error']}")
+            continue
 
-    return p
+        tag = "OK  " if r["synchronized"] else "FAIL"
+        stratum = r["stratum"] if r["stratum"] is not None else "?"
+        ref = r["reference"] or "?"
+        print(f"\n[{tag}] {r['host']}")
+        print(f"       State   : {r['clock_state']}")
+        print(f"       Stratum : {stratum}")
+        print(f"       Ref     : {ref}")
+        if r["configured_servers"]:
+            print(f"       Servers : {', '.join(sorted(r['configured_servers']))}")
+        if r["missing_servers"]:
+            print(f"       MISSING : {', '.join(sorted(r['missing_servers']))}")
+
+    print("\n" + "=" * width)
+    total = len(results)
+    synced = sum(1 for r in results if r["synchronized"])
+    print(f"Summary: {synced}/{total} devices synchronized")
+    if expected_servers:
+        compliant = sum(
+            1 for r in results
+            if r["reachable"] and r["synchronized"] and not r["missing_servers"]
+        )
+        print(f"         {compliant}/{total} fully NTP-compliant")
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Check NTP synchronization status on Cisco IOS/IOS-XE devices."
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-d", "--device", help="Device IP or hostname")
+    group.add_argument("--host-file", metavar="FILE", help="File with one device per line")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    parser.add_argument("--key", dest="key_file", metavar="PATH", help="SSH private key file")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument(
+        "--expected", nargs="+", metavar="IP",
+        help="NTP server IPs that must be configured on each device",
+    )
+    parser.add_argument("--timeout", type=int, default=10, help="SSH connect timeout in seconds")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    password = args.password
+    if not password and not args.key_file:
+        password = getpass.getpass(f"Password for {args.username}: ")
+
+    if args.device:
+        hosts = [args.device]
+    else:
+        try:
+            with open(args.host_file) as fh:
+                hosts = [
+                    line.strip()
+                    for line in fh
+                    if line.strip() and not line.startswith("#")
+                ]
+        except OSError as exc:
+            log.error("Cannot read host file: %s", exc)
+            sys.exit(1)
+
+    if not hosts:
+        log.error("No hosts to check.")
+        sys.exit(1)
+
+    results = []
+    for host in hosts:
+        log.info("Checking %s ...", host)
+        results.append(
+            check_device(host, args.username, password, args.key_file,
+                         args.port, args.expected, args.timeout)
+        )
+
+    print_report(results, args.expected)
+
+    failures = [
+        r for r in results
+        if not r["reachable"] or not r["synchronized"] or r.get("missing_servers")
+    ]
+    sys.exit(1 if failures else 0)
 
 
 if __name__ == "__main__":
-    args = build_parser().parse_args()
-    vault_path = Path(args.vault)
-    vault = _load_vault(vault_path)
-    {"add": cmd_add, "list": cmd_list, "delete": cmd_delete, "test": cmd_test}[
-        args.command
-    ](args, vault, vault_path)
+    main()
