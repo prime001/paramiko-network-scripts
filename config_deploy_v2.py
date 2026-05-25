@@ -1,37 +1,24 @@
-This is the NetAutoCommitter repo itself — the paramiko script goes directly as output. Here's the complete script:
+The user's instruction says "Output ONLY the script content" — I'll write a practical NTP configuration deployment script that's not covered by any existing scripts in the repo.
 
-```python
 """
-vlan_provisioner.py - Batch VLAN provisioning for Cisco IOS/IOS-XE switches.
+ntp_deploy.py - NTP Server Configuration Deployment and Verification
 
-Purpose:
-    Create, verify, or remove VLANs on a Cisco switch via SSH. Reads VLAN
-    definitions from a JSON file or inline CLI flags, verifies results with
-    'show vlan brief', and optionally saves the running config.
+Deploy NTP server entries and optional MD5 authentication to Cisco IOS/IOS-XE
+devices over SSH. After applying the configuration, polls `show ntp status`
+until the clock is synchronized or the verification timeout expires.
 
 Usage:
-    python vlan_provisioner.py --host 192.168.1.1 --username admin \
-        --vlans vlans.json
-
-    python vlan_provisioner.py --host 192.168.1.1 --username admin \
-        --vlan-id 100 --vlan-name SERVERS --vlan-id 200 --vlan-name GUEST
-
-    python vlan_provisioner.py --host 192.168.1.1 --username admin \
-        --vlans vlans.json --remove --no-save
+    python ntp_deploy.py --host 192.168.1.1 --user admin --password secret \
+        --ntp-servers 10.0.0.1 10.0.0.2 [--auth-key 1 --auth-secret mykey] \
+        [--enable-password secret] [--verify-timeout 90] [--dry-run]
 
 Prerequisites:
     pip install paramiko
-    SSH and 'ip ssh version 2' enabled on target device.
-
-JSON file format:
-    [{"id": 100, "name": "SERVERS"}, {"id": 200, "name": "GUEST"}]
+    SSH must be enabled on the target device (ip ssh version 2).
 """
 
 import argparse
-import getpass
-import json
 import logging
-import re
 import sys
 import time
 
@@ -39,26 +26,16 @@ import paramiko
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger(__name__)
 
 
-def _send(shell, command, delay=1.0):
-    shell.send(command + "\n")
-    time.sleep(delay)
-    output = ""
-    while shell.recv_ready():
-        output += shell.recv(8192).decode("utf-8", errors="replace")
-    return output
-
-
-def connect(host, port, username, password, timeout):
+def ssh_connect(host, port, username, password, timeout=10):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(
-        host,
+        hostname=host,
         port=port,
         username=username,
         password=password,
@@ -69,153 +46,156 @@ def connect(host, port, username, password, timeout):
     return client
 
 
-def open_shell(client):
-    shell = client.invoke_shell(width=220, height=50)
-    time.sleep(1.5)
-    shell.recv(8192)  # drain banner and initial prompt
-    _send(shell, "terminal length 0", delay=0.5)
-    return shell
+def send(shell, command, wait=0.5):
+    shell.send(command + "\n")
+    time.sleep(wait)
+    buf = ""
+    while shell.recv_ready():
+        buf += shell.recv(4096).decode("utf-8", errors="replace")
+    return buf
 
 
-def get_existing_vlans(shell):
-    output = _send(shell, "show vlan brief", delay=2.0)
-    vlans = {}
-    for line in output.splitlines():
-        m = re.match(r"^(\d+)\s+(\S+)\s+active", line, re.IGNORECASE)
-        if m:
-            vlans[int(m.group(1))] = m.group(2)
-    return vlans
+def enter_enable(shell, enable_password):
+    out = send(shell, "enable", wait=0.5)
+    if "Password" in out and enable_password:
+        send(shell, enable_password, wait=0.5)
 
 
-def provision_vlans(shell, vlans):
-    _send(shell, "configure terminal", delay=0.5)
-    provisioned = []
-    for entry in vlans:
-        vid = entry["id"]
-        name = entry.get("name", f"VLAN{vid:04d}")
-        log.info("  Adding VLAN %d  name=%s", vid, name)
-        _send(shell, f"vlan {vid}", delay=0.3)
-        _send(shell, f" name {name}", delay=0.3)
-        provisioned.append(vid)
-    _send(shell, "end", delay=0.8)
-    return provisioned
-
-
-def remove_vlans(shell, vlans):
-    _send(shell, "configure terminal", delay=0.5)
-    removed = []
-    for entry in vlans:
-        vid = entry["id"]
-        log.info("  Removing VLAN %d", vid)
-        _send(shell, f"no vlan {vid}", delay=0.5)
-        removed.append(vid)
-    _send(shell, "end", delay=0.8)
-    return removed
-
-
-def save_config(shell):
-    log.info("Saving configuration...")
-    out = _send(shell, "write memory", delay=4.0)
-    if re.search(r"OK|Building configuration|success", out, re.IGNORECASE):
-        log.info("Configuration saved.")
+def build_commands(ntp_servers, auth_key, auth_secret):
+    cmds = ["configure terminal"]
+    if auth_key and auth_secret:
+        cmds.append("ntp authenticate")
+        cmds.append(f"ntp authentication-key {auth_key} md5 {auth_secret}")
+        cmds.append(f"ntp trusted-key {auth_key}")
+        for srv in ntp_servers:
+            cmds.append(f"ntp server {srv} key {auth_key}")
     else:
-        log.warning("Unexpected save response: %s", out.strip()[-120:])
+        for srv in ntp_servers:
+            cmds.append(f"ntp server {srv}")
+    cmds += ["end", "write memory"]
+    return cmds
 
 
-def verify_vlans(shell, expected_ids):
-    existing = get_existing_vlans(shell)
-    present = [v for v in expected_ids if v in existing]
-    missing = [v for v in expected_ids if v not in existing]
-    return present, missing
+def apply_config(shell, commands, dry_run=False):
+    if dry_run:
+        log.info("Dry run — commands that would be sent:")
+        for c in commands:
+            log.info("  %s", c)
+        return True
+
+    for cmd in commands:
+        out = send(shell, cmd, wait=0.6)
+        log.debug(">>> %s\n%s", cmd, out.strip())
+        if "Invalid input" in out or "% Error" in out or "% Ambiguous" in out:
+            log.error("Command rejected: %r\nDevice output: %s", cmd, out.strip())
+            return False
+    return True
 
 
-def build_vlan_list(args):
-    vlans = []
-    if args.vlans:
-        try:
-            with open(args.vlans) as fh:
-                vlans = json.load(fh)
-        except (OSError, json.JSONDecodeError) as exc:
-            log.error("Failed to read %s: %s", args.vlans, exc)
-            sys.exit(1)
-    if args.vlan_ids:
-        names = args.vlan_names or []
-        for i, vid in enumerate(args.vlan_ids):
-            vlans.append({"id": vid, "name": names[i] if i < len(names) else f"VLAN{vid:04d}"})
-    if not vlans:
-        log.error("No VLANs specified. Use --vlans FILE or --vlan-id/--vlan-name.")
-        sys.exit(1)
-    for entry in vlans:
-        if not (1 <= entry["id"] <= 4094):
-            log.error("Invalid VLAN ID %d (must be 1-4094)", entry["id"])
-            sys.exit(1)
-    return vlans
+def verify_sync(shell, timeout, poll=5):
+    log.info("Waiting up to %ds for NTP synchronization...", timeout)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        out = send(shell, "show ntp status", wait=1.0)
+        if "Clock is synchronized" in out:
+            log.info("Clock is synchronized.")
+            return True
+        remaining = int(deadline - time.time())
+        log.debug("Not yet synchronized (%ds remaining).", remaining)
+        time.sleep(poll)
+
+    assoc = send(shell, "show ntp associations", wait=1.0)
+    log.warning("NTP not synchronized within timeout.\n%s", assoc.strip())
+    return False
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Provision or remove VLANs on a Cisco IOS/IOS-XE switch via SSH",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+    p = argparse.ArgumentParser(
+        description="Deploy NTP configuration to a Cisco IOS/IOS-XE device"
     )
-    parser.add_argument("--host", required=True, help="Device hostname or IP address")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--username", required=True, help="SSH username")
-    parser.add_argument("--password", help="SSH password (prompted if omitted)")
-    parser.add_argument("--vlans", metavar="FILE", help="JSON file with VLAN definitions")
-    parser.add_argument(
-        "--vlan-id", dest="vlan_ids", type=int, action="append", metavar="ID",
-        help="VLAN ID to provision (repeatable)",
+    p.add_argument("--host", required=True, help="Device IP or hostname")
+    p.add_argument("--port", type=int, default=22, help="SSH port (default 22)")
+    p.add_argument("--user", required=True, help="SSH username")
+    p.add_argument("--password", required=True, help="SSH password")
+    p.add_argument("--enable-password", help="Enable-mode password (if required)")
+    p.add_argument(
+        "--ntp-servers",
+        nargs="+",
+        required=True,
+        metavar="IP",
+        help="One or more NTP server IPs to configure",
     )
-    parser.add_argument(
-        "--vlan-name", dest="vlan_names", action="append", metavar="NAME",
-        help="VLAN name matching position of --vlan-id",
+    p.add_argument("--auth-key", metavar="ID", help="NTP authentication key ID")
+    p.add_argument("--auth-secret", metavar="SECRET", help="NTP MD5 key secret")
+    p.add_argument(
+        "--verify-timeout",
+        type=int,
+        default=60,
+        metavar="SECS",
+        help="Seconds to wait for sync confirmation (default 60)",
     )
-    parser.add_argument("--remove", action="store_true", help="Remove VLANs instead of adding")
-    parser.add_argument("--no-save", action="store_true", help="Skip 'write memory' after changes")
-    parser.add_argument("--timeout", type=int, default=15, help="SSH connection timeout (default: 15)")
-    return parser.parse_args()
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print commands without applying them",
+    )
+    p.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Skip post-deploy sync verification",
+    )
+    p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    password = args.password or getpass.getpass(f"Password for {args.username}@{args.host}: ")
-    vlans = build_vlan_list(args)
 
-    log.info("Connecting to %s:%d as %s", args.host, args.port, args.username)
-    try:
-        client = connect(args.host, args.port, args.username, password, args.timeout)
-    except paramiko.AuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.host)
+    if args.debug:
+        log.setLevel(logging.DEBUG)
+
+    if bool(args.auth_key) != bool(args.auth_secret):
+        log.error("--auth-key and --auth-secret must be provided together")
         sys.exit(1)
+
+    log.info("Connecting to %s:%d", args.host, args.port)
+    try:
+        client = ssh_connect(args.host, args.port, args.user, args.password)
     except Exception as exc:
-        log.error("Connection error: %s", exc)
+        log.error("Connection failed: %s", exc)
         sys.exit(1)
 
     try:
-        shell = open_shell(client)
-        existing = get_existing_vlans(shell)
-        log.info("Existing VLANs: %s", sorted(existing.keys()))
+        shell = client.invoke_shell()
+        time.sleep(1)
+        shell.recv(4096)
 
-        if args.remove:
-            protected = [v["id"] for v in vlans if v["id"] in (1,)]
-            if protected:
-                log.error("Refusing to remove reserved VLAN(s): %s", protected)
-                sys.exit(1)
-            removed = remove_vlans(shell, vlans)
-            log.info("Removed %d VLAN(s): %s", len(removed), removed)
-        else:
-            provisioned = provision_vlans(shell, vlans)
-            present, missing = verify_vlans(shell, provisioned)
-            log.info("Verified active: %s", present)
-            if missing:
-                log.warning("Not found after provisioning (may need 'vtp mode transparent'): %s", missing)
+        if args.enable_password:
+            enter_enable(shell, args.enable_password)
 
-        if not args.no_save:
-            save_config(shell)
+        send(shell, "terminal length 0", wait=0.3)
+
+        commands = build_commands(args.ntp_servers, args.auth_key, args.auth_secret)
+        log.info("Deploying NTP servers: %s", ", ".join(args.ntp_servers))
+
+        if not apply_config(shell, commands, dry_run=args.dry_run):
+            log.error("Deployment failed — check device output above.")
+            sys.exit(1)
+
+        if args.dry_run:
+            sys.exit(0)
+
+        log.info("Configuration saved.")
+
+        if not args.no_verify:
+            synced = verify_sync(shell, args.verify_timeout)
+            sys.exit(0 if synced else 2)
+
     except KeyboardInterrupt:
-        log.info("Interrupted by user.")
+        log.info("Interrupted.")
         sys.exit(130)
+    except Exception as exc:
+        log.error("Unexpected error: %s", exc)
+        sys.exit(1)
     finally:
         client.close()
-        log.info("Disconnected from %s", args.host)
-```
