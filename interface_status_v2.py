@@ -1,158 +1,217 @@
-```python
-"""
-OSPF Neighbor Status Checker
+The script is ready — here's the content (output only, no fences):
 
-Retrieves and displays OSPF neighbor status from network devices for monitoring
-routing adjacency health and troubleshooting neighbor state issues.
+---
+
+```
+"""
+interface_error_monitor.py - Network Interface Error Counter Monitor
+
+Purpose:
+    Connects to a network device via SSH and retrieves interface error
+    statistics (CRC errors, input errors, output drops, interface resets).
+    Flags interfaces exceeding a configurable threshold, useful for proactive
+    fault detection before links fail completely.
 
 Usage:
-    python ospf_neighbor_status.py -d 192.168.1.1 -u admin -p password
-    python ospf_neighbor_status.py -d 192.168.1.1 -u admin -p password --filter-state FULL
+    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret
+    python interface_error_monitor.py -d 192.168.1.1 -u admin --key ~/.ssh/id_rsa
+    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret --threshold 50 --json
 
 Prerequisites:
-    - paramiko (pip install paramiko)
-    - Network device with SSH enabled
-    - User credentials with appropriate privilege level
-    - OSPF configured on the device
+    pip install paramiko
+    Target device must support "show interfaces" (Cisco IOS/IOS-XE/NX-OS).
 """
 
 import argparse
+import getpass
+import json
 import logging
+import re
 import sys
-from paramiko import AutoAddPolicy, SSHClient
-from paramiko.ssh_exception import (
-    AuthenticationException,
-    NoValidConnectionsError,
-    SSHException,
-)
+import time
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+import paramiko
+
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-def connect_device(host, username, password, timeout=10):
-    """Establish SSH connection to network device."""
-    try:
-        client = SSHClient()
-        client.set_missing_host_key_policy(AutoAddPolicy())
-        client.connect(
-            host,
-            username=username,
-            password=password,
-            timeout=timeout,
-            look_for_keys=False,
-            allow_agent=False
-        )
-        logger.info(f"Connected to {host}")
-        return client
-    except AuthenticationException:
-        logger.error(f"Authentication failed for {host}")
-        sys.exit(1)
-    except (NoValidConnectionsError, SSHException) as e:
-        logger.error(f"Connection error to {host}: {e}")
-        sys.exit(1)
+_IFACE_HEADER = re.compile(
+    r"^(\S+)\s+is\s+(up|down|administratively down)", re.MULTILINE
+)
+_INPUT_ERRORS = re.compile(r"(\d+)\s+input errors")
+_CRC_ERRORS = re.compile(r"(\d+)\s+input errors.*?(\d+)\s+CRC", re.DOTALL)
+_OUTPUT_DROPS = re.compile(r"(\d+)\s+output drops")
+_RESETS = re.compile(r"(\d+)\s+interface resets")
 
 
-def get_ospf_neighbors(client):
-    """Retrieve OSPF neighbor information from device."""
-    try:
-        stdin, stdout, stderr = client.exec_command(
-            'show ip ospf neighbor',
-            timeout=10
-        )
-        return stdout.read().decode('utf-8')
-    except SSHException as e:
-        logger.error(f"Error executing command: {e}")
-        sys.exit(1)
+def connect(host, port, username, password=None, key_file=None, timeout=30):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    kwargs = {
+        "hostname": host,
+        "port": port,
+        "username": username,
+        "timeout": timeout,
+        "look_for_keys": bool(key_file),
+        "allow_agent": False,
+    }
+    if key_file:
+        kwargs["key_filename"] = key_file
+    elif password:
+        kwargs["password"] = password
+    else:
+        raise ValueError("Provide either --password or --key")
+    client.connect(**kwargs)
+    return client
 
 
-def parse_ospf_output(output, filter_state=None):
-    """Parse OSPF neighbor output into structured data."""
-    neighbors = []
-    for line in output.split('\n'):
-        line = line.strip()
-        if not line or 'Neighbor' in line or '---' in line:
+def run_command(client, command, wait=3.0):
+    shell = client.invoke_shell()
+    shell.settimeout(15)
+    time.sleep(0.5)
+    if shell.recv_ready():
+        shell.recv(4096)
+    shell.send("terminal length 0\n")
+    time.sleep(0.5)
+    if shell.recv_ready():
+        shell.recv(4096)
+    shell.send(command + "\n")
+    time.sleep(wait)
+    output = ""
+    while shell.recv_ready():
+        output += shell.recv(65535).decode("utf-8", errors="replace")
+        time.sleep(0.2)
+    shell.close()
+    return output
+
+
+def parse_error_counters(raw):
+    blocks = re.split(r"\n(?=\S+\s+is\s+(?:up|down|administratively down))", raw)
+    results = []
+    for block in blocks:
+        m = _IFACE_HEADER.match(block)
+        if not m:
             continue
+        name, state = m.group(1), m.group(2)
 
-        parts = line.split()
-        if len(parts) >= 5:
-            neighbor = {
-                'neighbor_id': parts[0],
-                'priority': parts[1],
-                'state': parts[2],
-                'dead_time': parts[3],
-                'interface': parts[4]
-            }
-            if filter_state is None or neighbor['state'] == filter_state:
-                neighbors.append(neighbor)
+        input_errors = 0
+        ie_m = _INPUT_ERRORS.search(block)
+        if ie_m:
+            input_errors = int(ie_m.group(1))
+        crc = 0
+        crc_m = _CRC_ERRORS.search(block)
+        if crc_m:
+            input_errors = int(crc_m.group(1))
+            crc = int(crc_m.group(2))
+        drops_m = _OUTPUT_DROPS.search(block)
+        output_drops = int(drops_m.group(1)) if drops_m else 0
+        reset_m = _RESETS.search(block)
+        resets = int(reset_m.group(1)) if reset_m else 0
 
-    return neighbors
+        results.append({
+            "interface": name,
+            "state": state,
+            "input_errors": input_errors,
+            "crc_errors": crc,
+            "output_drops": output_drops,
+            "resets": resets,
+        })
+    return results
 
 
-def display_neighbors(neighbors):
-    """Display OSPF neighbors in formatted table."""
-    if not neighbors:
-        print("No OSPF neighbors found.")
-        return
-
-    header = (
-        f"{'Neighbor ID':<15} {'Priority':<10} "
-        f"{'State':<12} {'Dead Time':<12} {'Interface':<15}"
+def exceeds_threshold(iface, threshold):
+    return any(
+        iface[k] >= threshold
+        for k in ("input_errors", "crc_errors", "output_drops", "resets")
     )
-    print(header)
-    print('-' * len(header))
 
-    for nb in neighbors:
+
+def print_table(interfaces, threshold):
+    hdr = f"{'Interface':<32} {'State':<24} {'InErr':>7} {'CRC':>7} {'OutDrop':>8} {'Resets':>7}"
+    print(hdr)
+    print("-" * len(hdr))
+    for iface in interfaces:
+        flag = " !" if exceeds_threshold(iface, threshold) else ""
         print(
-            f"{nb['neighbor_id']:<15} {nb['priority']:<10} "
-            f"{nb['state']:<12} {nb['dead_time']:<12} "
-            f"{nb['interface']:<15}"
+            f"{iface['interface']:<32} {iface['state']:<24}"
+            f" {iface['input_errors']:>7} {iface['crc_errors']:>7}"
+            f" {iface['output_drops']:>8} {iface['resets']:>7}{flag}"
         )
 
-    print(f"\nTotal neighbors: {len(neighbors)}")
-    state_counts = {}
-    for nb in neighbors:
-        state = nb['state']
-        state_counts[state] = state_counts.get(state, 0) + 1
 
-    for state, count in sorted(state_counts.items()):
-        symbol = "✓" if state == "FULL" else "✗"
-        print(f"  {symbol} {state}: {count}")
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='Check OSPF neighbor status on network devices'
+def build_parser():
+    p = argparse.ArgumentParser(description="Report interface error counters on a network device")
+    p.add_argument("-d", "--device", required=True, help="Device hostname or IP")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
+    p.add_argument("--key", dest="key_file", default=None, help="SSH private key path")
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument(
+        "--threshold", type=int, default=10,
+        help="Error count that flags an interface (default: 10)",
     )
-    parser.add_argument('-d', '--device', required=True,
-                        help='Device IP or hostname')
-    parser.add_argument('-u', '--username', required=True,
-                        help='SSH username')
-    parser.add_argument('-p', '--password', required=True,
-                        help='SSH password')
-    parser.add_argument('--filter-state',
-                        help='Filter by neighbor state (e.g., FULL)')
-    parser.add_argument('--timeout', type=int, default=10,
-                        help='SSH timeout in seconds')
+    p.add_argument("--json", action="store_true", dest="as_json", help="Emit JSON instead of table")
+    p.add_argument("--timeout", type=int, default=30, help="Connection timeout in seconds")
+    return p
 
-    args = parser.parse_args()
 
-    logger.info(f"Checking OSPF neighbors on {args.device}")
+if __name__ == "__main__":
+    args = build_parser().parse_args()
 
-    client = connect_device(args.device, args.username, args.password,
-                           args.timeout)
+    if not args.key_file and not args.password:
+        args.password = getpass.getpass(f"Password for {args.username}@{args.device}: ")
+
+    logger.info("Connecting to %s:%d", args.device, args.port)
     try:
-        output = get_ospf_neighbors(client)
-        neighbors = parse_ospf_output(output, args.filter_state)
-        display_neighbors(neighbors)
+        client = connect(
+            host=args.device,
+            port=args.port,
+            username=args.username,
+            password=args.password,
+            key_file=args.key_file,
+            timeout=args.timeout,
+        )
+    except paramiko.AuthenticationException:
+        logger.error("Authentication failed for %s@%s", args.username, args.device)
+        sys.exit(1)
+    except (paramiko.SSHException, OSError) as exc:
+        logger.error("Connection failed: %s", exc)
+        sys.exit(1)
+
+    try:
+        logger.info("Running 'show interfaces'...")
+        raw = run_command(client, "show interfaces", wait=3.0)
     finally:
         client.close()
-        logger.info("Disconnected")
 
+    interfaces = parse_error_counters(raw)
+    if not interfaces:
+        logger.error("No interface data parsed — verify device output format")
+        sys.exit(1)
 
-if __name__ == '__main__':
-    main()
+    if args.as_json:
+        print(json.dumps(interfaces, indent=2))
+        sys.exit(0)
+
+    flagged = [i for i in interfaces if exceeds_threshold(i, args.threshold)]
+    print(f"\nInterface Error Report — {args.device}")
+    print(f"Threshold: {args.threshold}  |  Total interfaces: {len(interfaces)}  |  Flagged: {len(flagged)}\n")
+    print_table(interfaces, args.threshold)
+
+    if flagged:
+        print(f"\nFlagged ({len(flagged)}):")
+        for iface in flagged:
+            issues = ", ".join(
+                f"{label}={iface[key]}"
+                for label, key in [
+                    ("CRC", "crc_errors"),
+                    ("InErr", "input_errors"),
+                    ("OutDrop", "output_drops"),
+                    ("Resets", "resets"),
+                ]
+                if iface[key] >= args.threshold
+            )
+            print(f"  {iface['interface']} [{iface['state']}]: {issues}")
+    else:
+        print("\nNo interfaces exceeded the error threshold.")
 ```
