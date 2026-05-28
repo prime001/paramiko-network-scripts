@@ -1,27 +1,33 @@
-```python
 #!/usr/bin/env python3
 """
-Device Reachability Tester - Tests SSH connectivity to network devices.
+Device Configuration Template Validator
 
-Tests SSH reachability to devices in inventory and generates a connectivity report.
-Useful for health checks and identifying unreachable or slow devices.
+Validates that a device's running configuration matches an expected configuration
+template. Useful for compliance checking and configuration auditing.
+
+Purpose:
+    - Compare device running config against a template
+    - Identify missing or mismatched configuration lines
+    - Support partial line matching and variable substitution
+    - Generate compliance reports
 
 Usage:
-    python device_reachability_tester.py -c credentials.json -i devices.json -o report.txt
-    python device_reachability_tester.py -c creds.json -i devices.json --timeout 10
+    python config_validator.py -d 192.168.1.1 -u admin -p password -t template.cfg
+    python config_validator.py -d device.example.com -u admin -k ~/.ssh/id_rsa -t compliance.txt --strict
 
 Prerequisites:
-    - paramiko library: pip install paramiko
-    - Credentials file (JSON format) with SSH credentials
-    - Device inventory file (JSON or text format)
+    - Device must be accessible via SSH
+    - paramiko library installed: pip install paramiko
+    - Template file with expected configuration (one line per rule)
+    - Valid SSH credentials or key-based auth
 """
 
-import json
 import argparse
 import logging
 import sys
-import time
 import paramiko
+from pathlib import Path
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,179 +36,176 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def load_credentials(cred_file):
-    """Load SSH credentials from JSON file."""
-    try:
-        with open(cred_file, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        logger.error(f"Credentials file not found: {cred_file}")
-        sys.exit(1)
-    except json.JSONDecodeError:
-        logger.error(f"Invalid JSON in credentials file: {cred_file}")
-        sys.exit(1)
+class ConfigValidator:
+    """Validates device config against a template."""
 
+    def __init__(self, host, username, password=None, key_path=None, port=22):
+        """Initialize SSH client."""
+        self.host = host
+        self.username = username
+        self.password = password
+        self.key_path = key_path
+        self.port = port
+        self.client = paramiko.SSHClient()
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-def load_devices(device_file):
-    """Load device list from JSON or text file."""
-    try:
-        with open(device_file, 'r') as f:
-            content = f.read()
-            if device_file.endswith('.json'):
-                return json.loads(content)
-            return [line.strip() for line in content.split('\n') if line.strip()]
-    except FileNotFoundError:
-        logger.error(f"Device file not found: {device_file}")
-        sys.exit(1)
-
-
-def test_device_reachability(host, username, password, timeout=5, port=22):
-    """Test SSH reachability to a single device."""
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-    start_time = time.time()
-    try:
-        client.connect(
-            host,
-            port=port,
-            username=username,
-            password=password,
-            timeout=timeout,
-            look_for_keys=False,
-            allow_agent=False
-        )
-        response_time = time.time() - start_time
-        return True, response_time, None
-    except paramiko.AuthenticationException as e:
-        return False, None, f"Authentication failed: {str(e)}"
-    except paramiko.SSHException as e:
-        return False, None, f"SSH error: {str(e)}"
-    except Exception as e:
-        return False, None, f"Connection failed: {str(e)}"
-    finally:
+    def connect(self):
+        """Establish SSH connection."""
         try:
-            client.close()
-        except Exception:
-            pass
+            if self.key_path:
+                self.client.connect(
+                    self.host,
+                    port=self.port,
+                    username=self.username,
+                    key_filename=self.key_path,
+                    timeout=10
+                )
+            else:
+                self.client.connect(
+                    self.host,
+                    port=self.port,
+                    username=self.username,
+                    password=self.password,
+                    timeout=10
+                )
+            logger.info(f"Connected to {self.host}")
+            return True
+        except paramiko.AuthenticationException as e:
+            logger.error(f"Authentication failed: {e}")
+            return False
+        except paramiko.SSHException as e:
+            logger.error(f"SSH error: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Connection error: {e}")
+            return False
 
+    def get_running_config(self, command="show running-config"):
+        """Retrieve running configuration from device."""
+        try:
+            stdin, stdout, stderr = self.client.exec_command(command)
+            config = stdout.read().decode('utf-8', errors='ignore')
+            if stderr.read():
+                logger.warning("Errors during config retrieval")
+            logger.info(f"Retrieved config ({len(config)} bytes)")
+            return config
+        except Exception as e:
+            logger.error(f"Failed to get running config: {e}")
+            return None
 
-def run_reachability_test(devices, credentials, timeout=5, port=22):
-    """Test reachability for all devices."""
-    results = []
-    username = credentials.get('username')
-    password = credentials.get('password')
+    def validate_config(self, running_config, template_lines, strict=False):
+        """Validate running config against template rules."""
+        results = {
+            'matched': [],
+            'missing': []
+        }
 
-    if not username or not password:
-        logger.error("Username or password not found in credentials")
-        sys.exit(1)
+        # Normalize config for comparison
+        config_lines = [line.strip() for line in running_config.split('\n')]
+        config_lower = [line.lower() for line in config_lines]
 
-    logger.info(f"Testing reachability for {len(devices)} device(s)...")
+        for template_line in template_lines:
+            template_line = template_line.strip()
+            if not template_line or template_line.startswith('#'):
+                continue
 
-    for device in devices:
-        host = device if isinstance(device, str) else device.get('host')
-        dev_port = device.get('port', port) if isinstance(device, dict) else port
+            template_lower = template_line.lower()
 
-        logger.info(f"Testing {host}...")
-        reachable, response_time, error = test_device_reachability(
-            host, username, password, timeout, dev_port
-        )
+            # Check for exact match (case-insensitive)
+            if template_lower in config_lower:
+                results['matched'].append(template_line)
+                logger.debug(f"✓ Found: {template_line}")
+            # Check for partial match (substring) in non-strict mode
+            elif not strict and any(template_lower in cl for cl in config_lower):
+                results['matched'].append(template_line)
+                logger.debug(f"✓ Found (partial): {template_line}")
+            else:
+                results['missing'].append(template_line)
+                logger.warning(f"✗ Missing: {template_line}")
 
-        results.append({
-            'host': host,
-            'port': dev_port,
-            'reachable': reachable,
-            'response_time': response_time,
-            'error': error
-        })
+        return results
 
-    return results
+    def close(self):
+        """Close SSH connection."""
+        self.client.close()
+        logger.info("Connection closed")
 
+    def print_report(self, results):
+        """Print validation report."""
+        total = len(results['matched']) + len(results['missing'])
+        match_pct = (len(results['matched']) / total * 100) if total > 0 else 0
 
-def generate_report(results):
-    """Generate a formatted reachability report."""
-    reachable_count = sum(1 for r in results if r['reachable'])
-    unreachable_count = len(results) - reachable_count
+        print(f"\n{'='*60}")
+        print(f"Configuration Validation Report: {self.host}")
+        print(f"{'='*60}")
+        print(f"Matched:  {len(results['matched'])}/{total} ({match_pct:.1f}%)")
+        print(f"Missing:  {len(results['missing'])}/{total}")
 
-    report_lines = [
-        "=" * 70,
-        "Device Reachability Report",
-        "=" * 70,
-        f"Total Devices: {len(results)}",
-        f"Reachable: {reachable_count}",
-        f"Unreachable: {unreachable_count}",
-        "=" * 70,
-        ""
-    ]
+        if results['missing']:
+            print(f"\n{'Missing Configuration Lines:'}")
+            print("-" * 60)
+            for line in results['missing']:
+                print(f"  ✗ {line}")
 
-    for result in results:
-        status = "✓ REACHABLE" if result['reachable'] else "✗ UNREACHABLE"
-        host_info = f"{result['host']}:{result['port']}"
-
-        if result['reachable']:
-            response = f" ({result['response_time']:.2f}s)"
-            report_lines.append(f"{status:20} {host_info:30} {response}")
-        else:
-            report_lines.append(f"{status:20} {host_info:30}")
-            if result['error']:
-                report_lines.append(f"  └─ {result['error']}")
-
-        report_lines.append("")
-
-    return "\n".join(report_lines)
+        print(f"{'='*60}\n")
 
 
 def main():
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Test SSH reachability to network devices"
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument(
-        '-c', '--credentials',
-        required=True,
-        help='Path to credentials JSON file'
-    )
-    parser.add_argument(
-        '-i', '--inventory',
-        required=True,
-        help='Path to device inventory file (JSON or text)'
-    )
-    parser.add_argument(
-        '-o', '--output',
-        help='Path to save report (optional)'
-    )
-    parser.add_argument(
-        '-t', '--timeout',
-        type=int,
-        default=5,
-        help='SSH connection timeout in seconds (default: 5)'
-    )
-    parser.add_argument(
-        '-p', '--port',
-        type=int,
-        default=22,
-        help='SSH port (default: 22)'
-    )
+    parser.add_argument('-d', '--device', required=True, help='Device IP or hostname')
+    parser.add_argument('-u', '--username', required=True, help='SSH username')
+    parser.add_argument('-p', '--password', help='SSH password (use -k for key auth)')
+    parser.add_argument('-k', '--key', help='Path to SSH private key')
+    parser.add_argument('-t', '--template', required=True, help='Template config file path')
+    parser.add_argument('--port', type=int, default=22, help='SSH port (default: 22)')
+    parser.add_argument('--strict', action='store_true', help='Require exact line matches')
+    parser.add_argument('-c', '--command', default='show running-config',
+                        help='Command to retrieve config (default: show running-config)')
+    parser.add_argument('--verbose', action='store_true', help='Verbose output')
 
     args = parser.parse_args()
 
-    credentials = load_credentials(args.credentials)
-    devices = load_devices(args.inventory)
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
 
-    results = run_reachability_test(devices, credentials, args.timeout, args.port)
-    report = generate_report(results)
+    if not args.password and not args.key:
+        logger.error("Provide either password (-p) or key path (-k)")
+        return 1
 
-    print(report)
+    try:
+        template_path = Path(args.template)
+        template_lines = template_path.read_text().split('\n')
+        logger.info(f"Loaded template: {args.template} ({len(template_lines)} lines)")
+    except Exception as e:
+        logger.error(f"Failed to load template: {e}")
+        return 1
 
-    if args.output:
-        try:
-            with open(args.output, 'w') as f:
-                f.write(report)
-            logger.info(f"Report saved to {args.output}")
-        except IOError as e:
-            logger.error(f"Failed to write report: {e}")
-            sys.exit(1)
+    validator = ConfigValidator(
+        host=args.device,
+        username=args.username,
+        password=args.password,
+        key_path=args.key,
+        port=args.port
+    )
+
+    if not validator.connect():
+        return 1
+
+    running_config = validator.get_running_config(args.command)
+    if not running_config:
+        validator.close()
+        return 1
+
+    results = validator.validate_config(running_config, template_lines, args.strict)
+    validator.print_report(results)
+    validator.close()
+
+    return 0 if not results['missing'] else 1
 
 
-if __name__ == "__main__":
-    main()
-```
+if __name__ == '__main__':
+    sys.exit(main())
