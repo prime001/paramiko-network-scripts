@@ -1,74 +1,61 @@
-credential_rotation.py — Automated SSH credential rotation for network devices.
+```python
+"""
+SSH Public Key Deployer for Network Devices
 
-Purpose:
-    Connect to one or more network devices via SSH and rotate (change) a user
-    account password, then immediately verify the new credentials before
-    considering the rotation successful.  Supports Cisco IOS/IOS-XE
-    (username secret syntax + write memory) and a generic fallback for
-    Linux/Unix hosts (passwd flow).
+Deploys an SSH public key to Cisco IOS/IOS-XE devices using the
+ip ssh pubkey-chain mechanism, enabling key-based authentication for
+automation accounts and eliminating password prompts in pipelines.
 
 Usage:
-    # Single host — passwords prompted interactively
-    python credential_rotation.py --host 192.168.1.1 --username netops
-
-    # Single host — passwords supplied on CLI (CI/CD use)
-    python credential_rotation.py --host 192.168.1.1 --username netops \
-        --current-password OldP@ss1 --new-password NewP@ss2
-
-    # Multiple hosts from a file (one IP/hostname per line, # = comment)
-    python credential_rotation.py --hosts-file devices.txt \
-        --username netops --platform ios
+    python ssh_key_deployer.py -H 192.168.1.1 -u admin -p secret --key ~/.ssh/id_rsa.pub
+    python ssh_key_deployer.py -H hosts.txt -u netops -p secret --key ~/.ssh/id_rsa.pub --verify
 
 Prerequisites:
-    pip install paramiko
+    - pip install paramiko
+    - IOS 15.2+ or IOS-XE (ip ssh pubkey-chain support)
+    - SSH v2 enabled: ip ssh version 2
+    - Deploying account needs privilege 15 or config access
 """
 
 import argparse
-import getpass
 import logging
 import sys
 import time
+from pathlib import Path
 
 import paramiko
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
+
+# IOS limits key-string lines to 254 characters
+_IOS_KEY_CHUNK = 254
 
 
-def _shell_send(shell, command: str, delay: float = 1.0, buf: int = 65535) -> str:
-    shell.send(command + "\n")
-    time.sleep(delay)
-    chunks = []
+def _recv_until_stable(shell, pause=1.5):
+    time.sleep(pause)
+    buf = b""
     while shell.recv_ready():
-        chunks.append(shell.recv(buf).decode("utf-8", errors="replace"))
-    return "".join(chunks)
+        buf += shell.recv(8192)
+        time.sleep(0.1)
+    return buf.decode("utf-8", errors="ignore")
 
 
-def _rotate_ios(shell, username: str, new_password: str) -> bool:
-    out = _shell_send(shell, f"username {username} secret {new_password}", delay=1.5)
-    if "Invalid" in out or "Error" in out:
-        log.error("IOS rejected the password change command: %s", out.strip())
-        return False
-    _shell_send(shell, "write memory", delay=2.0)
-    log.debug("IOS write memory issued")
-    return True
+def _send(shell, cmd, pause=0.6):
+    shell.send(cmd + "\n")
+    return _recv_until_stable(shell, pause)
 
 
-def _rotate_generic(shell, new_password: str) -> bool:
-    """passwd-style rotation for Linux/Unix SSH targets."""
-    _shell_send(shell, "passwd", delay=1.0)
-    out1 = _shell_send(shell, new_password, delay=1.0)
-    out2 = _shell_send(shell, new_password, delay=1.0)
-    combined = (out1 + out2).lower()
-    return "successfully" in combined or "updated" in combined or "changed" in combined
+def deploy_key_to_device(host, port, username, password, public_key, timeout):
+    parts = public_key.strip().split()
+    if len(parts) < 2 or not parts[0].startswith("ssh-"):
+        raise ValueError("Not a valid SSH public key")
+    key_data = parts[1]
 
-
-def _verify_login(host: str, port: int, username: str, password: str) -> bool:
-    """Open a fresh SSH connection to confirm the new password works."""
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
@@ -77,155 +64,144 @@ def _verify_login(host: str, port: int, username: str, password: str) -> bool:
             port=port,
             username=username,
             password=password,
-            timeout=10,
-            allow_agent=False,
+            timeout=timeout,
             look_for_keys=False,
+            allow_agent=False,
         )
-        return True
+        shell = client.invoke_shell(width=200, height=200)
+        _recv_until_stable(shell, pause=2)
+
+        _send(shell, "terminal length 0")
+        _send(shell, "configure terminal")
+        _send(shell, "ip ssh pubkey-chain")
+        _send(shell, f"username {username}")
+        _send(shell, "key-string")
+
+        chunks = [key_data[i:i + _IOS_KEY_CHUNK] for i in range(0, len(key_data), _IOS_KEY_CHUNK)]
+        for chunk in chunks:
+            _send(shell, chunk, pause=0.3)
+
+        _send(shell, "exit")   # exit key-string
+        _send(shell, "exit")   # exit username
+        _send(shell, "exit")   # exit pubkey-chain
+        out = _send(shell, "end")
+
+        verify = _send(shell, "show running-config | section ip ssh pubkey", pause=2)
+        deployed = key_data[:32] in verify
+        return deployed, verify
+
     except paramiko.AuthenticationException:
-        return False
-    except Exception as exc:
-        log.warning("[%s] Verification connect error: %s", host, exc)
-        return False
+        raise RuntimeError("Authentication failed — check credentials")
+    except paramiko.SSHException as exc:
+        raise RuntimeError(f"SSH negotiation error: {exc}")
     finally:
         client.close()
 
 
-def rotate_device(
-    host: str,
-    port: int,
-    username: str,
-    current_password: str,
-    new_password: str,
-    platform: str,
-) -> bool:
-    """Rotate credentials on a single device; return True on verified success."""
+def verify_key_present(host, port, username, password, public_key, timeout):
+    parts = public_key.strip().split()
+    key_data = parts[1] if len(parts) >= 2 else ""
+
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        log.info("[%s] Connecting on port %d …", host, port)
         client.connect(
-            host,
-            port=port,
-            username=username,
-            password=current_password,
-            timeout=15,
-            allow_agent=False,
-            look_for_keys=False,
+            host, port=port, username=username, password=password,
+            timeout=timeout, look_for_keys=False, allow_agent=False,
         )
-        shell = client.invoke_shell(width=200, height=50)
-        time.sleep(1.2)
-        shell.recv(65535)  # drain banner / MOTD
-
-        if platform == "ios":
-            _shell_send(shell, "terminal length 0", delay=0.5)
-            ok = _rotate_ios(shell, username, new_password)
-        else:
-            ok = _rotate_generic(shell, new_password)
-
-        shell.close()
-
-        if not ok:
-            log.error("[%s] Rotation command reported failure", host)
-            return False
-
-    except paramiko.AuthenticationException:
-        log.error("[%s] Authentication failed with current credentials", host)
-        return False
-    except paramiko.SSHException as exc:
-        log.error("[%s] SSH error: %s", host, exc)
-        return False
-    except OSError as exc:
-        log.error("[%s] Network error: %s", host, exc)
-        return False
+        shell = client.invoke_shell(width=200)
+        _recv_until_stable(shell, pause=2)
+        _send(shell, "terminal length 0")
+        out = _send(shell, "show running-config | section ip ssh pubkey", pause=2)
+        return key_data[:32] in out
     finally:
         client.close()
 
-    log.info("[%s] Verifying new credentials …", host)
-    if _verify_login(host, port, username, new_password):
-        log.info("[%s] Rotation SUCCEEDED — new credentials verified", host)
-        return True
 
-    log.error(
-        "[%s] Verification FAILED — new credentials do not work; manual intervention required",
-        host,
-    )
-    return False
+def load_hosts(source):
+    p = Path(source).expanduser()
+    if p.exists():
+        return [l.strip() for l in p.read_text().splitlines()
+                if l.strip() and not l.startswith("#")]
+    return [source]
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Rotate SSH credentials on network devices and verify success.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+def main():
+    parser = argparse.ArgumentParser(
+        description="Deploy SSH public key to Cisco IOS/IOS-XE network devices"
     )
-    target = p.add_mutually_exclusive_group(required=True)
-    target.add_argument("--host", help="Single device IP or hostname")
-    target.add_argument(
-        "--hosts-file",
-        metavar="FILE",
-        help="Text file listing one host per line (# lines ignored)",
-    )
-    p.add_argument("--port", type=int, default=22, help="SSH port")
-    p.add_argument("--username", required=True, help="Account whose password is rotated")
-    p.add_argument(
-        "--current-password",
-        help="Current password (interactive prompt if omitted)",
-    )
-    p.add_argument(
-        "--new-password",
-        help="Replacement password (interactive prompt if omitted)",
-    )
-    p.add_argument(
-        "--platform",
-        choices=["ios", "generic"],
-        default="ios",
-        help="ios = Cisco IOS/IOS-XE (username secret); generic = Linux passwd flow",
-    )
-    p.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
-    return p
+    parser.add_argument("-H", "--host", required=True,
+                        help="Device IP/hostname, or path to file with one host per line")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument("--key", required=True,
+                        help="Path to SSH public key file (e.g. ~/.ssh/id_rsa.pub)")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds")
+    parser.add_argument("--verify", action="store_true",
+                        help="Only verify if key is present; do not deploy")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print what would happen without connecting")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show device output")
+    args = parser.parse_args()
+
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+
+    key_path = Path(args.key).expanduser()
+    if not key_path.exists():
+        logger.error("Key file not found: %s", key_path)
+        sys.exit(1)
+    public_key = key_path.read_text().strip()
+    if not public_key.split()[0].startswith("ssh-"):
+        logger.error("Not a valid SSH public key: %s", key_path)
+        sys.exit(1)
+
+    hosts = load_hosts(args.host)
+    action = "Verifying" if args.verify else "Deploying"
+    logger.info("%s key on %d host(s)", action, len(hosts))
+
+    if args.dry_run:
+        for h in hosts:
+            print(f"[DRY-RUN] Would {'verify' if args.verify else 'deploy'} key on {h}")
+        sys.exit(0)
+
+    ok_hosts, fail_hosts = [], []
+
+    for host in hosts:
+        try:
+            if args.verify:
+                present = verify_key_present(host, args.port, args.username,
+                                             args.password, public_key, args.timeout)
+                status = "KEY PRESENT" if present else "KEY MISSING"
+                logger.info("[%s] %s", status, host)
+                (ok_hosts if present else fail_hosts).append(host)
+            else:
+                deployed, detail = deploy_key_to_device(
+                    host, args.port, args.username, args.password, public_key, args.timeout
+                )
+                if deployed:
+                    logger.info("[OK] %s — key confirmed in running-config", host)
+                    ok_hosts.append(host)
+                else:
+                    logger.warning("[WARN] %s — deploy completed but key not found in config", host)
+                    fail_hosts.append(host)
+                if args.verbose:
+                    logger.debug("Device output:\n%s", detail)
+        except Exception as exc:
+            logger.error("[FAIL] %s — %s", host, exc)
+            fail_hosts.append(host)
+
+    print(f"\n{'─' * 40}")
+    print(f"Result: {len(ok_hosts)} OK / {len(fail_hosts)} failed / {len(hosts)} total")
+    for h in ok_hosts:
+        print(f"  ✓  {h}")
+    for h in fail_hosts:
+        print(f"  ✗  {h}")
+
+    sys.exit(1 if fail_hosts else 0)
 
 
 if __name__ == "__main__":
-    parser = build_parser()
-    args = parser.parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    current_pw = args.current_password or getpass.getpass("Current password: ")
-    new_pw = args.new_password or getpass.getpass("New password: ")
-
-    if args.host:
-        hosts = [args.host.strip()]
-    else:
-        try:
-            with open(args.hosts_file) as fh:
-                hosts = [
-                    line.strip()
-                    for line in fh
-                    if line.strip() and not line.startswith("#")
-                ]
-        except OSError as exc:
-            log.error("Cannot read hosts file: %s", exc)
-            sys.exit(1)
-
-    if not hosts:
-        log.error("No hosts to process")
-        sys.exit(1)
-
-    succeeded, failed = [], []
-    for host in hosts:
-        ok = rotate_device(
-            host=host,
-            port=args.port,
-            username=args.username,
-            current_password=current_pw,
-            new_password=new_pw,
-            platform=args.platform,
-        )
-        (succeeded if ok else failed).append(host)
-
-    print(f"\nRotation complete — {len(succeeded)} succeeded, {len(failed)} failed")
-    if failed:
-        print("Failed hosts:", ", ".join(failed))
-        sys.exit(1)
+    main()
+```
