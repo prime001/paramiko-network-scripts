@@ -1,201 +1,216 @@
-The user's instruction says "Output ONLY the script content" — I'll write a practical NTP configuration deployment script that's not covered by any existing scripts in the repo.
+NTP Synchronization Status Checker for network devices.
 
-"""
-ntp_deploy.py - NTP Server Configuration Deployment and Verification
-
-Deploy NTP server entries and optional MD5 authentication to Cisco IOS/IOS-XE
-devices over SSH. After applying the configuration, polls `show ntp status`
-until the clock is synchronized or the verification timeout expires.
+Connects via SSH (paramiko) to one or more Cisco IOS/IOS-XE devices and
+reports NTP synchronization state, stratum, reference clock, and offset.
+Useful for verifying time consistency across a fleet before/after maintenance,
+auditing NTP compliance, or troubleshooting clock-sensitive protocols (OSPF,
+BGP, certificates, logging correlation).
 
 Usage:
-    python ntp_deploy.py --host 192.168.1.1 --user admin --password secret \
-        --ntp-servers 10.0.0.1 10.0.0.2 [--auth-key 1 --auth-secret mykey] \
-        [--enable-password secret] [--verify-timeout 90] [--dry-run]
+    python ntp_sync_check.py -H 192.168.1.1 -u admin -p secret
+    python ntp_sync_check.py -H 192.168.1.1 192.168.1.2 -u admin --key ~/.ssh/id_rsa
+    python ntp_sync_check.py --hosts-file hosts.txt -u admin -p secret --timeout 15
 
 Prerequisites:
     pip install paramiko
-    SSH must be enabled on the target device (ip ssh version 2).
+
+Exit codes:
+    0  All devices synchronized
+    1  One or more devices not synchronized or unreachable
 """
 
 import argparse
 import logging
+import re
 import sys
-import time
+from dataclasses import dataclass
+from typing import Optional
 
 import paramiko
 
 logging.basicConfig(
-    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-def ssh_connect(host, port, username, password, timeout=10):
+@dataclass
+class NTPStatus:
+    host: str
+    synced: bool
+    stratum: Optional[int]
+    reference: Optional[str]
+    offset_ms: Optional[float]
+    error: Optional[str] = None
+
+
+def _run_command(client: paramiko.SSHClient, command: str, timeout: int) -> str:
+    _, stdout, stderr = client.exec_command(command, timeout=timeout)
+    out = stdout.read().decode(errors="replace")
+    err = stderr.read().decode(errors="replace")
+    if err.strip():
+        logger.debug("stderr: %s", err.strip())
+    return out
+
+
+def _parse_ntp_status(output: str) -> dict:
+    result = {"synced": False, "stratum": None, "reference": None, "offset_ms": None}
+
+    if re.search(r"Clock is synchronized", output, re.IGNORECASE):
+        result["synced"] = True
+
+    m = re.search(r"stratum\s+(\d+)", output, re.IGNORECASE)
+    if m:
+        result["stratum"] = int(m.group(1))
+
+    m = re.search(r"reference is\s+(\S+)", output, re.IGNORECASE)
+    if m:
+        result["reference"] = m.group(1)
+
+    # IOS reports offset in msec; IOS-XE may report in usec — normalize to ms
+    m = re.search(r"offset\s+is\s+([\-\d.]+)\s+(msec|usec)", output, re.IGNORECASE)
+    if m:
+        val = float(m.group(1))
+        result["offset_ms"] = val / 1000.0 if m.group(2).lower() == "usec" else val
+
+    return result
+
+
+def check_ntp(
+    host: str,
+    username: str,
+    password: Optional[str],
+    key_filename: Optional[str],
+    port: int,
+    timeout: int,
+) -> NTPStatus:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=host,
-        port=port,
-        username=username,
-        password=password,
-        timeout=timeout,
-        look_for_keys=False,
-        allow_agent=False,
-    )
-    return client
+    try:
+        connect_kwargs: dict = dict(
+            hostname=host,
+            port=port,
+            username=username,
+            timeout=timeout,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+        if key_filename:
+            connect_kwargs["key_filename"] = key_filename
+            connect_kwargs["look_for_keys"] = True
+        else:
+            connect_kwargs["password"] = password
+
+        client.connect(**connect_kwargs)
+        logger.debug("Connected to %s", host)
+
+        output = _run_command(client, "show ntp status", timeout)
+        parsed = _parse_ntp_status(output)
+
+        return NTPStatus(
+            host=host,
+            synced=parsed["synced"],
+            stratum=parsed["stratum"],
+            reference=parsed["reference"],
+            offset_ms=parsed["offset_ms"],
+        )
+    except paramiko.AuthenticationException:
+        return NTPStatus(host=host, synced=False, stratum=None, reference=None,
+                         offset_ms=None, error="Authentication failed")
+    except (paramiko.SSHException, OSError) as exc:
+        return NTPStatus(host=host, synced=False, stratum=None, reference=None,
+                         offset_ms=None, error=str(exc))
+    finally:
+        client.close()
 
 
-def send(shell, command, wait=0.5):
-    shell.send(command + "\n")
-    time.sleep(wait)
-    buf = ""
-    while shell.recv_ready():
-        buf += shell.recv(4096).decode("utf-8", errors="replace")
-    return buf
+def _load_hosts_file(path: str) -> list:
+    hosts = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                hosts.append(line)
+    return hosts
 
 
-def enter_enable(shell, enable_password):
-    out = send(shell, "enable", wait=0.5)
-    if "Password" in out and enable_password:
-        send(shell, enable_password, wait=0.5)
+def _print_results(results: list, verbose: bool) -> int:
+    width = max(len(r.host) for r in results)
+    failures = 0
+
+    for r in results:
+        if r.error:
+            status = f"ERROR     {r.error}"
+            failures += 1
+        elif r.synced:
+            parts = ["SYNCED"]
+            if r.stratum is not None:
+                parts.append(f"stratum={r.stratum}")
+            if r.reference:
+                parts.append(f"ref={r.reference}")
+            if r.offset_ms is not None:
+                parts.append(f"offset={r.offset_ms:+.2f}ms")
+            status = "  ".join(parts)
+        else:
+            status = "NOT SYNCED"
+            failures += 1
+
+        print(f"{r.host:<{width}}  {status}")
+
+    if verbose:
+        synced = len(results) - failures
+        print(f"\n{synced}/{len(results)} device(s) synchronized")
+
+    return failures
 
 
-def build_commands(ntp_servers, auth_key, auth_secret):
-    cmds = ["configure terminal"]
-    if auth_key and auth_secret:
-        cmds.append("ntp authenticate")
-        cmds.append(f"ntp authentication-key {auth_key} md5 {auth_secret}")
-        cmds.append(f"ntp trusted-key {auth_key}")
-        for srv in ntp_servers:
-            cmds.append(f"ntp server {srv} key {auth_key}")
-    else:
-        for srv in ntp_servers:
-            cmds.append(f"ntp server {srv}")
-    cmds += ["end", "write memory"]
-    return cmds
-
-
-def apply_config(shell, commands, dry_run=False):
-    if dry_run:
-        log.info("Dry run — commands that would be sent:")
-        for c in commands:
-            log.info("  %s", c)
-        return True
-
-    for cmd in commands:
-        out = send(shell, cmd, wait=0.6)
-        log.debug(">>> %s\n%s", cmd, out.strip())
-        if "Invalid input" in out or "% Error" in out or "% Ambiguous" in out:
-            log.error("Command rejected: %r\nDevice output: %s", cmd, out.strip())
-            return False
-    return True
-
-
-def verify_sync(shell, timeout, poll=5):
-    log.info("Waiting up to %ds for NTP synchronization...", timeout)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        out = send(shell, "show ntp status", wait=1.0)
-        if "Clock is synchronized" in out:
-            log.info("Clock is synchronized.")
-            return True
-        remaining = int(deadline - time.time())
-        log.debug("Not yet synchronized (%ds remaining).", remaining)
-        time.sleep(poll)
-
-    assoc = send(shell, "show ntp associations", wait=1.0)
-    log.warning("NTP not synchronized within timeout.\n%s", assoc.strip())
-    return False
-
-
-def parse_args():
+def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Deploy NTP configuration to a Cisco IOS/IOS-XE device"
+        description="Check NTP synchronization status on network devices via SSH.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--host", required=True, help="Device IP or hostname")
-    p.add_argument("--port", type=int, default=22, help="SSH port (default 22)")
-    p.add_argument("--user", required=True, help="SSH username")
-    p.add_argument("--password", required=True, help="SSH password")
-    p.add_argument("--enable-password", help="Enable-mode password (if required)")
-    p.add_argument(
-        "--ntp-servers",
-        nargs="+",
-        required=True,
-        metavar="IP",
-        help="One or more NTP server IPs to configure",
-    )
-    p.add_argument("--auth-key", metavar="ID", help="NTP authentication key ID")
-    p.add_argument("--auth-secret", metavar="SECRET", help="NTP MD5 key secret")
-    p.add_argument(
-        "--verify-timeout",
-        type=int,
-        default=60,
-        metavar="SECS",
-        help="Seconds to wait for sync confirmation (default 60)",
-    )
-    p.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print commands without applying them",
-    )
-    p.add_argument(
-        "--no-verify",
-        action="store_true",
-        help="Skip post-deploy sync verification",
-    )
+    host_group = p.add_mutually_exclusive_group(required=True)
+    host_group.add_argument("-H", "--hosts", nargs="+", metavar="HOST",
+                            help="One or more device IPs or hostnames")
+    host_group.add_argument("--hosts-file", metavar="FILE",
+                            help="File listing one host per line (# lines skipped)")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    cred = p.add_mutually_exclusive_group(required=True)
+    cred.add_argument("-p", "--password", help="SSH password")
+    cred.add_argument("--key", metavar="FILE", dest="key_filename",
+                      help="Path to SSH private key file")
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("--timeout", type=int, default=20,
+                   help="Connect/command timeout in seconds (default: 20)")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="Show summary line and extra info")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
-    return p.parse_args()
+    return p
 
 
 if __name__ == "__main__":
-    args = parse_args()
+    parser = _build_parser()
+    args = parser.parse_args()
 
-    if args.debug:
-        log.setLevel(logging.DEBUG)
+    log_level = logging.DEBUG if args.debug else (logging.INFO if args.verbose else logging.WARNING)
+    logging.getLogger().setLevel(log_level)
 
-    if bool(args.auth_key) != bool(args.auth_secret):
-        log.error("--auth-key and --auth-secret must be provided together")
-        sys.exit(1)
+    hosts = args.hosts if args.hosts else _load_hosts_file(args.hosts_file)
+    if not hosts:
+        parser.error("No hosts specified")
 
-    log.info("Connecting to %s:%d", args.host, args.port)
-    try:
-        client = ssh_connect(args.host, args.port, args.user, args.password)
-    except Exception as exc:
-        log.error("Connection failed: %s", exc)
-        sys.exit(1)
+    results = []
+    for host in hosts:
+        logger.info("Checking %s", host)
+        results.append(check_ntp(
+            host=host,
+            username=args.username,
+            password=args.password,
+            key_filename=args.key_filename,
+            port=args.port,
+            timeout=args.timeout,
+        ))
 
-    try:
-        shell = client.invoke_shell()
-        time.sleep(1)
-        shell.recv(4096)
-
-        if args.enable_password:
-            enter_enable(shell, args.enable_password)
-
-        send(shell, "terminal length 0", wait=0.3)
-
-        commands = build_commands(args.ntp_servers, args.auth_key, args.auth_secret)
-        log.info("Deploying NTP servers: %s", ", ".join(args.ntp_servers))
-
-        if not apply_config(shell, commands, dry_run=args.dry_run):
-            log.error("Deployment failed — check device output above.")
-            sys.exit(1)
-
-        if args.dry_run:
-            sys.exit(0)
-
-        log.info("Configuration saved.")
-
-        if not args.no_verify:
-            synced = verify_sync(shell, args.verify_timeout)
-            sys.exit(0 if synced else 2)
-
-    except KeyboardInterrupt:
-        log.info("Interrupted.")
-        sys.exit(130)
-    except Exception as exc:
-        log.error("Unexpected error: %s", exc)
-        sys.exit(1)
-    finally:
-        client.close()
+    failures = _print_results(results, args.verbose)
+    sys.exit(1 if failures else 0)
