@@ -1,42 +1,31 @@
-The script is ready — here's the content (output only, no fences, as requested):
+running_startup_diff.py — Detect unsaved configuration changes on network devices.
 
-```
-"""
-config_compliance.py - Network device configuration compliance auditor.
-...
-```
+Connects via SSH (paramiko), fetches both 'show running-config' and
+'show startup-config', then produces a unified diff. Useful for change
+auditing, pre-maintenance checks, and cron-based drift detection.
 
-Since the write was blocked, here is the complete script content to copy:
-
----
-
-"""
-config_compliance.py - Network device configuration compliance auditor.
-
-Fetches the running configuration from a device via SSH and compares it against
-a local golden/baseline config file. Reports lines that are required but missing
-from the device and lines present on the device but absent from the baseline.
-
-Usage:
-    python config_compliance.py -H 192.168.1.1 -u admin -p secret \
-        --baseline golden.cfg
-
-    python config_compliance.py -H 192.168.1.1 -u admin --key ~/.ssh/id_rsa \
-        --baseline baseline.cfg --output report.txt --missing-only
+Exit codes:
+    0 — configs match (no unsaved changes)
+    1 — connection or authentication error
+    2 — diff exists (unsaved changes found)
 
 Prerequisites:
     pip install paramiko
 
-Exit codes:
-    0 = fully compliant (running config matches baseline)
-    1 = non-compliant or error
+Usage:
+    python running_startup_diff.py -H 192.168.1.1 -u admin -p secret
+    python running_startup_diff.py -H 192.168.1.1 -u admin --key ~/.ssh/id_rsa
+    python running_startup_diff.py -H 192.168.1.1 -u admin -p secret \
+        --context 5 --output /tmp/drift.txt --save-on-diff
 """
 
 import argparse
+import difflib
+import getpass
 import logging
 import sys
 import time
-from pathlib import Path
+from typing import List, Optional
 
 import paramiko
 
@@ -47,7 +36,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def connect(host, port, username, password=None, key_path=None, timeout=30):
+def ssh_connect(
+    host: str,
+    username: str,
+    password: Optional[str] = None,
+    key_file: Optional[str] = None,
+    port: int = 22,
+    timeout: int = 30,
+) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     kwargs = {
@@ -58,187 +54,161 @@ def connect(host, port, username, password=None, key_path=None, timeout=30):
         "look_for_keys": False,
         "allow_agent": False,
     }
-    if key_path:
-        kwargs["key_filename"] = key_path
+    if key_file:
+        kwargs["key_filename"] = key_file
     elif password:
         kwargs["password"] = password
-    else:
-        raise ValueError("Either --password or --key must be provided")
     client.connect(**kwargs)
     return client
 
 
-def fetch_running_config(client, command="show running-config", wait=3.0):
-    channel = client.invoke_shell(width=200, height=5000)
-    time.sleep(1.0)
-    channel.recv(65535)  # drain banner/prompt
-
-    channel.send(command + "\n")
+def send_command(shell: paramiko.Channel, command: str, wait: float = 2.5) -> str:
+    shell.send(command + "\n")
     time.sleep(wait)
-
-    output = b""
-    while channel.recv_ready():
-        chunk = channel.recv(65535)
-        output += chunk
-        time.sleep(0.1)
-
-    channel.close()
-    return output.decode("utf-8", errors="replace")
+    output = []
+    while shell.recv_ready():
+        output.append(shell.recv(65535).decode("utf-8", errors="replace"))
+    return "".join(output)
 
 
-_NOISE_PREFIXES = (
-    "!",
-    "Building configuration",
-    "Current configuration",
-    "Last configuration change",
-    "NVRAM config",
-    "boot-start-marker",
-    "boot-end-marker",
-)
-
-
-def strip_noise(lines):
-    clean = []
-    for line in lines:
-        s = line.strip()
-        if not s:
+def fetch_config(shell: paramiko.Channel, command: str) -> List[str]:
+    raw = send_command(shell, command, wait=3.5)
+    lines = []
+    for line in raw.splitlines():
+        stripped = line.rstrip()
+        if stripped.endswith("#") or stripped.endswith(">"):
             continue
-        if any(s.startswith(p) for p in _NOISE_PREFIXES):
+        if stripped.strip() == command.strip():
             continue
-        if s.startswith("version ") and len(s.split()) == 2:
-            continue
-        clean.append(s)
-    return clean
+        lines.append(stripped)
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return lines
 
 
-def load_baseline(path):
-    text = Path(path).read_text(encoding="utf-8")
-    return strip_noise(text.splitlines())
-
-
-def compliance_check(running_lines, baseline_lines):
-    running_set = set(running_lines)
-    baseline_set = set(baseline_lines)
-    missing = sorted(baseline_set - running_set)
-    unexpected = sorted(running_set - baseline_set)
-    return missing, unexpected
-
-
-def format_report(host, missing, unexpected, n_running, n_baseline):
-    out = [
-        f"Compliance Report: {host}",
-        "=" * 60,
-        f"Baseline lines:      {n_baseline}",
-        f"Running config lines: {n_running}",
-        f"Missing (required, absent from device): {len(missing)}",
-        f"Unexpected (on device, not in baseline): {len(unexpected)}",
-        "",
-    ]
-    if missing:
-        out.append("--- MISSING REQUIRED LINES ---")
-        for line in missing:
-            out.append(f"  - {line}")
-        out.append("")
-    if unexpected:
-        out.append("--- UNEXPECTED LINES ---")
-        for line in unexpected:
-            out.append(f"  + {line}")
-        out.append("")
-    if not missing and not unexpected:
-        out.append("RESULT: COMPLIANT — running config matches baseline exactly.")
-    else:
-        out.append("RESULT: NON-COMPLIANT")
-    return "\n".join(out)
-
-
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Audit device running config compliance against a golden baseline."
+def build_diff(
+    running: List[str], startup: List[str], context: int = 3
+) -> List[str]:
+    return list(
+        difflib.unified_diff(
+            startup,
+            running,
+            fromfile="startup-config",
+            tofile="running-config",
+            lineterm="",
+            n=context,
+        )
     )
-    p.add_argument("-H", "--host", required=True, help="Device IP or hostname")
-    p.add_argument("-P", "--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", help="SSH password")
-    p.add_argument("-k", "--key", help="Path to SSH private key file")
-    p.add_argument("-b", "--baseline", required=True, help="Path to baseline config file")
-    p.add_argument(
-        "-c", "--command",
-        default="show running-config",
-        help="Command to retrieve running config (default: 'show running-config')",
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Diff running-config vs startup-config to detect unsaved changes"
     )
-    p.add_argument("-o", "--output", help="Write report to file instead of stdout")
-    p.add_argument(
-        "--wait", type=float, default=3.0,
-        help="Seconds to wait for device output (default: 3.0)",
+    parser.add_argument("-H", "--host", required=True, help="Device hostname or IP")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    parser.add_argument("--key", metavar="FILE", help="SSH private key path")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument(
+        "--timeout", type=int, default=30, help="Connection timeout in seconds"
     )
-    p.add_argument(
-        "--missing-only", action="store_true",
-        help="Report only missing lines; suppress unexpected-line findings",
+    parser.add_argument(
+        "--context",
+        type=int,
+        default=3,
+        help="Lines of context around each diff hunk (default: 3)",
     )
-    p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    return p.parse_args()
+    parser.add_argument(
+        "--output", metavar="FILE", help="Write diff to file instead of stdout"
+    )
+    parser.add_argument(
+        "--save-on-diff",
+        action="store_true",
+        help="Issue 'write memory' when unsaved changes are found",
+    )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Suppress informational messages; rely on exit code",
+    )
+    args = parser.parse_args()
 
+    if not args.key and not args.password:
+        args.password = getpass.getpass(
+            f"Password for {args.username}@{args.host}: "
+        )
 
-def main():
-    args = parse_args()
+    if args.quiet:
+        logger.setLevel(logging.WARNING)
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    if not args.password and not args.key:
-        logger.error("Provide --password or --key for authentication")
-        sys.exit(1)
-
-    baseline_path = Path(args.baseline)
-    if not baseline_path.exists():
-        logger.error("Baseline file not found: %s", args.baseline)
-        sys.exit(1)
-
-    logger.info("Loading baseline from %s", args.baseline)
-    baseline_lines = load_baseline(baseline_path)
-    logger.info("Baseline: %d significant lines", len(baseline_lines))
-
-    logger.info("Connecting to %s:%d as %s", args.host, args.port, args.username)
     try:
-        client = connect(
-            host=args.host,
-            port=args.port,
-            username=args.username,
+        logger.info("Connecting to %s:%d", args.host, args.port)
+        client = ssh_connect(
+            args.host,
+            args.username,
             password=args.password,
-            key_path=args.key,
+            key_file=args.key,
+            port=args.port,
+            timeout=args.timeout,
         )
     except paramiko.AuthenticationException:
         logger.error("Authentication failed for %s@%s", args.username, args.host)
-        sys.exit(1)
+        return 1
     except (paramiko.SSHException, OSError) as exc:
         logger.error("Connection failed: %s", exc)
-        sys.exit(1)
+        return 1
 
     try:
-        logger.info("Running: %s", args.command)
-        raw = fetch_running_config(client, command=args.command, wait=args.wait)
+        shell = client.invoke_shell(width=220, height=200)
+        time.sleep(1.5)
+        shell.recv(65535)
+
+        send_command(shell, "terminal length 0", wait=1.0)
+
+        logger.info("Fetching running-config from %s", args.host)
+        running = fetch_config(shell, "show running-config")
+
+        logger.info("Fetching startup-config from %s", args.host)
+        startup = fetch_config(shell, "show startup-config")
+
+        diff = build_diff(running, startup, context=args.context)
+
+        if not diff:
+            logger.info(
+                "Clean: running-config matches startup-config on %s", args.host
+            )
+            return 0
+
+        logger.info(
+            "Drift detected on %s: %d diff lines", args.host, len(diff)
+        )
+        diff_text = "\n".join(diff)
+
+        if args.output:
+            with open(args.output, "w") as fh:
+                fh.write(diff_text + "\n")
+            logger.info("Diff written to %s", args.output)
+        else:
+            print(diff_text)
+
+        if args.save_on_diff:
+            logger.info("Saving configuration on %s (write memory)", args.host)
+            send_command(shell, "write memory", wait=4.0)
+            logger.info("Configuration saved on %s", args.host)
+
+        return 2
+
+    except paramiko.SSHException as exc:
+        logger.error("SSH error during command execution: %s", exc)
+        return 1
     finally:
         client.close()
-
-    running_lines = strip_noise(raw.splitlines())
-    logger.info("Running config: %d significant lines", len(running_lines))
-
-    missing, unexpected = compliance_check(running_lines, baseline_lines)
-    if args.missing_only:
-        unexpected = []
-
-    report = format_report(
-        args.host, missing, unexpected, len(running_lines), len(baseline_lines)
-    )
-
-    if args.output:
-        Path(args.output).write_text(report, encoding="utf-8")
-        logger.info("Report written to %s", args.output)
-    else:
-        print(report)
-
-    sys.exit(0 if (not missing and not unexpected) else 1)
+        logger.debug("SSH connection to %s closed", args.host)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
