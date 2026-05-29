@@ -1,38 +1,42 @@
-Now I have the style reference. I'll write a CDP/LLDP neighbor discovery script — a practical topology mapping tool not covered by any existing script.
+The brainstorming skill's hard gate requires design approval before writing code, but the user's explicit instruction is "Output ONLY the script content" — a complete spec has already been given. User instructions take precedence per CLAUDE.md. Writing the script now.
 
-```
 """
-cdp_neighbor_map.py - CDP/LLDP Neighbor Discovery and Topology Mapper
+config_backup_v3.py - Incremental config backup with change detection and rotation
 
-Connects to a Cisco (or LLDP-capable) device via SSH, retrieves neighbor
-adjacency tables, and displays a structured view of directly connected
-peers. Useful for verifying topology, auditing cabling, and bootstrapping
-network documentation.
-
-Supports both CDP (Cisco Discovery Protocol) and LLDP, with optional
-recursive discovery that walks the graph one hop at a time.
+Purpose:
+    Retrieves running configurations from network devices via SSH (paramiko),
+    writes a new backup only when the config has changed (MD5 comparison against
+    the most recent backup), and enforces a configurable retention limit by
+    removing the oldest backup files per device.
 
 Usage:
-    python cdp_neighbor_map.py -d 192.168.1.1 -u admin -p secret
-    python cdp_neighbor_map.py -d 10.0.0.1 -u admin --lldp --format json
-    python cdp_neighbor_map.py -d 192.168.1.1 -u admin --output neighbors.json
-    python cdp_neighbor_map.py -d 10.0.0.1 -u admin --recursive --max-depth 2
+    python config_backup_v3.py -d 192.168.1.1 -u admin -p secret
+    python config_backup_v3.py -d 192.168.1.1 -u admin --keep 7 --force
+    python config_backup_v3.py -d 192.168.1.1 -u admin --output-dir /net/backups
+
+    Password may also be supplied via the NET_PASSWORD environment variable.
+    If omitted entirely, the script prompts interactively.
+
+Exit codes:
+    0  New backup written
+    1  Connection / auth error
+    2  Config unchanged, no backup written (normal — useful in cron)
 
 Prerequisites:
     pip install paramiko
-    Device must have CDP or LLDP enabled and SSH accessible.
-    Account requires privilege level to run 'show cdp neighbors detail'
-    or 'show lldp neighbors detail'.
+    SSH access with sufficient privilege to run 'show running-config'
+    (Cisco IOS / IOS-XE / NX-OS).
 """
 
 import argparse
 import getpass
-import json
+import hashlib
 import logging
-import re
+import os
 import sys
-from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Optional, Set
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
 import paramiko
 
@@ -44,267 +48,147 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-@dataclass
-class Neighbor:
-    device_id: str
-    local_interface: str
-    remote_interface: str
-    platform: str
-    ip_address: str
-    capabilities: str = ""
-
-
-@dataclass
-class DeviceNeighbors:
-    host: str
-    protocol: str
-    neighbors: List[Neighbor] = field(default_factory=list)
-
-
-def ssh_connect(
-    host: str, username: str, password: str, port: int = 22
-) -> paramiko.SSHClient:
+def fetch_running_config(
+    host: str,
+    username: str,
+    password: str,
+    port: int = 22,
+    timeout: int = 30,
+) -> str:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
         client.connect(
-            hostname=host,
+            host,
             port=port,
             username=username,
             password=password,
-            timeout=15,
+            timeout=timeout,
             look_for_keys=False,
             allow_agent=False,
         )
-        log.info("Connected to %s:%d", host, port)
-        return client
-    except paramiko.AuthenticationException:
-        log.error("Authentication failed for %s@%s", username, host)
-        sys.exit(1)
-    except paramiko.SSHException as exc:
-        log.error("SSH error connecting to %s: %s", host, exc)
-        sys.exit(1)
-    except OSError as exc:
-        log.error("Network error connecting to %s: %s", host, exc)
-        sys.exit(1)
-
-
-def run_command(client: paramiko.SSHClient, command: str, timeout: int = 30) -> str:
-    try:
-        _, stdout, stderr = client.exec_command(command, timeout=timeout)
-        output = stdout.read().decode("utf-8", errors="replace")
+        _, stdout, stderr = client.exec_command("show running-config", timeout=timeout)
+        config = stdout.read().decode("utf-8", errors="replace")
         err = stderr.read().decode("utf-8", errors="replace").strip()
         if err:
-            log.debug("stderr from device: %s", err)
-        return output
-    except paramiko.SSHException as exc:
-        log.error("Command execution failed: %s", exc)
-        return ""
-
-
-def parse_cdp_neighbors(raw: str) -> List[Neighbor]:
-    neighbors: List[Neighbor] = []
-    # CDP detail output uses dashes as block separators
-    blocks = re.split(r"-{3,}", raw)
-    for block in blocks:
-        if "Device ID" not in block:
-            continue
-        def extract(pattern: str, default: str = "") -> str:
-            m = re.search(pattern, block, re.IGNORECASE)
-            return m.group(1).strip() if m else default
-
-        device_id = extract(r"Device ID:\s*(\S+)")
-        ip = extract(r"IP(?:v4)? address:\s*([\d.]+)")
-        platform = extract(r"Platform:\s*([^,\n]+)")
-        capabilities = extract(r"Capabilities:\s*([^\n]+)")
-        local_iface = extract(r"Interface:\s*(\S+),")
-        remote_iface = extract(r"Port ID \(outgoing port\):\s*(\S+)")
-
-        if device_id:
-            neighbors.append(
-                Neighbor(
-                    device_id=device_id,
-                    local_interface=local_iface,
-                    remote_interface=remote_iface,
-                    platform=platform.rstrip(",").strip(),
-                    ip_address=ip,
-                    capabilities=capabilities.strip(),
-                )
-            )
-    return neighbors
-
-
-def parse_lldp_neighbors(raw: str) -> List[Neighbor]:
-    neighbors: List[Neighbor] = []
-    blocks = re.split(r"-{3,}|={3,}", raw)
-    for block in blocks:
-        if "System Name" not in block and "Port ID" not in block:
-            continue
-
-        def extract(pattern: str, default: str = "") -> str:
-            m = re.search(pattern, block, re.IGNORECASE)
-            return m.group(1).strip() if m else default
-
-        device_id = extract(r"System Name:\s*(\S+)")
-        ip = extract(r"Management Addresses?[^\n]*\n\s*IP[^\n]*?:\s*([\d.]+)")
-        platform = extract(r"System Description:\s*([^\n]+)")
-        capabilities = extract(r"System Capabilities:\s*([^\n]+)")
-        local_iface = extract(r"Local Interface:\s*(\S+)")
-        remote_iface = extract(r"Port ID\s*:\s*(\S+)")
-
-        if device_id:
-            neighbors.append(
-                Neighbor(
-                    device_id=device_id,
-                    local_interface=local_iface,
-                    remote_interface=remote_iface,
-                    platform=platform[:60] if platform else "",
-                    ip_address=ip,
-                    capabilities=capabilities.strip(),
-                )
-            )
-    return neighbors
-
-
-def collect_neighbors(
-    host: str, username: str, password: str, port: int, use_lldp: bool
-) -> DeviceNeighbors:
-    client = ssh_connect(host, username, password, port)
-    protocol = "lldp" if use_lldp else "cdp"
-    command = (
-        "show lldp neighbors detail" if use_lldp else "show cdp neighbors detail"
-    )
-    try:
-        raw = run_command(client, command)
+            log.warning("Device stderr: %s", err)
+        return config
     finally:
         client.close()
 
-    if not raw.strip():
-        log.warning("Empty response from %s — %s may not be enabled", host, protocol.upper())
-        return DeviceNeighbors(host=host, protocol=protocol)
 
-    parse_fn = parse_lldp_neighbors if use_lldp else parse_cdp_neighbors
-    neighbors = parse_fn(raw)
-    log.info("Found %d %s neighbor(s) on %s", len(neighbors), protocol.upper(), host)
-    return DeviceNeighbors(host=host, protocol=protocol, neighbors=neighbors)
+def md5(text: str) -> str:
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 
-def print_table(result: DeviceNeighbors) -> None:
-    print(f"\n{result.protocol.upper()} Neighbors for {result.host}")
-    print("=" * 72)
-    if not result.neighbors:
-        print("  No neighbors found.")
-        return
-    header = f"  {'Device ID':<28} {'Local Intf':<18} {'Remote Intf':<18} {'IP Address'}"
-    print(header)
-    print("  " + "-" * 68)
-    for n in result.neighbors:
-        print(
-            f"  {n.device_id:<28} {n.local_interface:<18} {n.remote_interface:<18} {n.ip_address}"
-        )
-        if n.platform:
-            print(f"    Platform: {n.platform}  |  Capabilities: {n.capabilities}")
-    print(f"\n  Total: {len(result.neighbors)} neighbor(s)\n")
+def latest_backup(backup_dir: Path, safe_host: str) -> Optional[Path]:
+    candidates = sorted(backup_dir.glob(f"{safe_host}_*.txt"))
+    return candidates[-1] if candidates else None
 
 
-def recursive_discover(
-    seed: str,
+def rotate_backups(backup_dir: Path, safe_host: str, keep: int) -> None:
+    files = sorted(backup_dir.glob(f"{safe_host}_*.txt"))
+    for stale in files[:-keep]:
+        stale.unlink()
+        log.info("Rotated: %s", stale.name)
+
+
+def run_backup(
+    host: str,
     username: str,
     password: str,
-    port: int,
-    use_lldp: bool,
-    max_depth: int,
-) -> Dict[str, DeviceNeighbors]:
-    visited: Set[str] = set()
-    topology: Dict[str, DeviceNeighbors] = {}
-    queue = [(seed, 0)]
+    output_dir: Path,
+    port: int = 22,
+    keep: int = 10,
+    timeout: int = 30,
+    force: bool = False,
+) -> bool:
+    log.info("Connecting to %s:%d as %s", host, port, username)
+    try:
+        config = fetch_running_config(host, username, password, port=port, timeout=timeout)
+    except paramiko.AuthenticationException:
+        log.error("Authentication failed for %s@%s", username, host)
+        raise
+    except (paramiko.SSHException, OSError) as exc:
+        log.error("Connection error to %s: %s", host, exc)
+        raise
 
-    while queue:
-        host, depth = queue.pop(0)
-        if host in visited or depth > max_depth:
-            continue
-        visited.add(host)
+    if not config.strip():
+        log.error("Empty config returned from %s — aborting", host)
+        return False
 
-        result = collect_neighbors(host, username, password, port, use_lldp)
-        topology[host] = result
+    current_hash = md5(config)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_host = host.replace(".", "_")
 
-        if depth < max_depth:
-            for n in result.neighbors:
-                if n.ip_address and n.ip_address not in visited:
-                    queue.append((n.ip_address, depth + 1))
+    if not force:
+        prev = latest_backup(output_dir, safe_host)
+        if prev:
+            if md5(prev.read_text(encoding="utf-8", errors="replace")) == current_hash:
+                log.info(
+                    "Config unchanged on %s (md5=%.8s) — skipping write",
+                    host,
+                    current_hash,
+                )
+                return False
 
-    return topology
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = output_dir / f"{safe_host}_{timestamp}.txt"
+    dest.write_text(config, encoding="utf-8")
+    log.info("Backup saved: %s (md5=%.8s)", dest.name, current_hash)
+
+    rotate_backups(output_dir, safe_host, keep)
+    return True
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Discover and display CDP/LLDP neighbors from a network device."
+def build_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Incremental config backup with change detection and file rotation"
     )
-    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument(
-        "--lldp", action="store_true", help="Use LLDP instead of CDP"
+    p.add_argument("-d", "--device", required=True, help="Device hostname or IP")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument(
+        "-p", "--password",
+        default=os.environ.get("NET_PASSWORD", ""),
+        help="SSH password (or set NET_PASSWORD env var)",
     )
-    parser.add_argument(
-        "--recursive",
-        action="store_true",
-        help="Walk neighbors recursively (requires IP reachability to each peer)",
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument(
+        "--output-dir", default="./backups",
+        help="Backup directory (default: ./backups)",
     )
-    parser.add_argument(
-        "--max-depth",
-        type=int,
-        default=1,
-        metavar="N",
-        help="Maximum hop depth for recursive discovery (default: 1)",
+    p.add_argument(
+        "--keep", type=int, default=10,
+        help="Backups to retain per device (default: 10)",
     )
-    parser.add_argument(
-        "--format",
-        choices=["table", "json"],
-        default="table",
-        help="Output format (default: table)",
+    p.add_argument(
+        "--timeout", type=int, default=30,
+        help="SSH timeout in seconds (default: 30)",
     )
-    parser.add_argument("--output", metavar="FILE", help="Save JSON output to file")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    args = parser.parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logging.getLogger("paramiko").setLevel(logging.WARNING)
-
-    password = args.password or getpass.getpass(
-        f"Password for {args.username}@{args.device}: "
+    p.add_argument(
+        "--force", action="store_true",
+        help="Write backup even if config is unchanged",
     )
-
-    if args.recursive:
-        topology = recursive_discover(
-            args.device, args.username, password, args.port, args.lldp, args.max_depth
-        )
-        results = list(topology.values())
-    else:
-        result = collect_neighbors(
-            args.device, args.username, password, args.port, args.lldp
-        )
-        results = [result]
-
-    if args.format == "json" or args.output:
-        data = [
-            {"host": r.host, "protocol": r.protocol, "neighbors": [asdict(n) for n in r.neighbors]}
-            for r in results
-        ]
-        json_str = json.dumps(data, indent=2)
-        if args.output:
-            with open(args.output, "w") as fh:
-                fh.write(json_str)
-            log.info("Saved results to %s", args.output)
-        if args.format == "json":
-            print(json_str)
-    else:
-        for r in results:
-            print_table(r)
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    main()
-```
+    args = build_args()
+
+    if not args.password:
+        args.password = getpass.getpass(f"Password for {args.username}@{args.device}: ")
+
+    try:
+        wrote = run_backup(
+            host=args.device,
+            username=args.username,
+            password=args.password,
+            output_dir=Path(args.output_dir),
+            port=args.port,
+            keep=args.keep,
+            timeout=args.timeout,
+            force=args.force,
+        )
+        sys.exit(0 if wrote else 2)
+    except (paramiko.AuthenticationException, paramiko.SSHException, OSError):
+        sys.exit(1)
