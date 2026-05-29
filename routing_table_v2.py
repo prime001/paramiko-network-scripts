@@ -1,234 +1,198 @@
-```python
-"""
-Route Change Monitor — SSH-based IP routing table change detection.
+Routing Table Change Monitor
 
-Purpose:
-    Connects to a network device via SSH and detects changes in the IP routing
-    table by comparing the current state against a saved baseline snapshot.
-    Useful for auditing unexpected route additions, withdrawals, or next-hop
-    shifts after maintenance windows or BGP/OSPF events.
+Polls a network device's routing table at a configurable interval and reports
+when routes are added or removed. Useful for detecting unplanned topology
+changes, flapping routes, or validating convergence after maintenance.
 
 Usage:
-    # Save a baseline snapshot
-    python route_change_monitor.py -d 192.168.1.1 -u admin --save-baseline
-
-    # Compare current table against the saved baseline
-    python route_change_monitor.py -d 192.168.1.1 -u admin --check
-
-    # Continuous monitoring — poll every N seconds, report changes between polls
-    python route_change_monitor.py -d 192.168.1.1 -u admin --watch --interval 60
+    python routing_table_monitor.py -d 192.168.1.1 -u admin -p secret
+    python routing_table_monitor.py -d 192.168.1.1 -u admin --ask-pass \
+        --interval 30 --count 10 --output changes.log
 
 Prerequisites:
     pip install paramiko
-    SSH access with sufficient privileges to run 'show ip route' (Cisco IOS/NX-OS)
+    SSH access to the target device (Cisco IOS/IOS-XE/NX-OS)
 """
 
 import argparse
 import getpass
-import json
+import hashlib
 import logging
 import re
 import sys
 import time
 from datetime import datetime
-from pathlib import Path
 
 import paramiko
 
 logging.basicConfig(
-    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-def ssh_connect(host, username, password, port=22, timeout=10):
+def ssh_exec(client: paramiko.SSHClient, command: str, timeout: int = 30) -> str:
+    _, stdout, stderr = client.exec_command(command, timeout=timeout)
+    output = stdout.read().decode("utf-8", errors="replace")
+    error = stderr.read().decode("utf-8", errors="replace")
+    if error.strip():
+        logger.debug("stderr: %s", error.strip())
+    return output
+
+
+def connect(host: str, port: int, username: str, password: str) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(
-        host,
+        hostname=host,
         port=port,
         username=username,
         password=password,
-        timeout=timeout,
         look_for_keys=False,
         allow_agent=False,
+        timeout=15,
     )
     return client
 
 
-def run_command(client, command, recv_timeout=10):
-    _, stdout, stderr = client.exec_command(command, timeout=recv_timeout)
-    output = stdout.read().decode("utf-8", errors="replace")
-    err = stderr.read().decode("utf-8", errors="replace").strip()
-    if err:
-        log.warning("Device stderr: %s", err)
-    return output
-
-
-def parse_routes(raw_output):
-    """Return {prefix: nexthop} from 'show ip route' output."""
-    routes = {}
-    via_pattern = re.compile(
-        r"^[COSRBEIDO\s*>]+\s+(\d+\.\d+\.\d+\.\d+(?:/\d+)?)\s+\[[\d/]+\]\s+via\s+(\S+)",
+def fetch_routes(client: paramiko.SSHClient) -> set[str]:
+    """Return a set of route prefix strings from 'show ip route'."""
+    raw = ssh_exec(client, "show ip route")
+    routes = set()
+    pattern = re.compile(
+        r"^[A-Z*>i\s]{1,3}\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?:/\d{1,2})?)",
         re.MULTILINE,
     )
-    connected_pattern = re.compile(
-        r"^[C\s]+(\d+\.\d+\.\d+\.\d+/\d+)\s+is directly connected,\s+(\S+)",
-        re.MULTILINE,
-    )
-    for m in via_pattern.finditer(raw_output):
-        routes[m.group(1)] = m.group(2).rstrip(",")
-    for m in connected_pattern.finditer(raw_output):
-        routes[m.group(1)] = f"direct:{m.group(2)}"
+    for match in pattern.finditer(raw):
+        routes.add(match.group(1))
     return routes
 
 
-def snapshot_path(host, baseline_dir):
-    safe = re.sub(r"[^\w]", "_", host)
-    return Path(baseline_dir) / f"{safe}_routes.json"
+def route_fingerprint(routes: set[str]) -> str:
+    return hashlib.md5("|".join(sorted(routes)).encode()).hexdigest()
 
 
-def save_snapshot(host, routes, baseline_dir):
-    path = snapshot_path(host, baseline_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({
-        "host": host,
-        "timestamp": datetime.utcnow().isoformat(),
-        "routes": routes,
-    }, indent=2))
-    log.info("Baseline saved → %s  (%d routes)", path, len(routes))
+def format_diff(added: set[str], removed: set[str]) -> str:
+    lines = []
+    for r in sorted(removed):
+        lines.append(f"  - REMOVED  {r}")
+    for r in sorted(added):
+        lines.append(f"  + ADDED    {r}")
+    return "\n".join(lines)
 
 
-def load_snapshot(host, baseline_dir):
-    path = snapshot_path(host, baseline_dir)
-    if not path.exists():
-        return None
-    data = json.loads(path.read_text())
-    log.info("Baseline loaded from %s  (saved %s, %d routes)",
-             path, data.get("timestamp", "?"), len(data["routes"]))
-    return data["routes"]
+def monitor(args: argparse.Namespace) -> None:
+    password = args.password or getpass.getpass(f"Password for {args.username}@{args.device}: ")
 
+    log_file = None
+    if args.output:
+        log_file = open(args.output, "a")
 
-def diff_routes(baseline, current):
-    added = {p: current[p] for p in current if p not in baseline}
-    removed = {p: baseline[p] for p in baseline if p not in current}
-    changed = {
-        p: {"was": baseline[p], "now": current[p]}
-        for p in current
-        if p in baseline and current[p] != baseline[p]
-    }
-    return added, removed, changed
-
-
-def print_diff(added, removed, changed):
-    if not (added or removed or changed):
-        print("  No routing table changes detected.")
-        return False
-    if added:
-        print(f"  ADDED ({len(added)}):")
-        for prefix, nh in sorted(added.items()):
-            print(f"    + {prefix:<24} via {nh}")
-    if removed:
-        print(f"  REMOVED ({len(removed)}):")
-        for prefix, nh in sorted(removed.items()):
-            print(f"    - {prefix:<24} via {nh}")
-    if changed:
-        print(f"  NEXT-HOP CHANGED ({len(changed)}):")
-        for prefix, info in sorted(changed.items()):
-            print(f"    ~ {prefix:<24} {info['was']}  →  {info['now']}")
-    return True
-
-
-def collect(args, password):
-    log.info("Connecting to %s:%d", args.device, args.port)
     try:
-        client = ssh_connect(args.device, args.username, password, args.port)
+        logger.info("Connecting to %s:%d", args.device, args.port)
+        client = connect(args.device, args.port, args.username, password)
     except paramiko.AuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.device)
+        logger.error("Authentication failed for %s@%s", args.username, args.device)
         sys.exit(1)
     except Exception as exc:
-        log.error("Connection error: %s", exc)
+        logger.error("Connection failed: %s", exc)
         sys.exit(1)
+
     try:
-        raw = run_command(client, "show ip route")
-        routes = parse_routes(raw)
-        log.info("Collected %d routes from %s", len(routes), args.device)
-        return routes
+        logger.info("Taking initial routing table snapshot...")
+        previous = fetch_routes(client)
+        prev_fp = route_fingerprint(previous)
+        logger.info("Baseline: %d routes (fingerprint %s)", len(previous), prev_fp[:8])
+
+        poll_count = 0
+        change_count = 0
+
+        while True:
+            time.sleep(args.interval)
+            poll_count += 1
+
+            try:
+                current = fetch_routes(client)
+            except Exception as exc:
+                logger.warning("Poll %d failed: %s — reconnecting", poll_count, exc)
+                try:
+                    client.close()
+                    client = connect(args.device, args.port, args.username, password)
+                    current = fetch_routes(client)
+                except Exception as reconnect_exc:
+                    logger.error("Reconnect failed: %s", reconnect_exc)
+                    break
+
+            curr_fp = route_fingerprint(current)
+            if curr_fp == prev_fp:
+                logger.info("Poll %d — no change (%d routes)", poll_count, len(current))
+            else:
+                added = current - previous
+                removed = previous - current
+                change_count += 1
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                msg = (
+                    f"\n[{ts}] CHANGE #{change_count} detected on {args.device} "
+                    f"(poll {poll_count})\n"
+                    f"  Routes before: {len(previous)}  after: {len(current)}\n"
+                    + format_diff(added, removed)
+                )
+                logger.warning(msg)
+                if log_file:
+                    log_file.write(msg + "\n")
+                    log_file.flush()
+
+                previous = current
+                prev_fp = curr_fp
+
+            if args.count and poll_count >= args.count:
+                logger.info("Reached poll limit (%d). Exiting.", args.count)
+                break
+
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user.")
     finally:
         client.close()
+        if log_file:
+            log_file.close()
+        logger.info(
+            "Session ended. Total polls: %d, changes detected: %d",
+            poll_count,
+            change_count,
+        )
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Monitor IP routing table changes on network devices via SSH"
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Monitor routing table changes on a network device via SSH."
     )
-    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", default=None,
-                        help="SSH password (prompted if omitted)")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--baseline-dir", default="./route_baselines",
-                        help="Directory for baseline snapshots (default: ./route_baselines)")
-
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--save-baseline", action="store_true",
-                      help="Collect current routes and save as the new baseline")
-    mode.add_argument("--check", action="store_true",
-                      help="Compare current routes against the saved baseline")
-    mode.add_argument("--watch", action="store_true",
-                      help="Poll continuously; report changes between each poll")
-
-    parser.add_argument("--interval", type=int, default=60,
-                        help="Poll interval in seconds for --watch mode (default: 60)")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Enable debug logging")
-    args = parser.parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    password = args.password or getpass.getpass(
-        f"Password for {args.username}@{args.device}: "
+    p.add_argument("-d", "--device", required=True, help="Device hostname or IP")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", default=None, help="SSH password (prompts if omitted)")
+    p.add_argument("--ask-pass", action="store_true", help="Force interactive password prompt")
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument(
+        "--interval", type=int, default=60,
+        help="Polling interval in seconds (default: 60)",
     )
-
-    if args.save_baseline:
-        routes = collect(args, password)
-        save_snapshot(args.device, routes, args.baseline_dir)
-
-    elif args.check:
-        baseline = load_snapshot(args.device, args.baseline_dir)
-        if baseline is None:
-            log.error("No baseline found. Run --save-baseline first.")
-            sys.exit(1)
-        current = collect(args, password)
-        added, removed, changed = diff_routes(baseline, current)
-        print(f"\n{args.device} — route diff vs baseline:")
-        has_changes = print_diff(added, removed, changed)
-        sys.exit(1 if has_changes else 0)
-
-    elif args.watch:
-        log.info("Watch mode active (interval: %ds). Ctrl-C to stop.", args.interval)
-        previous = collect(args, password)
-        print(f"[{datetime.now():%H:%M:%S}] Monitoring {args.device} — "
-              f"baseline: {len(previous)} routes")
-        try:
-            while True:
-                time.sleep(args.interval)
-                current = collect(args, password)
-                added, removed, changed = diff_routes(previous, current)
-                ts = datetime.now().strftime("%H:%M:%S")
-                if added or removed or changed:
-                    print(f"\n[{ts}] CHANGES on {args.device}:")
-                    print_diff(added, removed, changed)
-                else:
-                    print(f"[{ts}] No changes  ({len(current)} routes)")
-                previous = current
-        except KeyboardInterrupt:
-            print("\nMonitoring stopped.")
+    p.add_argument(
+        "--count", type=int, default=0,
+        help="Stop after N polls (default: 0 = run forever)",
+    )
+    p.add_argument("--output", metavar="FILE", help="Append change events to FILE")
+    p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return p
 
 
 if __name__ == "__main__":
-    main()
-```
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.ask_pass:
+        args.password = None
+
+    monitor(args)
