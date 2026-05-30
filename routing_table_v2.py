@@ -1,27 +1,33 @@
-Routing Table Change Monitor
+```python
+"""
+Route Prefix Verifier — validates expected prefixes in a device's routing table.
 
-Polls a network device's routing table at a configurable interval and reports
-when routes are added or removed. Useful for detecting unplanned topology
-changes, flapping routes, or validating convergence after maintenance.
+Purpose:
+    Connects to a network device via SSH and verifies that a specified set of
+    IP prefixes are present in the routing table, optionally asserting next-hop
+    and routing protocol. Useful for post-change validation and compliance audits.
 
 Usage:
-    python routing_table_monitor.py -d 192.168.1.1 -u admin -p secret
-    python routing_table_monitor.py -d 192.168.1.1 -u admin --ask-pass \
-        --interval 30 --count 10 --output changes.log
+    python routing_table_verify.py -d 192.168.1.1 -u admin \
+        --prefixes 10.0.0.0/8 172.16.0.0/12 \
+        --expected-nexthop 192.168.1.254 \
+        --expected-protocol B
+
+    # Load prefixes from a file (one per line):
+    python routing_table_verify.py -d 192.168.1.1 -u admin \
+        --prefix-file critical_routes.txt -v
 
 Prerequisites:
     pip install paramiko
-    SSH access to the target device (Cisco IOS/IOS-XE/NX-OS)
+    Device must have SSH enabled with privilege to run 'show ip route <prefix>'.
+    Tested against Cisco IOS, IOS-XE. Adapt verify_prefix() for other NOS.
 """
 
 import argparse
-import getpass
-import hashlib
 import logging
 import re
 import sys
-import time
-from datetime import datetime
+from getpass import getpass
 
 import paramiko
 
@@ -29,170 +35,187 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-def ssh_exec(client: paramiko.SSHClient, command: str, timeout: int = 30) -> str:
+def ssh_connect(host, username, password, port=22, timeout=15):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            host,
+            port=port,
+            username=username,
+            password=password,
+            timeout=timeout,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+        return client
+    except paramiko.AuthenticationException:
+        log.error("Authentication failed for %s@%s", username, host)
+        raise
+    except paramiko.SSHException as exc:
+        log.error("SSH error connecting to %s: %s", host, exc)
+        raise
+
+
+def run_command(client, command, timeout=10):
     _, stdout, stderr = client.exec_command(command, timeout=timeout)
     output = stdout.read().decode("utf-8", errors="replace")
-    error = stderr.read().decode("utf-8", errors="replace")
-    if error.strip():
-        logger.debug("stderr: %s", error.strip())
+    err = stderr.read().decode("utf-8", errors="replace").strip()
+    if err:
+        log.debug("stderr for '%s': %s", command, err)
     return output
 
 
-def connect(host: str, port: int, username: str, password: str) -> paramiko.SSHClient:
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=host,
-        port=port,
-        username=username,
-        password=password,
-        look_for_keys=False,
-        allow_agent=False,
-        timeout=15,
+def verify_prefix(client, prefix, expected_nexthop=None, expected_protocol=None):
+    """Check a single prefix; returns a result dict with presence and parsed attributes."""
+    output = run_command(client, f"show ip route {prefix}")
+
+    result = {
+        "prefix": prefix,
+        "present": False,
+        "protocol": None,
+        "nexthop": None,
+        "nexthop_match": None,
+        "protocol_match": None,
+        "raw": output.strip(),
+    }
+
+    not_found_patterns = [
+        r"% Network not in table",
+        r"% Subnet not in table",
+        r"not in table",
+        r"not found",
+    ]
+    for pat in not_found_patterns:
+        if re.search(pat, output, re.IGNORECASE):
+            return result
+
+    nexthop_match = re.search(r"via\s+(\d+\.\d+\.\d+\.\d+)", output)
+    if nexthop_match:
+        result["present"] = True
+        result["nexthop"] = nexthop_match.group(1)
+
+    # IOS protocol codes: B=BGP, O=OSPF, S=Static, C=Connected, R=RIP, E=EIGRP
+    proto_match = re.search(r"^\s*([BOSDRCEIL*]+)\s+", output, re.MULTILINE)
+    if proto_match:
+        result["present"] = True
+        result["protocol"] = proto_match.group(1).strip("* ")
+
+    if expected_nexthop and result["nexthop"]:
+        result["nexthop_match"] = result["nexthop"] == expected_nexthop
+
+    if expected_protocol and result["protocol"]:
+        result["protocol_match"] = expected_protocol.upper() in result["protocol"].upper()
+
+    return result
+
+
+def print_results(results, verbose=False):
+    passed = sum(1 for r in results if r["present"])
+    failed = len(results) - passed
+
+    print(f"\n{'='*60}")
+    print(f"Route Verification: {passed} present, {failed} missing")
+    print(f"{'='*60}")
+
+    for r in results:
+        status = "PASS" if r["present"] else "FAIL"
+        line = f"[{status}] {r['prefix']}"
+        if r["present"]:
+            line += f"  proto={r['protocol'] or '?'}  via={r['nexthop'] or '?'}"
+            if r["nexthop_match"] is not None:
+                line += f"  nexthop={'OK' if r['nexthop_match'] else 'MISMATCH'}"
+            if r["protocol_match"] is not None:
+                line += f"  protocol={'OK' if r['protocol_match'] else 'MISMATCH'}"
+        print(line)
+        if verbose and r["raw"]:
+            for raw_line in r["raw"].splitlines():
+                print(f"    {raw_line}")
+
+    print()
+    return failed == 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Verify that expected IP prefixes are present in a device's routing table."
     )
-    return client
-
-
-def fetch_routes(client: paramiko.SSHClient) -> set[str]:
-    """Return a set of route prefix strings from 'show ip route'."""
-    raw = ssh_exec(client, "show ip route")
-    routes = set()
-    pattern = re.compile(
-        r"^[A-Z*>i\s]{1,3}\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?:/\d{1,2})?)",
-        re.MULTILINE,
+    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument(
+        "--prefixes",
+        nargs="+",
+        default=[],
+        metavar="PREFIX",
+        help="IP prefixes to verify (e.g. 10.0.0.0/8 192.168.1.0/24)",
     )
-    for match in pattern.finditer(raw):
-        routes.add(match.group(1))
-    return routes
+    parser.add_argument(
+        "--prefix-file",
+        metavar="FILE",
+        help="File with one prefix per line, merged with --prefixes",
+    )
+    parser.add_argument(
+        "--expected-nexthop",
+        metavar="IP",
+        help="Assert all matched prefixes resolve via this next-hop IP",
+    )
+    parser.add_argument(
+        "--expected-protocol",
+        metavar="PROTO",
+        help="Assert routing protocol code (e.g. B, O, S, C, R)",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Print raw device output per prefix"
+    )
+    parser.add_argument("--timeout", type=int, default=15, help="SSH timeout in seconds")
+    args = parser.parse_args()
 
+    if not args.prefixes and not args.prefix_file:
+        parser.error("Provide at least one prefix via --prefixes or --prefix-file")
 
-def route_fingerprint(routes: set[str]) -> str:
-    return hashlib.md5("|".join(sorted(routes)).encode()).hexdigest()
+    password = args.password or getpass(f"Password for {args.username}@{args.device}: ")
 
+    prefixes = list(args.prefixes)
+    if args.prefix_file:
+        try:
+            with open(args.prefix_file) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        prefixes.append(line)
+        except OSError as exc:
+            log.error("Cannot read prefix file: %s", exc)
+            sys.exit(1)
 
-def format_diff(added: set[str], removed: set[str]) -> str:
-    lines = []
-    for r in sorted(removed):
-        lines.append(f"  - REMOVED  {r}")
-    for r in sorted(added):
-        lines.append(f"  + ADDED    {r}")
-    return "\n".join(lines)
-
-
-def monitor(args: argparse.Namespace) -> None:
-    password = args.password or getpass.getpass(f"Password for {args.username}@{args.device}: ")
-
-    log_file = None
-    if args.output:
-        log_file = open(args.output, "a")
-
+    log.info("Connecting to %s:%d", args.device, args.port)
     try:
-        logger.info("Connecting to %s:%d", args.device, args.port)
-        client = connect(args.device, args.port, args.username, password)
-    except paramiko.AuthenticationException:
-        logger.error("Authentication failed for %s@%s", args.username, args.device)
-        sys.exit(1)
-    except Exception as exc:
-        logger.error("Connection failed: %s", exc)
+        client = ssh_connect(args.device, args.username, password, args.port, args.timeout)
+    except Exception:
         sys.exit(1)
 
+    results = []
     try:
-        logger.info("Taking initial routing table snapshot...")
-        previous = fetch_routes(client)
-        prev_fp = route_fingerprint(previous)
-        logger.info("Baseline: %d routes (fingerprint %s)", len(previous), prev_fp[:8])
-
-        poll_count = 0
-        change_count = 0
-
-        while True:
-            time.sleep(args.interval)
-            poll_count += 1
-
-            try:
-                current = fetch_routes(client)
-            except Exception as exc:
-                logger.warning("Poll %d failed: %s — reconnecting", poll_count, exc)
-                try:
-                    client.close()
-                    client = connect(args.device, args.port, args.username, password)
-                    current = fetch_routes(client)
-                except Exception as reconnect_exc:
-                    logger.error("Reconnect failed: %s", reconnect_exc)
-                    break
-
-            curr_fp = route_fingerprint(current)
-            if curr_fp == prev_fp:
-                logger.info("Poll %d — no change (%d routes)", poll_count, len(current))
-            else:
-                added = current - previous
-                removed = previous - current
-                change_count += 1
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                msg = (
-                    f"\n[{ts}] CHANGE #{change_count} detected on {args.device} "
-                    f"(poll {poll_count})\n"
-                    f"  Routes before: {len(previous)}  after: {len(current)}\n"
-                    + format_diff(added, removed)
-                )
-                logger.warning(msg)
-                if log_file:
-                    log_file.write(msg + "\n")
-                    log_file.flush()
-
-                previous = current
-                prev_fp = curr_fp
-
-            if args.count and poll_count >= args.count:
-                logger.info("Reached poll limit (%d). Exiting.", args.count)
-                break
-
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user.")
+        for prefix in prefixes:
+            log.info("Checking %s", prefix)
+            result = verify_prefix(
+                client,
+                prefix,
+                expected_nexthop=args.expected_nexthop,
+                expected_protocol=args.expected_protocol,
+            )
+            results.append(result)
     finally:
         client.close()
-        if log_file:
-            log_file.close()
-        logger.info(
-            "Session ended. Total polls: %d, changes detected: %d",
-            poll_count,
-            change_count,
-        )
 
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Monitor routing table changes on a network device via SSH."
-    )
-    p.add_argument("-d", "--device", required=True, help="Device hostname or IP")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", default=None, help="SSH password (prompts if omitted)")
-    p.add_argument("--ask-pass", action="store_true", help="Force interactive password prompt")
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument(
-        "--interval", type=int, default=60,
-        help="Polling interval in seconds (default: 60)",
-    )
-    p.add_argument(
-        "--count", type=int, default=0,
-        help="Stop after N polls (default: 0 = run forever)",
-    )
-    p.add_argument("--output", metavar="FILE", help="Append change events to FILE")
-    p.add_argument("--debug", action="store_true", help="Enable debug logging")
-    return p
+    all_passed = print_results(results, verbose=args.verbose)
+    sys.exit(0 if all_passed else 1)
 
 
 if __name__ == "__main__":
-    parser = build_parser()
-    args = parser.parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    if args.ask_pass:
-        args.password = None
-
-    monitor(args)
+    main()
+```
