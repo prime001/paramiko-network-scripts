@@ -1,216 +1,226 @@
-NTP Synchronization Status Checker for network devices.
+```python
+"""
+vlan_provisioner.py - Cisco switch VLAN provisioning via paramiko SSH
 
-Connects via SSH (paramiko) to one or more Cisco IOS/IOS-XE devices and
-reports NTP synchronization state, stratum, reference clock, and offset.
-Useful for verifying time consistency across a fleet before/after maintenance,
-auditing NTP compliance, or troubleshooting clock-sensitive protocols (OSPF,
-BGP, certificates, logging correlation).
+Purpose:
+    Idempotently create or rename VLANs on Cisco IOS/IOS-XE switches.
+    Reads current VLAN database, applies only missing or misnamed entries,
+    then verifies the result. Supports dry-run mode and optional config save.
 
 Usage:
-    python ntp_sync_check.py -H 192.168.1.1 -u admin -p secret
-    python ntp_sync_check.py -H 192.168.1.1 192.168.1.2 -u admin --key ~/.ssh/id_rsa
-    python ntp_sync_check.py --hosts-file hosts.txt -u admin -p secret --timeout 15
+    python vlan_provisioner.py -d 192.168.1.1 -u admin -p secret \\
+        --vlans 100:DATA 200:VOICE 300:MGMT
+    python vlan_provisioner.py -d 192.168.1.1 -u admin -k ~/.ssh/id_rsa \\
+        --vlans 100:DATA --save --dry-run
 
 Prerequisites:
     pip install paramiko
-
-Exit codes:
-    0  All devices synchronized
-    1  One or more devices not synchronized or unreachable
+    SSH enabled on device: ip ssh version 2
+    Account requires privilege 15 or equivalent vlan-database write access
 """
 
 import argparse
 import logging
 import re
 import sys
-from dataclasses import dataclass
-from typing import Optional
+import time
 
 import paramiko
 
 logging.basicConfig(
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
-
-@dataclass
-class NTPStatus:
-    host: str
-    synced: bool
-    stratum: Optional[int]
-    reference: Optional[str]
-    offset_ms: Optional[float]
-    error: Optional[str] = None
+_TIMEOUT = 30
+_RECV_DELAY = 0.5
+_RECV_BYTES = 65535
 
 
-def _run_command(client: paramiko.SSHClient, command: str, timeout: int) -> str:
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    out = stdout.read().decode(errors="replace")
-    err = stderr.read().decode(errors="replace")
-    if err.strip():
-        logger.debug("stderr: %s", err.strip())
-    return out
+def _connect(host, port, username, password=None, key_path=None):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    kwargs = dict(
+        hostname=host,
+        port=port,
+        username=username,
+        timeout=_TIMEOUT,
+        look_for_keys=bool(key_path),
+        allow_agent=False,
+    )
+    if key_path:
+        kwargs["key_filename"] = key_path
+    else:
+        kwargs["password"] = password
+    client.connect(**kwargs)
+    return client
 
 
-def _parse_ntp_status(output: str) -> dict:
-    result = {"synced": False, "stratum": None, "reference": None, "offset_ms": None}
+def _open_shell(client):
+    shell = client.invoke_shell(width=200, height=50)
+    time.sleep(1.0)
+    shell.recv(_RECV_BYTES)
+    return shell
 
-    if re.search(r"Clock is synchronized", output, re.IGNORECASE):
-        result["synced"] = True
 
-    m = re.search(r"stratum\s+(\d+)", output, re.IGNORECASE)
-    if m:
-        result["stratum"] = int(m.group(1))
+def _send(shell, command, delay=_RECV_DELAY):
+    shell.send(command + "\n")
+    time.sleep(delay)
+    buf = b""
+    while shell.recv_ready():
+        buf += shell.recv(_RECV_BYTES)
+        time.sleep(0.1)
+    return buf.decode("utf-8", errors="replace")
 
-    m = re.search(r"reference is\s+(\S+)", output, re.IGNORECASE)
-    if m:
-        result["reference"] = m.group(1)
 
-    # IOS reports offset in msec; IOS-XE may report in usec — normalize to ms
-    m = re.search(r"offset\s+is\s+([\-\d.]+)\s+(msec|usec)", output, re.IGNORECASE)
-    if m:
-        val = float(m.group(1))
-        result["offset_ms"] = val / 1000.0 if m.group(2).lower() == "usec" else val
+def _get_existing_vlans(shell):
+    """Return {vlan_id: vlan_name} from 'show vlan brief'."""
+    output = _send(shell, "show vlan brief", delay=1.2)
+    vlans = {}
+    for line in output.splitlines():
+        m = re.match(r"^\s*(\d+)\s+(\S+)\s+active", line, re.IGNORECASE)
+        if m:
+            vlans[int(m.group(1))] = m.group(2)
+    return vlans
 
+
+def _provision_vlans(shell, vlan_pairs):
+    """Push vlan + name commands inside config mode."""
+    _send(shell, "configure terminal", delay=0.5)
+    for vid, name in vlan_pairs:
+        _send(shell, f"vlan {vid}")
+        _send(shell, f"name {name}")
+        _send(shell, "exit")
+    _send(shell, "end")
+    time.sleep(0.4)
+
+
+def _save_config(shell):
+    out = _send(shell, "write memory", delay=3.5)
+    return any(tok in out for tok in ("[OK]", "OK", "Building configuration"))
+
+
+def _parse_vlan_args(vlan_args):
+    result = []
+    for entry in vlan_args:
+        parts = entry.split(":", 1)
+        try:
+            vid = int(parts[0])
+        except ValueError:
+            logger.error("Invalid VLAN ID in '%s' — skipping", entry)
+            continue
+        if not 1 <= vid <= 4094:
+            logger.error("VLAN %d out of range (1-4094) — skipping", vid)
+            continue
+        name = parts[1].strip() if len(parts) > 1 else f"VLAN{vid:04d}"
+        result.append((vid, name))
     return result
 
 
-def check_ntp(
-    host: str,
-    username: str,
-    password: Optional[str],
-    key_filename: Optional[str],
-    port: int,
-    timeout: int,
-) -> NTPStatus:
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+def main():
+    parser = argparse.ArgumentParser(
+        description="Idempotent VLAN provisioner for Cisco IOS/IOS-XE"
+    )
+    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", help="SSH password")
+    parser.add_argument("-k", "--key", metavar="PATH", help="SSH private key path")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument(
+        "--vlans",
+        nargs="+",
+        required=True,
+        metavar="ID:NAME",
+        help="VLANs to provision, format ID:NAME (e.g. 100:DATA 200:VOICE)",
+    )
+    parser.add_argument(
+        "--save", action="store_true", help="Run 'write memory' after changes"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Show planned changes without applying"
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Debug output")
+    args = parser.parse_args()
+
+    if not args.password and not args.key:
+        parser.error("Supply --password or --key for authentication")
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    targets = _parse_vlan_args(args.vlans)
+    if not targets:
+        logger.error("No valid VLANs to provision")
+        sys.exit(1)
+
+    logger.info("Connecting to %s:%d as %s", args.device, args.port, args.username)
     try:
-        connect_kwargs: dict = dict(
-            hostname=host,
-            port=port,
-            username=username,
-            timeout=timeout,
-            look_for_keys=False,
-            allow_agent=False,
-        )
-        if key_filename:
-            connect_kwargs["key_filename"] = key_filename
-            connect_kwargs["look_for_keys"] = True
-        else:
-            connect_kwargs["password"] = password
-
-        client.connect(**connect_kwargs)
-        logger.debug("Connected to %s", host)
-
-        output = _run_command(client, "show ntp status", timeout)
-        parsed = _parse_ntp_status(output)
-
-        return NTPStatus(
-            host=host,
-            synced=parsed["synced"],
-            stratum=parsed["stratum"],
-            reference=parsed["reference"],
-            offset_ms=parsed["offset_ms"],
-        )
+        client = _connect(args.device, args.port, args.username, args.password, args.key)
     except paramiko.AuthenticationException:
-        return NTPStatus(host=host, synced=False, stratum=None, reference=None,
-                         offset_ms=None, error="Authentication failed")
+        logger.error("Authentication failed for user '%s'", args.username)
+        sys.exit(1)
     except (paramiko.SSHException, OSError) as exc:
-        return NTPStatus(host=host, synced=False, stratum=None, reference=None,
-                         offset_ms=None, error=str(exc))
+        logger.error("Connection error: %s", exc)
+        sys.exit(1)
+
+    try:
+        shell = _open_shell(client)
+        _send(shell, "terminal length 0")
+
+        existing = _get_existing_vlans(shell)
+        logger.info("Device has %d active VLANs", len(existing))
+
+        to_apply = []
+        for vid, name in targets:
+            if vid not in existing:
+                logger.info("VLAN %d '%s' — will create", vid, name)
+                to_apply.append((vid, name))
+            elif existing[vid].lower() != name.lower():
+                logger.info(
+                    "VLAN %d — will rename '%s' -> '%s'", vid, existing[vid], name
+                )
+                to_apply.append((vid, name))
+            else:
+                logger.info("VLAN %d '%s' — already correct", vid, name)
+
+        if not to_apply:
+            logger.info("Nothing to do — all VLANs already provisioned correctly")
+            return
+
+        if args.dry_run:
+            print("\nDry-run — no changes applied:")
+            for vid, name in to_apply:
+                action = "create" if vid not in existing else "rename"
+                print(f"  [{action}] vlan {vid} name {name}")
+            return
+
+        _provision_vlans(shell, to_apply)
+
+        verified = _get_existing_vlans(shell)
+        failures = [
+            f"VLAN {vid}: expected name '{name}', got '{verified.get(vid, '<missing>'"
+            for vid, name in targets
+            if vid not in verified or verified[vid].lower() != name.lower()
+        ]
+        if failures:
+            for msg in failures:
+                logger.error("VERIFY FAILED: %s", msg)
+            sys.exit(1)
+
+        logger.info("All %d VLANs verified successfully", len(targets))
+
+        if args.save:
+            ok = _save_config(shell)
+            logger.info("Config saved") if ok else logger.warning(
+                "'write memory' output ambiguous — verify manually"
+            )
+
     finally:
         client.close()
-
-
-def _load_hosts_file(path: str) -> list:
-    hosts = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                hosts.append(line)
-    return hosts
-
-
-def _print_results(results: list, verbose: bool) -> int:
-    width = max(len(r.host) for r in results)
-    failures = 0
-
-    for r in results:
-        if r.error:
-            status = f"ERROR     {r.error}"
-            failures += 1
-        elif r.synced:
-            parts = ["SYNCED"]
-            if r.stratum is not None:
-                parts.append(f"stratum={r.stratum}")
-            if r.reference:
-                parts.append(f"ref={r.reference}")
-            if r.offset_ms is not None:
-                parts.append(f"offset={r.offset_ms:+.2f}ms")
-            status = "  ".join(parts)
-        else:
-            status = "NOT SYNCED"
-            failures += 1
-
-        print(f"{r.host:<{width}}  {status}")
-
-    if verbose:
-        synced = len(results) - failures
-        print(f"\n{synced}/{len(results)} device(s) synchronized")
-
-    return failures
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Check NTP synchronization status on network devices via SSH.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    host_group = p.add_mutually_exclusive_group(required=True)
-    host_group.add_argument("-H", "--hosts", nargs="+", metavar="HOST",
-                            help="One or more device IPs or hostnames")
-    host_group.add_argument("--hosts-file", metavar="FILE",
-                            help="File listing one host per line (# lines skipped)")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    cred = p.add_mutually_exclusive_group(required=True)
-    cred.add_argument("-p", "--password", help="SSH password")
-    cred.add_argument("--key", metavar="FILE", dest="key_filename",
-                      help="Path to SSH private key file")
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("--timeout", type=int, default=20,
-                   help="Connect/command timeout in seconds (default: 20)")
-    p.add_argument("-v", "--verbose", action="store_true",
-                   help="Show summary line and extra info")
-    p.add_argument("--debug", action="store_true", help="Enable debug logging")
-    return p
+        logger.debug("SSH session closed")
 
 
 if __name__ == "__main__":
-    parser = _build_parser()
-    args = parser.parse_args()
-
-    log_level = logging.DEBUG if args.debug else (logging.INFO if args.verbose else logging.WARNING)
-    logging.getLogger().setLevel(log_level)
-
-    hosts = args.hosts if args.hosts else _load_hosts_file(args.hosts_file)
-    if not hosts:
-        parser.error("No hosts specified")
-
-    results = []
-    for host in hosts:
-        logger.info("Checking %s", host)
-        results.append(check_ntp(
-            host=host,
-            username=args.username,
-            password=args.password,
-            key_filename=args.key_filename,
-            port=args.port,
-            timeout=args.timeout,
-        ))
-
-    failures = _print_results(results, args.verbose)
-    sys.exit(1 if failures else 0)
+    main()
+```
