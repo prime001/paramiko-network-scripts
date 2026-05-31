@@ -1,214 +1,172 @@
 ```python
 """
-neighbor_discovery.py - CDP/LLDP neighbor discovery and topology audit via SSH.
+vlan_table.py - Retrieve and parse VLAN table from Cisco IOS/NX-OS devices.
 
 Purpose:
-    Connects to a Cisco (or compatible) device over SSH using Paramiko, runs
-    'show cdp neighbors detail' and/or 'show lldp neighbors detail', and parses
-    the output into a structured neighbor inventory. Useful for ad-hoc topology
-    audits and verifying cabling without access to a network controller.
+    SSH into a network device, run 'show vlan brief', and parse the output
+    into structured data showing VLAN ID, name, status, and assigned ports.
+    Useful for auditing VLAN assignments and identifying unused VLANs.
 
 Usage:
-    python neighbor_discovery.py --host 192.168.1.1 --user admin --password secret
-    python neighbor_discovery.py --host 192.168.1.1 --user admin --key ~/.ssh/id_rsa
-    python neighbor_discovery.py --host 192.168.1.1 --user admin --password secret \
-        --protocol lldp --output neighbors.json
+    python vlan_table.py -d 192.168.1.1 -u admin -p secret
+    python vlan_table.py -d 192.168.1.1 -u admin --key ~/.ssh/id_rsa
+    python vlan_table.py -d 192.168.1.1 -u admin -p secret --status active --json
 
 Prerequisites:
     pip install paramiko
-    CDP and/or LLDP must be enabled on the target device. The connecting user
-    must have read access to 'show cdp/lldp neighbors detail'.
+    Device must allow SSH and 'show vlan brief' (Cisco IOS, IOS-XE, NX-OS)
 """
 
 import argparse
-import getpass
 import json
 import logging
 import re
 import sys
-import time
+from getpass import getpass
 
 import paramiko
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
-RECV_TIMEOUT = 5
-RECV_BUFFER = 65535
 
-
-def ssh_connect(host, port, username, password=None, key_path=None):
+def ssh_connect(host, username, password=None, key_file=None, port=22, timeout=10):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = dict(hostname=host, port=port, username=username, timeout=15)
-    if key_path:
-        kwargs["key_filename"] = key_path
+    kwargs = {
+        "hostname": host,
+        "port": port,
+        "username": username,
+        "timeout": timeout,
+        "look_for_keys": False,
+        "allow_agent": False,
+    }
+    if key_file:
+        kwargs["key_filename"] = key_file
+        kwargs["look_for_keys"] = True
     else:
         kwargs["password"] = password
-        kwargs["look_for_keys"] = False
     client.connect(**kwargs)
     return client
 
 
-def run_command(client, command, wait=RECV_TIMEOUT):
-    shell = client.invoke_shell()
-    shell.settimeout(wait)
-    time.sleep(1)
-    shell.recv(RECV_BUFFER)  # discard banner/prompt
-    shell.send(command + "\n")
-    time.sleep(wait)
-    output = b""
-    while shell.recv_ready():
-        output += shell.recv(RECV_BUFFER)
-    shell.close()
-    return output.decode("utf-8", errors="replace")
+def run_command(client, command, timeout=15):
+    _, stdout, stderr = client.exec_command(command, timeout=timeout)
+    output = stdout.read().decode("utf-8", errors="replace")
+    err = stderr.read().decode("utf-8", errors="replace")
+    if err.strip():
+        logger.warning("stderr: %s", err.strip())
+    return output
 
 
-def parse_cdp_neighbors(raw):
-    neighbors = []
-    blocks = re.split(r"-{10,}", raw)
-    for block in blocks:
-        if "Device ID" not in block:
+def parse_vlan_brief(output):
+    """Parse IOS-style 'show vlan brief'; handles port continuation lines."""
+    vlans = []
+    data_started = False
+
+    for line in output.splitlines():
+        if re.match(r"^-{4,}", line):
+            data_started = True
             continue
-        n = {}
-        m = re.search(r"Device ID:\s*(.+)", block)
-        if m:
-            n["device_id"] = m.group(1).strip()
-        m = re.search(r"IP address:\s*(\S+)", block, re.IGNORECASE)
-        if m:
-            n["ip_address"] = m.group(1)
-        m = re.search(r"Platform:\s*([^,]+)", block)
-        if m:
-            n["platform"] = m.group(1).strip()
-        m = re.search(r"Interface:\s*(\S+),\s*Port ID.*?:\s*(\S+)", block)
-        if m:
-            n["local_interface"] = m.group(1)
-            n["remote_interface"] = m.group(2)
-        m = re.search(r"Capabilities:\s*(.+)", block)
-        if m:
-            n["capabilities"] = m.group(1).strip()
-        if n:
-            neighbors.append(n)
-    return neighbors
-
-
-def parse_lldp_neighbors(raw):
-    neighbors = []
-    blocks = re.split(r"-{10,}|(?=Local Intf:)", raw)
-    for block in blocks:
-        if "System Name" not in block and "Port Description" not in block:
+        if not data_started or not line.strip():
             continue
-        n = {}
-        m = re.search(r"System Name:\s*(.+)", block)
-        if m:
-            n["device_id"] = m.group(1).strip()
-        m = re.search(r"Management Addresses.*?IP:\s*(\S+)", block, re.DOTALL)
-        if m:
-            n["ip_address"] = m.group(1)
-        m = re.search(r"System Description:\s*\n\s*(.+)", block)
-        if m:
-            n["platform"] = m.group(1).strip()
-        m = re.search(r"Local Intf:\s*(\S+)", block)
-        if m:
-            n["local_interface"] = m.group(1)
-        m = re.search(r"Port id:\s*(\S+)", block)
-        if m:
-            n["remote_interface"] = m.group(1)
-        m = re.search(r"System Capabilities:\s*(.+)", block)
-        if m:
-            n["capabilities"] = m.group(1).strip()
-        if n:
-            neighbors.append(n)
-    return neighbors
+
+        match = re.match(
+            r"^(\d{1,4})\s+(\S+)\s+(active|act/unsup|suspended|unsupported)\s*(.*)?$",
+            line,
+            re.IGNORECASE,
+        )
+        if match:
+            vlan_id, name, status, ports_raw = match.groups()
+            ports = [p.strip() for p in ports_raw.split(",") if p.strip()]
+            vlans.append({"id": int(vlan_id), "name": name, "status": status.lower(), "ports": ports})
+        elif vlans:
+            additional = [p.strip() for p in line.strip().split(",") if p.strip()]
+            if additional:
+                vlans[-1]["ports"].extend(additional)
+
+    return vlans
 
 
-def print_neighbors(neighbors, protocol):
-    if not neighbors:
-        print(f"No {protocol.upper()} neighbors found.")
-        return
-    print(f"\n{'=' * 70}")
-    print(f"  {protocol.upper()} Neighbors ({len(neighbors)} found)")
-    print(f"{'=' * 70}")
-    for n in neighbors:
-        print(f"  Device:        {n.get('device_id', 'N/A')}")
-        print(f"  IP Address:    {n.get('ip_address', 'N/A')}")
-        print(f"  Platform:      {n.get('platform', 'N/A')}")
-        print(f"  Local Iface:   {n.get('local_interface', 'N/A')}")
-        print(f"  Remote Iface:  {n.get('remote_interface', 'N/A')}")
-        print(f"  Capabilities:  {n.get('capabilities', 'N/A')}")
-        print(f"  {'-' * 66}")
+def format_table(vlans, device):
+    if not vlans:
+        return "No VLANs found."
+
+    id_w = max(4, max(len(str(v["id"])) for v in vlans))
+    name_w = max(16, max(len(v["name"]) for v in vlans))
+    status_w = max(10, max(len(v["status"]) for v in vlans))
+
+    header = f"{'VLAN':<{id_w}}  {'Name':<{name_w}}  {'Status':<{status_w}}  Ports"
+    sep = "-" * len(header)
+    lines = [f"\nVLAN Table — {device}", header, sep]
+
+    for v in vlans:
+        ports_str = ", ".join(v["ports"]) if v["ports"] else "(none)"
+        lines.append(
+            f"{v['id']:<{id_w}}  {v['name']:<{name_w}}  {v['status']:<{status_w}}  {ports_str}"
+        )
+
+    lines.append(f"\nTotal: {len(vlans)} VLAN(s)")
+    return "\n".join(lines)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Discover CDP/LLDP neighbors on a network device via SSH."
-    )
-    parser.add_argument("--host", required=True, help="Device IP or hostname")
+    parser = argparse.ArgumentParser(description="Parse VLAN table from Cisco IOS/NX-OS devices")
+    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    parser.add_argument("--key", dest="key_file", help="Path to SSH private key")
     parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--user", required=True, help="SSH username")
-    parser.add_argument("--password", help="SSH password (prompted if omitted)")
-    parser.add_argument("--key", help="Path to SSH private key file")
     parser.add_argument(
-        "--protocol",
-        choices=["cdp", "lldp", "both"],
-        default="both",
-        help="Discovery protocol to query (default: both)",
+        "--status",
+        choices=["active", "suspended", "all"],
+        default="all",
+        help="Filter VLANs by status (default: all)",
     )
-    parser.add_argument("--output", help="Write JSON results to this file path")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
-    if args.debug:
+    if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-        logging.getLogger("paramiko").setLevel(logging.DEBUG)
 
-    if not args.password and not args.key:
-        args.password = getpass.getpass(f"Password for {args.user}@{args.host}: ")
-
-    results = {}
+    if not args.key_file and not args.password:
+        args.password = getpass(f"Password for {args.username}@{args.device}: ")
 
     try:
-        logger.info("Connecting to %s:%d", args.host, args.port)
-        client = ssh_connect(args.host, args.port, args.user, args.password, args.key)
-        logger.info("Connected")
+        logger.info("Connecting to %s", args.device)
+        client = ssh_connect(
+            host=args.device,
+            username=args.username,
+            password=args.password,
+            key_file=args.key_file,
+            port=args.port,
+        )
+    except paramiko.AuthenticationException:
+        print(f"ERROR: Authentication failed for {args.username}@{args.device}", file=sys.stderr)
+        sys.exit(1)
+    except (paramiko.SSHException, OSError) as exc:
+        print(f"ERROR: Cannot connect to {args.device}: {exc}", file=sys.stderr)
+        sys.exit(1)
 
-        if args.protocol in ("cdp", "both"):
-            logger.info("Querying CDP neighbors")
-            raw = run_command(client, "show cdp neighbors detail")
-            neighbors = parse_cdp_neighbors(raw)
-            results["cdp"] = neighbors
-            print_neighbors(neighbors, "cdp")
-
-        if args.protocol in ("lldp", "both"):
-            logger.info("Querying LLDP neighbors")
-            raw = run_command(client, "show lldp neighbors detail")
-            neighbors = parse_lldp_neighbors(raw)
-            results["lldp"] = neighbors
-            print_neighbors(neighbors, "lldp")
-
+    try:
+        raw = run_command(client, "show vlan brief")
+        logger.debug("Raw output:\n%s", raw)
+    except Exception as exc:
+        print(f"ERROR: Command execution failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+    finally:
         client.close()
 
-    except paramiko.AuthenticationException:
-        logger.error("Authentication failed for %s@%s", args.user, args.host)
-        sys.exit(1)
-    except paramiko.SSHException as exc:
-        logger.error("SSH error: %s", exc)
-        sys.exit(1)
-    except OSError as exc:
-        logger.error("Connection failed: %s", exc)
-        sys.exit(1)
+    vlans = parse_vlan_brief(raw)
 
-    if args.output:
-        try:
-            with open(args.output, "w") as fh:
-                json.dump(results, fh, indent=2)
-            logger.info("Results written to %s", args.output)
-        except OSError as exc:
-            logger.error("Failed to write output file: %s", exc)
-            sys.exit(1)
+    if args.status != "all":
+        vlans = [v for v in vlans if args.status in v["status"]]
+
+    if args.json:
+        print(json.dumps(vlans, indent=2))
+    else:
+        print(format_table(vlans, args.device))
 
 
 if __name__ == "__main__":
