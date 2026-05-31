@@ -1,42 +1,26 @@
-The brainstorming skill's hard gate requires design approval before writing code, but the user's explicit instruction is "Output ONLY the script content" — a complete spec has already been given. User instructions take precedence per CLAUDE.md. Writing the script now.
-
+```python
 """
-config_backup_v3.py - Incremental config backup with change detection and rotation
+running_startup_sync.py - Detect and optionally resolve running vs startup config drift.
 
 Purpose:
-    Retrieves running configurations from network devices via SSH (paramiko),
-    writes a new backup only when the config has changed (MD5 comparison against
-    the most recent backup), and enforces a configurable retention limit by
-    removing the oldest backup files per device.
+    Connects to a network device via SSH and compares the running configuration
+    against the startup configuration to detect unsaved changes. Optionally saves
+    the running config to startup (write memory) when drift is found.
 
 Usage:
-    python config_backup_v3.py -d 192.168.1.1 -u admin -p secret
-    python config_backup_v3.py -d 192.168.1.1 -u admin --keep 7 --force
-    python config_backup_v3.py -d 192.168.1.1 -u admin --output-dir /net/backups
-
-    Password may also be supplied via the NET_PASSWORD environment variable.
-    If omitted entirely, the script prompts interactively.
-
-Exit codes:
-    0  New backup written
-    1  Connection / auth error
-    2  Config unchanged, no backup written (normal — useful in cron)
+    python running_startup_sync.py -H 192.168.1.1 -u admin -p secret
+    python running_startup_sync.py -H 192.168.1.1 -u admin -p secret --save
+    python running_startup_sync.py -H 192.168.1.1 -u admin -k ~/.ssh/id_rsa --save
 
 Prerequisites:
     pip install paramiko
-    SSH access with sufficient privilege to run 'show running-config'
-    (Cisco IOS / IOS-XE / NX-OS).
 """
 
 import argparse
-import getpass
-import hashlib
+import difflib
 import logging
-import os
 import sys
-from datetime import datetime
-from pathlib import Path
-from typing import Optional
+import time
 
 import paramiko
 
@@ -45,150 +29,155 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-def fetch_running_config(
-    host: str,
-    username: str,
-    password: str,
-    port: int = 22,
-    timeout: int = 30,
-) -> str:
+def _recv_until_prompt(channel, timeout=15, chunk_size=4096):
+    """Read channel output until prompt character or timeout."""
+    output = ""
+    channel.settimeout(timeout)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if channel.recv_ready():
+            chunk = channel.recv(chunk_size).decode("utf-8", errors="replace")
+            output += chunk
+            stripped = output.rstrip()
+            if stripped.endswith("#") or stripped.endswith(">"):
+                break
+        else:
+            time.sleep(0.1)
+    return output
+
+
+def _run_command(channel, command, timeout=30):
+    """Send command and return output (strips echoed command and prompt)."""
+    channel.send(command + "\n")
+    raw = _recv_until_prompt(channel, timeout=timeout)
+    lines = raw.splitlines()
+    body = lines[1:-1] if len(lines) > 2 else lines
+    return "\n".join(body)
+
+
+def connect(host, port, username, password, key_filename, timeout):
+    """Return an authenticated paramiko SSHClient."""
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    connect_kwargs = dict(
+        hostname=host,
+        port=port,
+        username=username,
+        timeout=timeout,
+        look_for_keys=False,
+        allow_agent=False,
+    )
+    if key_filename:
+        connect_kwargs["key_filename"] = key_filename
+        connect_kwargs["look_for_keys"] = True
+    else:
+        connect_kwargs["password"] = password
+    client.connect(**connect_kwargs)
+    return client
+
+
+def check_sync(host, port, username, password, key_filename, timeout, save_on_drift):
+    """
+    Connect to device, compare running vs startup config.
+
+    Returns True if configs are in sync (or drift was saved), False on unresolved drift.
+    """
+    client = None
     try:
-        client.connect(
-            host,
-            port=port,
-            username=username,
-            password=password,
-            timeout=timeout,
-            look_for_keys=False,
-            allow_agent=False,
+        logger.info("Connecting to %s:%d", host, port)
+        client = connect(host, port, username, password, key_filename, timeout)
+
+        channel = client.invoke_shell()
+        _recv_until_prompt(channel, timeout=10)
+
+        _run_command(channel, "terminal length 0", timeout=10)
+
+        logger.info("Fetching running-config")
+        running = _run_command(channel, "show running-config", timeout=60)
+
+        logger.info("Fetching startup-config")
+        startup = _run_command(channel, "show startup-config", timeout=60)
+
+        diff = list(
+            difflib.unified_diff(
+                startup.splitlines(),
+                running.splitlines(),
+                fromfile="startup-config",
+                tofile="running-config",
+                lineterm="",
+            )
         )
-        _, stdout, stderr = client.exec_command("show running-config", timeout=timeout)
-        config = stdout.read().decode("utf-8", errors="replace")
-        err = stderr.read().decode("utf-8", errors="replace").strip()
-        if err:
-            log.warning("Device stderr: %s", err)
-        return config
-    finally:
-        client.close()
 
+        if not diff:
+            logger.info("SYNC OK: running-config matches startup-config on %s", host)
+            return True
 
-def md5(text: str) -> str:
-    return hashlib.md5(text.encode("utf-8")).hexdigest()
+        logger.warning("DRIFT DETECTED on %s — %d diff lines", host, len(diff))
+        for line in diff[:40]:
+            print(line)
+        if len(diff) > 40:
+            print(f"... and {len(diff) - 40} more lines")
 
+        if save_on_drift:
+            logger.info("Saving running-config to startup-config on %s", host)
+            save_output = _run_command(channel, "write memory", timeout=30)
+            logger.info("Save result: %s", save_output.strip())
+            return True
 
-def latest_backup(backup_dir: Path, safe_host: str) -> Optional[Path]:
-    candidates = sorted(backup_dir.glob(f"{safe_host}_*.txt"))
-    return candidates[-1] if candidates else None
-
-
-def rotate_backups(backup_dir: Path, safe_host: str, keep: int) -> None:
-    files = sorted(backup_dir.glob(f"{safe_host}_*.txt"))
-    for stale in files[:-keep]:
-        stale.unlink()
-        log.info("Rotated: %s", stale.name)
-
-
-def run_backup(
-    host: str,
-    username: str,
-    password: str,
-    output_dir: Path,
-    port: int = 22,
-    keep: int = 10,
-    timeout: int = 30,
-    force: bool = False,
-) -> bool:
-    log.info("Connecting to %s:%d as %s", host, port, username)
-    try:
-        config = fetch_running_config(host, username, password, port=port, timeout=timeout)
-    except paramiko.AuthenticationException:
-        log.error("Authentication failed for %s@%s", username, host)
-        raise
-    except (paramiko.SSHException, OSError) as exc:
-        log.error("Connection error to %s: %s", host, exc)
-        raise
-
-    if not config.strip():
-        log.error("Empty config returned from %s — aborting", host)
         return False
 
-    current_hash = md5(config)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    safe_host = host.replace(".", "_")
-
-    if not force:
-        prev = latest_backup(output_dir, safe_host)
-        if prev:
-            if md5(prev.read_text(encoding="utf-8", errors="replace")) == current_hash:
-                log.info(
-                    "Config unchanged on %s (md5=%.8s) — skipping write",
-                    host,
-                    current_hash,
-                )
-                return False
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dest = output_dir / f"{safe_host}_{timestamp}.txt"
-    dest.write_text(config, encoding="utf-8")
-    log.info("Backup saved: %s (md5=%.8s)", dest.name, current_hash)
-
-    rotate_backups(output_dir, safe_host, keep)
-    return True
+    except paramiko.AuthenticationException:
+        logger.error("Authentication failed for %s@%s", username, host)
+        return False
+    except paramiko.SSHException as exc:
+        logger.error("SSH error on %s: %s", host, exc)
+        return False
+    except OSError as exc:
+        logger.error("Connection error on %s: %s", host, exc)
+        return False
+    finally:
+        if client:
+            client.close()
 
 
-def build_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Incremental config backup with change detection and file rotation"
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Detect running vs startup config drift on a network device."
     )
-    p.add_argument("-d", "--device", required=True, help="Device hostname or IP")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument(
-        "-p", "--password",
-        default=os.environ.get("NET_PASSWORD", ""),
-        help="SSH password (or set NET_PASSWORD env var)",
+    parser.add_argument("-H", "--host", required=True, help="Device hostname or IP")
+    parser.add_argument("-P", "--port", type=int, default=22, help="SSH port (default 22)")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", default="", help="SSH password")
+    parser.add_argument("-k", "--key-file", dest="key_file", help="Path to SSH private key")
+    parser.add_argument(
+        "-t", "--timeout", type=int, default=30, help="Connection timeout in seconds"
     )
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument(
-        "--output-dir", default="./backups",
-        help="Backup directory (default: ./backups)",
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Write memory on device if drift is detected",
     )
-    p.add_argument(
-        "--keep", type=int, default=10,
-        help="Backups to retain per device (default: 10)",
-    )
-    p.add_argument(
-        "--timeout", type=int, default=30,
-        help="SSH timeout in seconds (default: 30)",
-    )
-    p.add_argument(
-        "--force", action="store_true",
-        help="Write backup even if config is unchanged",
-    )
-    return p.parse_args()
+    return parser
 
 
 if __name__ == "__main__":
-    args = build_args()
+    args = build_parser().parse_args()
 
-    if not args.password:
-        args.password = getpass.getpass(f"Password for {args.username}@{args.device}: ")
+    if not args.password and not args.key_file:
+        import getpass
+        args.password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
 
-    try:
-        wrote = run_backup(
-            host=args.device,
-            username=args.username,
-            password=args.password,
-            output_dir=Path(args.output_dir),
-            port=args.port,
-            keep=args.keep,
-            timeout=args.timeout,
-            force=args.force,
-        )
-        sys.exit(0 if wrote else 2)
-    except (paramiko.AuthenticationException, paramiko.SSHException, OSError):
-        sys.exit(1)
+    synced = check_sync(
+        host=args.host,
+        port=args.port,
+        username=args.username,
+        password=args.password,
+        key_filename=args.key_file,
+        timeout=args.timeout,
+        save_on_drift=args.save,
+    )
+    sys.exit(0 if synced else 1)
+```
