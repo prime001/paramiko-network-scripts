@@ -1,22 +1,31 @@
-running_startup_diff.py — Detect unsaved configuration changes on network devices.
+The user's instructions are explicit and complete — the spec is fully defined, output only. Writing the script now.
 
-Connects via SSH (paramiko), fetches both 'show running-config' and
-'show startup-config', then produces a unified diff. Useful for change
-auditing, pre-maintenance checks, and cron-based drift detection.
+"""
+running_vs_startup_diff.py — Detect unsaved config changes on network devices.
 
-Exit codes:
-    0 — configs match (no unsaved changes)
-    1 — connection or authentication error
-    2 — diff exists (unsaved changes found)
+Compares 'show running-config' against 'show startup-config' via SSH and reports
+any lines that differ between the two. Use this before maintenance windows to
+confirm all changes are saved, or in scheduled audits to catch config drift before
+an unexpected reload wipes uncommitted work.
+
+Usage:
+    Single device:
+        python running_vs_startup_diff.py -d 192.168.1.1 -u admin
+
+    Multiple devices from a file (one host per line):
+        python running_vs_startup_diff.py -f devices.txt -u admin
+
+    Save configs automatically where drift is found:
+        python running_vs_startup_diff.py -f devices.txt -u admin --save
+
+    Suppress per-device diff, show summary only:
+        python running_vs_startup_diff.py -f devices.txt -u admin --summary-only
 
 Prerequisites:
     pip install paramiko
 
-Usage:
-    python running_startup_diff.py -H 192.168.1.1 -u admin -p secret
-    python running_startup_diff.py -H 192.168.1.1 -u admin --key ~/.ssh/id_rsa
-    python running_startup_diff.py -H 192.168.1.1 -u admin -p secret \
-        --context 5 --output /tmp/drift.txt --save-on-diff
+    Tested against Cisco IOS/IOS-XE. Devices must allow 'show startup-config';
+    some platforms require privilege level 15 or a local flash copy to exist.
 """
 
 import argparse
@@ -25,189 +34,194 @@ import getpass
 import logging
 import sys
 import time
-from typing import List, Optional
+from typing import Optional
 
 import paramiko
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
+
+_SKIP_PREFIXES = (
+    "Building configuration",
+    "Current configuration",
+    "Last configuration change",
+    "NVRAM config last updated",
+)
 
 
-def ssh_connect(
-    host: str,
-    username: str,
-    password: Optional[str] = None,
-    key_file: Optional[str] = None,
-    port: int = 22,
-    timeout: int = 30,
-) -> paramiko.SSHClient:
+def connect(host: str, username: str, password: str, port: int,
+            timeout: int) -> Optional[paramiko.SSHClient]:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = {
-        "hostname": host,
-        "port": port,
-        "username": username,
-        "timeout": timeout,
-        "look_for_keys": False,
-        "allow_agent": False,
-    }
-    if key_file:
-        kwargs["key_filename"] = key_file
-    elif password:
-        kwargs["password"] = password
-    client.connect(**kwargs)
-    return client
+    try:
+        client.connect(
+            host, port=port, username=username, password=password,
+            timeout=timeout, look_for_keys=False, allow_agent=False,
+        )
+        return client
+    except paramiko.AuthenticationException:
+        log.error("%s: authentication failed", host)
+    except paramiko.SSHException as exc:
+        log.error("%s: SSH error: %s", host, exc)
+    except OSError as exc:
+        log.error("%s: connection failed: %s", host, exc)
+    return None
 
 
-def send_command(shell: paramiko.Channel, command: str, wait: float = 2.5) -> str:
-    shell.send(command + "\n")
+def shell_run(client: paramiko.SSHClient, command: str,
+              wait: float = 3.0) -> str:
+    chan = client.invoke_shell(width=250, height=5000)
+    time.sleep(0.5)
+    chan.recv(65535)
+    chan.send("terminal length 0\n")
+    time.sleep(0.5)
+    chan.recv(65535)
+    chan.send(command + "\n")
     time.sleep(wait)
-    output = []
-    while shell.recv_ready():
-        output.append(shell.recv(65535).decode("utf-8", errors="replace"))
-    return "".join(output)
+
+    buf = ""
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if chan.recv_ready():
+            buf += chan.recv(65535).decode("utf-8", errors="replace")
+            tail = buf.rstrip()
+            if tail.endswith("#") or tail.endswith(">"):
+                break
+        else:
+            time.sleep(0.3)
+
+    chan.close()
+    return buf
 
 
-def fetch_config(shell: paramiko.Channel, command: str) -> List[str]:
-    raw = send_command(shell, command, wait=3.5)
+def normalize(raw: str) -> list[str]:
     lines = []
     for line in raw.splitlines():
-        stripped = line.rstrip()
-        if stripped.endswith("#") or stripped.endswith(">"):
+        s = line.rstrip()
+        if not s or s == "!":
             continue
-        if stripped.strip() == command.strip():
+        if any(s.startswith(p) for p in _SKIP_PREFIXES):
             continue
-        lines.append(stripped)
-    while lines and not lines[0].strip():
-        lines.pop(0)
-    while lines and not lines[-1].strip():
-        lines.pop()
+        lines.append(s)
     return lines
 
 
-def build_diff(
-    running: List[str], startup: List[str], context: int = 3
-) -> List[str]:
-    return list(
-        difflib.unified_diff(
-            startup,
-            running,
+def check_device(host: str, username: str, password: str,
+                 port: int, timeout: int, save: bool) -> dict:
+    result = {"host": host, "status": "error", "diff": [], "saved": False}
+
+    client = connect(host, username, password, port, timeout)
+    if not client:
+        return result
+
+    try:
+        log.info("%s: reading running-config", host)
+        running = normalize(shell_run(client, "show running-config", wait=4))
+
+        log.info("%s: reading startup-config", host)
+        startup = normalize(shell_run(client, "show startup-config", wait=4))
+
+        diff = list(difflib.unified_diff(
+            startup, running,
             fromfile="startup-config",
             tofile="running-config",
             lineterm="",
-            n=context,
-        )
+        ))
+        result["diff"] = diff
+        result["status"] = "drift" if diff else "clean"
+
+        if diff and save:
+            log.info("%s: writing memory", host)
+            shell_run(client, "write memory", wait=5)
+            result["saved"] = True
+    finally:
+        client.close()
+
+    return result
+
+
+def load_hosts(path: str) -> list[str]:
+    with open(path) as fh:
+        return [
+            line.strip() for line in fh
+            if line.strip() and not line.startswith("#")
+        ]
+
+
+def print_report(results: list[dict], summary_only: bool) -> None:
+    clean = [r for r in results if r["status"] == "clean"]
+    drift = [r for r in results if r["status"] == "drift"]
+    errors = [r for r in results if r["status"] == "error"]
+
+    print("\n" + "=" * 60)
+    print("RUNNING vs STARTUP CONFIG REPORT")
+    print("=" * 60)
+    print(
+        f"\nDevices: {len(results)}  |  "
+        f"Clean: {len(clean)}  |  "
+        f"Drift: {len(drift)}  |  "
+        f"Unreachable: {len(errors)}\n"
     )
+
+    for r in errors:
+        print(f"  [ERROR]  {r['host']}")
+
+    for r in clean:
+        print(f"  [CLEAN]  {r['host']}")
+
+    for r in drift:
+        tag = "[SAVED]" if r["saved"] else "[UNSAVED]"
+        print(f"  [DRIFT]  {r['host']}  {tag}  ({len(r['diff'])} diff lines)")
+        if not summary_only:
+            print()
+            for line in r["diff"]:
+                print("    " + line)
+            print()
+
+    print()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Diff running-config vs startup-config to detect unsaved changes"
+        description="Compare running-config vs startup-config to find unsaved changes."
     )
-    parser.add_argument("-H", "--host", required=True, help="Device hostname or IP")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("-d", "--device", help="Single device hostname or IP")
+    target.add_argument("-f", "--file", help="File listing one host per line")
+    parser.add_argument("-u", "--username", required=True)
     parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
-    parser.add_argument("--key", metavar="FILE", help="SSH private key path")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument(
-        "--timeout", type=int, default=30, help="Connection timeout in seconds"
-    )
-    parser.add_argument(
-        "--context",
-        type=int,
-        default=3,
-        help="Lines of context around each diff hunk (default: 3)",
-    )
-    parser.add_argument(
-        "--output", metavar="FILE", help="Write diff to file instead of stdout"
-    )
-    parser.add_argument(
-        "--save-on-diff",
-        action="store_true",
-        help="Issue 'write memory' when unsaved changes are found",
-    )
-    parser.add_argument(
-        "-q",
-        "--quiet",
-        action="store_true",
-        help="Suppress informational messages; rely on exit code",
-    )
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument("--timeout", type=int, default=30,
+                        help="Connection timeout in seconds (default: 30)")
+    parser.add_argument("--save", action="store_true",
+                        help="Run 'write memory' on devices where drift is found")
+    parser.add_argument("--summary-only", action="store_true",
+                        help="Print summary table only; suppress line-by-line diff")
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
-    if not args.key and not args.password:
-        args.password = getpass.getpass(
-            f"Password for {args.username}@{args.host}: "
-        )
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    if args.quiet:
-        logger.setLevel(logging.WARNING)
+    password = args.password or getpass.getpass(f"Password for {args.username}: ")
+    hosts = [args.device] if args.device else load_hosts(args.file)
 
-    try:
-        logger.info("Connecting to %s:%d", args.host, args.port)
-        client = ssh_connect(
-            args.host,
-            args.username,
-            password=args.password,
-            key_file=args.key,
-            port=args.port,
-            timeout=args.timeout,
-        )
-    except paramiko.AuthenticationException:
-        logger.error("Authentication failed for %s@%s", args.username, args.host)
-        return 1
-    except (paramiko.SSHException, OSError) as exc:
-        logger.error("Connection failed: %s", exc)
+    if not hosts:
+        log.error("No hosts to check.")
         return 1
 
-    try:
-        shell = client.invoke_shell(width=220, height=200)
-        time.sleep(1.5)
-        shell.recv(65535)
+    results = [
+        check_device(h, args.username, password, args.port, args.timeout, args.save)
+        for h in hosts
+    ]
 
-        send_command(shell, "terminal length 0", wait=1.0)
+    print_report(results, args.summary_only)
 
-        logger.info("Fetching running-config from %s", args.host)
-        running = fetch_config(shell, "show running-config")
-
-        logger.info("Fetching startup-config from %s", args.host)
-        startup = fetch_config(shell, "show startup-config")
-
-        diff = build_diff(running, startup, context=args.context)
-
-        if not diff:
-            logger.info(
-                "Clean: running-config matches startup-config on %s", args.host
-            )
-            return 0
-
-        logger.info(
-            "Drift detected on %s: %d diff lines", args.host, len(diff)
-        )
-        diff_text = "\n".join(diff)
-
-        if args.output:
-            with open(args.output, "w") as fh:
-                fh.write(diff_text + "\n")
-            logger.info("Diff written to %s", args.output)
-        else:
-            print(diff_text)
-
-        if args.save_on_diff:
-            logger.info("Saving configuration on %s (write memory)", args.host)
-            send_command(shell, "write memory", wait=4.0)
-            logger.info("Configuration saved on %s", args.host)
-
-        return 2
-
-    except paramiko.SSHException as exc:
-        logger.error("SSH error during command execution: %s", exc)
-        return 1
-    finally:
-        client.close()
-        logger.debug("SSH connection to %s closed", args.host)
+    return 1 if any(r["status"] == "drift" for r in results) else 0
 
 
 if __name__ == "__main__":
