@@ -1,194 +1,177 @@
-```python
-"""
-Device Configuration Validator
+Network Device Health Monitor
 
-Validates critical device configurations against best practices.
-Connects via SSH, executes validation commands, and reports configuration issues.
+Polls CPU utilization, memory usage, and uptime from Cisco IOS/NX-OS devices
+via SSH and produces a per-device health summary. Useful for pre-maintenance
+checks, NOC dashboards, and alerting pipelines.
 
 Usage:
-    python config_validator.py -d 192.168.1.1 -u admin -p password
-    python config_validator.py -d 192.168.1.1 -u admin -k ~/.ssh/id_rsa
+    python health_monitor.py --host 192.168.1.1 --username admin --password secret
+    python health_monitor.py --hosts hosts.txt --username admin --key-file ~/.ssh/id_rsa
+    python health_monitor.py --host 192.168.1.1 --username admin --password secret --json
 
 Prerequisites:
-    - Device must support SSH access
-    - paramiko library: pip install paramiko
-    - Device must support standard show commands
+    pip install paramiko
 """
 
-import paramiko
-import logging
 import argparse
+import json
+import logging
+import re
 import sys
+from dataclasses import asdict, dataclass
+from typing import Optional
+
+import paramiko
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-class ConfigValidator:
-    """Validates device configuration compliance with best practices."""
+@dataclass
+class DeviceHealth:
+    host: str
+    reachable: bool
+    uptime: Optional[str] = None
+    cpu_5min: Optional[float] = None
+    mem_used_pct: Optional[float] = None
+    error: Optional[str] = None
 
-    def __init__(self, host, username, password=None, key_file=None,
-                 timeout=10, port=22):
-        self.host = host
-        self.username = username
-        self.password = password
-        self.key_file = key_file
-        self.timeout = timeout
-        self.port = port
-        self.client = None
-        self.issues = []
 
-    def connect(self):
-        """Establish SSH connection to device."""
+def _exec(client: paramiko.SSHClient, command: str, timeout: int = 10) -> str:
+    _, stdout, _ = client.exec_command(command, timeout=timeout)
+    return stdout.read().decode(errors="replace")
+
+
+def connect(
+    host: str,
+    username: str,
+    password: str,
+    key_file: str,
+    port: int,
+    timeout: int,
+) -> paramiko.SSHClient:
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    kwargs: dict = dict(hostname=host, port=port, username=username, timeout=timeout)
+    if key_file:
+        kwargs["key_filename"] = key_file
+    else:
+        kwargs["password"] = password
+        kwargs["look_for_keys"] = False
+    client.connect(**kwargs)
+    return client
+
+
+def parse_cpu(output: str) -> Optional[float]:
+    # IOS: "five minutes: 7%"
+    m = re.search(r"five minutes:\s*(\d+)%", output)
+    if m:
+        return float(m.group(1))
+    # NX-OS: three-column float percentages, last column is 5-min
+    m = re.search(r"\d+\.\d+%\s+\d+\.\d+%\s+(\d+\.\d+)%", output)
+    if m:
+        return float(m.group(1))
+    return None
+
+
+def parse_memory(output: str) -> Optional[float]:
+    # IOS: "Processor Pool Total: 123456 Used: 78901 Free: 44555"
+    m = re.search(r"Total:\s*(\d+)\s+Used:\s*(\d+)", output)
+    if m:
+        total, used = int(m.group(1)), int(m.group(2))
+        return round(used / total * 100, 1) if total else None
+    return None
+
+
+def parse_uptime(output: str) -> Optional[str]:
+    m = re.search(r"uptime is (.+)", output, re.IGNORECASE)
+    return m.group(1).strip() if m else None
+
+
+def poll_device(
+    host: str,
+    username: str,
+    password: str,
+    key_file: str,
+    port: int,
+    timeout: int,
+) -> DeviceHealth:
+    health = DeviceHealth(host=host, reachable=False)
+    try:
+        client = connect(host, username, password, key_file, port, timeout)
+        health.reachable = True
         try:
-            self.client = paramiko.SSHClient()
-            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-            if self.key_file:
-                self.client.connect(
-                    self.host, port=self.port, username=self.username,
-                    key_filename=self.key_file, timeout=self.timeout,
-                    look_for_keys=False
-                )
-            else:
-                self.client.connect(
-                    self.host, port=self.port, username=self.username,
-                    password=self.password, timeout=self.timeout
-                )
-            logger.info(f"Connected to {self.host}")
-            return True
-        except paramiko.AuthenticationException:
-            logger.error("Authentication failed")
-            return False
-        except Exception as e:
-            logger.error(f"Connection error: {e}")
-            return False
-
-    def run_command(self, cmd):
-        """Execute command on device and return output."""
-        try:
-            stdin, stdout, stderr = self.client.exec_command(cmd,
-                                                              timeout=self.timeout)
-            return stdout.read().decode('utf-8')
-        except Exception as e:
-            logger.error(f"Command execution error: {e}")
-            return ""
-
-    def check_hostname(self):
-        """Verify hostname is configured."""
-        output = self.run_command("show running-config | include hostname")
-        if not output.strip():
-            self.issues.append("CRITICAL: Hostname not configured")
-
-    def check_dns_servers(self):
-        """Verify DNS servers are configured."""
-        output = self.run_command("show running-config | include ip name-server")
-        if not output.strip():
-            self.issues.append("WARNING: No DNS servers configured")
-
-    def check_syslog(self):
-        """Verify logging/syslog is configured."""
-        output = self.run_command("show running-config | include logging")
-        if not output.strip():
-            self.issues.append("WARNING: No syslog servers configured")
-
-    def check_ntp(self):
-        """Verify NTP is configured."""
-        output = self.run_command("show running-config | include ntp")
-        if not output.strip():
-            self.issues.append("WARNING: No NTP configured")
-
-    def check_interfaces_down(self):
-        """Identify unexpectedly down interfaces."""
-        output = self.run_command("show interface brief")
-        down_count = output.count("down")
-        if down_count > 0:
-            self.issues.append(f"INFO: {down_count} interfaces down")
-
-    def check_spanning_tree(self):
-        """Verify spanning tree is running."""
-        output = self.run_command("show spanning-tree root")
-        if "disabled" in output.lower():
-            self.issues.append("WARNING: Spanning tree disabled")
-
-    def validate(self):
-        """Run all validation checks."""
-        logger.info("Starting configuration validation")
-        self.check_hostname()
-        self.check_dns_servers()
-        self.check_syslog()
-        self.check_ntp()
-        self.check_interfaces_down()
-        self.check_spanning_tree()
-        return self.issues
-
-    def disconnect(self):
-        """Close SSH connection."""
-        if self.client:
-            self.client.close()
-            logger.info("Disconnected")
+            health.uptime = parse_uptime(_exec(client, "show version"))
+            health.cpu_5min = parse_cpu(_exec(client, "show processes cpu"))
+            health.mem_used_pct = parse_memory(_exec(client, "show processes memory"))
+        finally:
+            client.close()
+    except paramiko.AuthenticationException:
+        health.error = "authentication failed"
+        log.error("%s: authentication failed", host)
+    except Exception as exc:
+        health.error = str(exc)
+        log.error("%s: %s", host, exc)
+    return health
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='Validate device configuration best practices'
-    )
-    parser.add_argument('-d', '--device', required=True,
-                        help='Device IP or hostname')
-    parser.add_argument('-u', '--username', required=True,
-                        help='SSH username')
-    parser.add_argument('-p', '--password',
-                        help='SSH password')
-    parser.add_argument('-k', '--key-file',
-                        help='SSH private key file path')
-    parser.add_argument('--port', type=int, default=22,
-                        help='SSH port (default: 22)')
-    parser.add_argument('--timeout', type=int, default=10,
-                        help='Command timeout in seconds (default: 10)')
+def print_table(results: list) -> None:
+    print(f"\n{'HOST':<22} {'UP':<5} {'CPU 5m%':<10} {'MEM%':<8} UPTIME / ERROR")
+    print("-" * 80)
+    for r in results:
+        cpu = f"{r.cpu_5min:.1f}" if r.cpu_5min is not None else "n/a"
+        mem = f"{r.mem_used_pct:.1f}" if r.mem_used_pct is not None else "n/a"
+        detail = r.uptime or r.error or "n/a"
+        status = "YES" if r.reachable else "NO"
+        print(f"{r.host:<22} {status:<5} {cpu:<10} {mem:<8} {detail}")
+    print()
 
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="SSH-based network device health monitor")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--host", help="Single device IP or hostname")
+    group.add_argument("--hosts", metavar="FILE", help="File with one host per line")
+    parser.add_argument("--username", required=True)
+    parser.add_argument("--password", default="")
+    parser.add_argument("--key-file", default="", metavar="PATH")
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument("--timeout", type=int, default=10, metavar="SECS")
+    parser.add_argument("--json", action="store_true", dest="as_json", help="Emit JSON")
     args = parser.parse_args()
 
-    if not args.password and not args.key_file:
-        logger.error("Provide either --password or --key-file")
-        sys.exit(1)
+    if args.hosts:
+        try:
+            with open(args.hosts) as fh:
+                hosts = [
+                    line.strip()
+                    for line in fh
+                    if line.strip() and not line.startswith("#")
+                ]
+        except OSError as exc:
+            log.error("Cannot read hosts file: %s", exc)
+            return 1
+    else:
+        hosts = [args.host]
 
-    validator = ConfigValidator(
-        host=args.device,
-        username=args.username,
-        password=args.password,
-        key_file=args.key_file,
-        timeout=args.timeout,
-        port=args.port
-    )
+    results = []
+    for host in hosts:
+        log.info("Polling %s", host)
+        results.append(
+            poll_device(host, args.username, args.password, args.key_file, args.port, args.timeout)
+        )
 
-    if not validator.connect():
-        sys.exit(1)
+    if args.as_json:
+        print(json.dumps([asdict(r) for r in results], indent=2))
+    else:
+        print_table(results)
 
-    try:
-        issues = validator.validate()
-
-        print(f"\n{'='*70}")
-        print(f"Configuration Validation Report: {args.device}")
-        print(f"{'='*70}")
-
-        if issues:
-            print(f"\nFindings ({len(issues)}):\n")
-            for issue in issues:
-                prefix = issue.split(':')[0]
-                symbol = "✓" if prefix == "INFO" else "⚠" if prefix == "WARNING" else "✗"
-                print(f"  {symbol} {issue}")
-        else:
-            print("\n✓ No configuration issues detected")
-
-        print(f"\n{'='*70}\n")
-        sys.exit(0 if not any("CRITICAL" in i for i in issues) else 1)
-    finally:
-        validator.disconnect()
+    return 1 if any(not r.reachable for r in results) else 0
 
 
 if __name__ == "__main__":
-    main()
-```
+    sys.exit(main())
