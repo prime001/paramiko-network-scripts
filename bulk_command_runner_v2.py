@@ -1,25 +1,35 @@
-Network Device Health Monitor
+#!/usr/bin/env python3
+"""
+vlan_audit.py - Cross-device VLAN consistency auditor
 
-Polls CPU utilization, memory usage, and uptime from Cisco IOS/NX-OS devices
-via SSH and produces a per-device health summary. Useful for pre-maintenance
-checks, NOC dashboards, and alerting pipelines.
+Purpose:
+    Connects to multiple network switches via SSH and audits VLAN consistency
+    across the fleet. Identifies VLANs present on some switches but missing on
+    others, helping catch provisioning gaps before they cause traffic black-holes.
 
 Usage:
-    python health_monitor.py --host 192.168.1.1 --username admin --password secret
-    python health_monitor.py --hosts hosts.txt --username admin --key-file ~/.ssh/id_rsa
-    python health_monitor.py --host 192.168.1.1 --username admin --password secret --json
+    python vlan_audit.py --hosts 10.0.0.1 10.0.0.2 10.0.0.3 \
+        --username admin --password secret
+
+    python vlan_audit.py --inventory switches.txt \
+        --username netops --key-file ~/.ssh/id_rsa --output audit.json
 
 Prerequisites:
     pip install paramiko
+
+    Devices must have SSH enabled. The account needs read access to
+    run 'show vlan brief' (Cisco IOS/NX-OS). Exits 0 when all VLANs are
+    consistent, 2 when discrepancies are found (useful in CI pipelines).
 """
 
 import argparse
+import getpass
 import json
 import logging
 import re
 import sys
-from dataclasses import asdict, dataclass
-from typing import Optional
+from collections import defaultdict
+from typing import Dict, List, Optional
 
 import paramiko
 
@@ -30,148 +40,176 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-
-@dataclass
-class DeviceHealth:
-    host: str
-    reachable: bool
-    uptime: Optional[str] = None
-    cpu_5min: Optional[float] = None
-    mem_used_pct: Optional[float] = None
-    error: Optional[str] = None
+# Legacy token-ring VLANs that IOS always reports; skip them in comparisons.
+_LEGACY_VLANS = {1002, 1003, 1004, 1005}
 
 
-def _exec(client: paramiko.SSHClient, command: str, timeout: int = 10) -> str:
-    _, stdout, _ = client.exec_command(command, timeout=timeout)
-    return stdout.read().decode(errors="replace")
-
-
-def connect(
+def ssh_connect(
     host: str,
     username: str,
-    password: str,
-    key_file: str,
+    password: Optional[str],
+    key_file: Optional[str],
     port: int,
     timeout: int,
 ) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs: dict = dict(hostname=host, port=port, username=username, timeout=timeout)
+    kwargs: dict = {
+        "hostname": host,
+        "username": username,
+        "port": port,
+        "timeout": timeout,
+        "look_for_keys": False,
+        "allow_agent": False,
+    }
     if key_file:
         kwargs["key_filename"] = key_file
     else:
         kwargs["password"] = password
-        kwargs["look_for_keys"] = False
     client.connect(**kwargs)
     return client
 
 
-def parse_cpu(output: str) -> Optional[float]:
-    # IOS: "five minutes: 7%"
-    m = re.search(r"five minutes:\s*(\d+)%", output)
-    if m:
-        return float(m.group(1))
-    # NX-OS: three-column float percentages, last column is 5-min
-    m = re.search(r"\d+\.\d+%\s+\d+\.\d+%\s+(\d+\.\d+)%", output)
-    if m:
-        return float(m.group(1))
-    return None
+def run_command(client: paramiko.SSHClient, command: str, timeout: int = 15) -> str:
+    _, stdout, stderr = client.exec_command(command, timeout=timeout)
+    out = stdout.read().decode("utf-8", errors="replace")
+    err = stderr.read().decode("utf-8", errors="replace").strip()
+    if err:
+        log.debug("stderr: %s", err)
+    return out
 
 
-def parse_memory(output: str) -> Optional[float]:
-    # IOS: "Processor Pool Total: 123456 Used: 78901 Free: 44555"
-    m = re.search(r"Total:\s*(\d+)\s+Used:\s*(\d+)", output)
-    if m:
-        total, used = int(m.group(1)), int(m.group(2))
-        return round(used / total * 100, 1) if total else None
-    return None
+def parse_vlan_brief(output: str) -> Dict[int, dict]:
+    """Return {vlan_id: {name, status}} from 'show vlan brief' output."""
+    vlans: Dict[int, dict] = {}
+    pattern = re.compile(
+        r"^(\d+)\s+(\S+)\s+(active|act/unsup|suspended|unsupported)",
+        re.IGNORECASE,
+    )
+    for line in output.splitlines():
+        m = pattern.match(line.strip())
+        if not m:
+            continue
+        vid = int(m.group(1))
+        if vid in _LEGACY_VLANS:
+            continue
+        vlans[vid] = {"name": m.group(2), "status": m.group(3).lower()}
+    return vlans
 
 
-def parse_uptime(output: str) -> Optional[str]:
-    m = re.search(r"uptime is (.+)", output, re.IGNORECASE)
-    return m.group(1).strip() if m else None
+def build_audit_report(device_vlans: Dict[str, Dict[int, dict]]) -> dict:
+    """Produce a consistency report comparing VLAN tables across all devices."""
+    all_vlans: set = set()
+    for vlans in device_vlans.values():
+        all_vlans.update(vlans)
+
+    presence: Dict[int, List[str]] = defaultdict(list)
+    for vid in all_vlans:
+        for host, vlans in device_vlans.items():
+            if vid in vlans:
+                presence[vid].append(host)
+
+    n_devices = len(device_vlans)
+    universal = sorted(v for v, hosts in presence.items() if len(hosts) == n_devices)
+    partial = {v: hosts for v, hosts in presence.items() if len(hosts) < n_devices}
+
+    per_device = {}
+    for host, vlans in device_vlans.items():
+        per_device[host] = {
+            "vlan_count": len(vlans),
+            "missing_vlans": sorted(v for v in partial if v not in vlans),
+            "device_only_vlans": sorted(v for v in vlans if presence[v] == [host]),
+        }
+
+    return {
+        "universal_vlans": universal,
+        "inconsistent_vlans": {str(v): sorted(hosts) for v, hosts in sorted(partial.items())},
+        "per_device": per_device,
+    }
 
 
-def poll_device(
-    host: str,
-    username: str,
-    password: str,
-    key_file: str,
-    port: int,
-    timeout: int,
-) -> DeviceHealth:
-    health = DeviceHealth(host=host, reachable=False)
-    try:
-        client = connect(host, username, password, key_file, port, timeout)
-        health.reachable = True
-        try:
-            health.uptime = parse_uptime(_exec(client, "show version"))
-            health.cpu_5min = parse_cpu(_exec(client, "show processes cpu"))
-            health.mem_used_pct = parse_memory(_exec(client, "show processes memory"))
-        finally:
-            client.close()
-    except paramiko.AuthenticationException:
-        health.error = "authentication failed"
-        log.error("%s: authentication failed", host)
-    except Exception as exc:
-        health.error = str(exc)
-        log.error("%s: %s", host, exc)
-    return health
+def load_inventory(path: str) -> List[str]:
+    with open(path) as fh:
+        return [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
 
 
-def print_table(results: list) -> None:
-    print(f"\n{'HOST':<22} {'UP':<5} {'CPU 5m%':<10} {'MEM%':<8} UPTIME / ERROR")
-    print("-" * 80)
-    for r in results:
-        cpu = f"{r.cpu_5min:.1f}" if r.cpu_5min is not None else "n/a"
-        mem = f"{r.mem_used_pct:.1f}" if r.mem_used_pct is not None else "n/a"
-        detail = r.uptime or r.error or "n/a"
-        status = "YES" if r.reachable else "NO"
-        print(f"{r.host:<22} {status:<5} {cpu:<10} {mem:<8} {detail}")
-    print()
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Audit VLAN consistency across multiple switches",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--hosts", nargs="+", metavar="HOST")
+    src.add_argument("--inventory", metavar="FILE", help="One host per line")
+
+    p.add_argument("--username", required=True)
+    creds = p.add_mutually_exclusive_group()
+    creds.add_argument("--password")
+    creds.add_argument("--key-file", metavar="PATH")
+
+    p.add_argument("--port", type=int, default=22)
+    p.add_argument("--timeout", type=int, default=10, metavar="SEC")
+    p.add_argument("--output", metavar="FILE", help="Write JSON report here")
+    p.add_argument("--verbose", action="store_true")
+    return p
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="SSH-based network device health monitor")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--host", help="Single device IP or hostname")
-    group.add_argument("--hosts", metavar="FILE", help="File with one host per line")
-    parser.add_argument("--username", required=True)
-    parser.add_argument("--password", default="")
-    parser.add_argument("--key-file", default="", metavar="PATH")
-    parser.add_argument("--port", type=int, default=22)
-    parser.add_argument("--timeout", type=int, default=10, metavar="SECS")
-    parser.add_argument("--json", action="store_true", dest="as_json", help="Emit JSON")
-    args = parser.parse_args()
+def main() -> None:
+    args = build_parser().parse_args()
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    if args.hosts:
-        try:
-            with open(args.hosts) as fh:
-                hosts = [
-                    line.strip()
-                    for line in fh
-                    if line.strip() and not line.startswith("#")
-                ]
-        except OSError as exc:
-            log.error("Cannot read hosts file: %s", exc)
-            return 1
-    else:
-        hosts = [args.host]
+    hosts = args.hosts if args.hosts else load_inventory(args.inventory)
+    if not hosts:
+        log.error("No hosts to audit")
+        sys.exit(1)
 
-    results = []
+    if not args.password and not args.key_file:
+        args.password = getpass.getpass(f"Password for {args.username}: ")
+
+    device_vlans: Dict[str, Dict[int, dict]] = {}
+    failed: List[str] = []
+
     for host in hosts:
-        log.info("Polling %s", host)
-        results.append(
-            poll_device(host, args.username, args.password, args.key_file, args.port, args.timeout)
-        )
+        log.info("Querying %s", host)
+        try:
+            client = ssh_connect(
+                host, args.username, args.password, args.key_file,
+                args.port, args.timeout,
+            )
+            raw = run_command(client, "show vlan brief")
+            client.close()
+            vlans = parse_vlan_brief(raw)
+            device_vlans[host] = vlans
+            log.info("%s: %d VLANs found", host, len(vlans))
+        except paramiko.AuthenticationException:
+            log.error("%s: authentication failed", host)
+            failed.append(host)
+        except (paramiko.SSHException, OSError) as exc:
+            log.error("%s: %s", host, exc)
+            failed.append(host)
 
-    if args.as_json:
-        print(json.dumps([asdict(r) for r in results], indent=2))
+    if not device_vlans:
+        log.error("No devices responded")
+        sys.exit(1)
+
+    report = build_audit_report(device_vlans)
+    report["failed_hosts"] = failed
+
+    serialized = json.dumps(report, indent=2)
+    if args.output:
+        with open(args.output, "w") as fh:
+            fh.write(serialized)
+        log.info("Report written to %s", args.output)
     else:
-        print_table(results)
+        print(serialized)
 
-    return 1 if any(not r.reachable for r in results) else 0
+    n_inconsistent = len(report["inconsistent_vlans"])
+    if n_inconsistent:
+        log.warning("%d VLAN(s) inconsistent across fleet", n_inconsistent)
+        sys.exit(2)
+    log.info("All VLANs consistent across %d device(s)", len(device_vlans))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
