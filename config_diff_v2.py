@@ -1,36 +1,36 @@
-The prompt says "Output ONLY the script content" — outputting directly:
-
-```
+```python
 """
-running_startup_diff.py — Detect unsaved configuration drift on network devices.
+config_drift_monitor.py - Detect unauthorized configuration changes on network devices.
 
-Compares 'show running-config' against 'show startup-config' to surface changes
-that have not been written to NVRAM. Useful for pre-maintenance hygiene checks,
-change-window audits, and compliance verification.
+Purpose:
+    Connects to a network device, retrieves the running configuration, and compares
+    it against a saved baseline. Reports any drift (additions, removals) since the
+    baseline was established. Useful for change management audits and detecting
+    unauthorized modifications between maintenance windows.
 
 Usage:
-    # Single device
-    python running_startup_diff.py -H 192.168.1.1 -u admin -p secret
+    # Save initial baseline:
+    python config_drift_monitor.py -H 192.168.1.1 -u admin -p secret --save-baseline
 
-    # Multiple devices from a file (one IP/hostname per line, # for comments)
-    python running_startup_diff.py --hosts devices.txt -u admin -p secret
+    # Check for drift against saved baseline:
+    python config_drift_monitor.py -H 192.168.1.1 -u admin -p secret
 
-    # Save report to file and exit non-zero if any drift found
-    python running_startup_diff.py -H 192.168.1.1 -u admin -p secret \
-        -o drift_report.txt --exit-nonzero
-
-    # Use SSH key authentication
-    python running_startup_diff.py -H 192.168.1.1 -u admin --key ~/.ssh/id_rsa
+    # Write diff to file instead of stdout:
+    python config_drift_monitor.py -H 192.168.1.1 -u admin -p secret --output /tmp/drift.diff
 
 Prerequisites:
     pip install paramiko
+
+Exit codes: 0 = clean, 1 = error, 2 = drift detected (useful for CI/alerting pipelines).
 """
 
 import argparse
 import difflib
 import logging
+import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import paramiko
@@ -38,186 +38,200 @@ import paramiko
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-def _drain(channel: paramiko.Channel, timeout: float = 30.0) -> str:
-    """Read from channel until a prompt character appears or timeout."""
-    buf = ""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if channel.recv_ready():
-            buf += channel.recv(65535).decode("utf-8", errors="replace")
-            if buf.rstrip().endswith(("#", ">")):
-                break
-        else:
-            time.sleep(0.05)
-    return buf
-
-
-def _send(channel: paramiko.Channel, cmd: str, timeout: float = 90.0) -> str:
-    """Send a command and return output with echoed command and prompt stripped."""
-    channel.send(cmd + "\n")
-    raw = _drain(channel, timeout)
-    lines = raw.splitlines()
-    if lines and cmd.strip() in lines[0]:
-        lines = lines[1:]
-    if lines and lines[-1].strip().endswith(("#", ">")):
-        lines = lines[:-1]
-    return "\n".join(lines)
-
-
-def fetch_configs(
-    host: str,
-    username: str,
-    password: str = None,
-    key_path: str = None,
-    port: int = 22,
-) -> tuple[list[str], list[str]]:
-    """Connect and return (running_lines, startup_lines)."""
+def ssh_connect(
+    host: str, username: str, password: str, port: int = 22, timeout: int = 30
+) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kw: dict = {
-        "hostname": host,
-        "port": port,
-        "username": username,
-        "timeout": 15,
-        "look_for_keys": bool(key_path),
-        "allow_agent": False,
-    }
-    if key_path:
-        kw["key_filename"] = key_path
-    else:
-        kw["password"] = password
-
-    client.connect(**kw)
-    try:
-        shell = client.invoke_shell(width=250, height=50000)
-        time.sleep(1)
-        _drain(shell, timeout=5)
-        _send(shell, "terminal length 0")
-        running = _send(shell, "show running-config").splitlines()
-        startup = _send(shell, "show startup-config").splitlines()
-    finally:
-        client.close()
-
-    return running, startup
-
-
-def diff_configs(
-    running: list[str], startup: list[str], host: str
-) -> list[str]:
-    return list(
-        difflib.unified_diff(
-            startup,
-            running,
-            fromfile=f"{host}:startup-config",
-            tofile=f"{host}:running-config",
-            lineterm="",
-        )
+    client.connect(
+        hostname=host,
+        port=port,
+        username=username,
+        password=password,
+        timeout=timeout,
+        look_for_keys=False,
+        allow_agent=False,
     )
+    return client
 
 
-def check_device(
-    host: str,
-    username: str,
-    password: str = None,
-    key_path: str = None,
-    port: int = 22,
-) -> list[str]:
-    log.info("Connecting to %s", host)
-    try:
-        running, startup = fetch_configs(host, username, password, key_path, port)
-    except paramiko.AuthenticationException:
-        log.error("%s: authentication failed", host)
-        return []
-    except (paramiko.SSHException, OSError) as exc:
-        log.error("%s: connection error — %s", host, exc)
-        return []
+def get_running_config(client: paramiko.SSHClient, command: str) -> str:
+    channel = client.invoke_shell()
+    channel.settimeout(30)
+    time.sleep(1)
+    while channel.recv_ready():
+        channel.recv(4096)
 
-    diff = diff_configs(running, startup, host)
-    if diff:
-        log.warning("%s: %d diff lines — unsaved changes detected", host, len(diff))
-    else:
-        log.info("%s: clean — running-config matches startup-config", host)
-    return diff
+    channel.send("terminal length 0\n")
+    time.sleep(0.5)
+    while channel.recv_ready():
+        channel.recv(4096)
+
+    channel.send(f"{command}\n")
+    time.sleep(3)
+
+    output = ""
+    while True:
+        if channel.recv_ready():
+            chunk = channel.recv(65535).decode("utf-8", errors="replace")
+            output += chunk
+        else:
+            time.sleep(0.5)
+            if not channel.recv_ready():
+                break
+
+    channel.close()
+    return output
+
+
+def strip_volatile_lines(config: str) -> list:
+    """Drop lines that legitimately change on every reload (timestamps, clock-period)."""
+    volatile_prefixes = (
+        "! Last configuration change",
+        "! NVRAM config last updated",
+        "ntp clock-period",
+    )
+    lines = []
+    for line in config.splitlines():
+        if any(line.strip().startswith(p) for p in volatile_prefixes):
+            continue
+        lines.append(line)
+    return lines
+
+
+def compute_diff(baseline: list, current: list, label_a: str, label_b: str) -> str:
+    diff = difflib.unified_diff(
+        baseline,
+        current,
+        fromfile=label_a,
+        tofile=label_b,
+        lineterm="",
+    )
+    return "\n".join(diff)
+
+
+def default_baseline_path(host: str) -> str:
+    safe = host.replace(".", "_").replace(":", "_")
+    return os.path.join(os.getcwd(), f"{safe}_baseline.txt")
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Detect unsaved config drift (running vs startup) on "
-        "Cisco-style devices via SSH.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    parser = argparse.ArgumentParser(
+        description=(
+            "Detect config drift on a network device by comparing live config "
+            "against a previously saved baseline."
+        )
     )
-    target = p.add_mutually_exclusive_group(required=True)
-    target.add_argument("-H", "--host", help="Device IP or hostname")
-    target.add_argument(
-        "--hosts", metavar="FILE", help="File with one device per line"
+    parser.add_argument("-H", "--host", required=True, help="Device hostname or IP")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument(
+        "--baseline-file",
+        help="Baseline file path (default: <host>_baseline.txt in cwd)",
     )
-    p.add_argument("-u", "--username", required=True)
-    p.add_argument("-p", "--password", default=None)
-    p.add_argument("--key", dest="key_path", default=None, help="SSH private key path")
-    p.add_argument("--port", type=int, default=22)
-    p.add_argument("-o", "--output", metavar="FILE", help="Write report to file")
-    p.add_argument(
-        "--exit-nonzero",
+    parser.add_argument(
+        "--save-baseline",
         action="store_true",
-        help="Exit with code 1 if drift is found on any device",
+        help="Capture current config as the new baseline and exit",
     )
-    return p.parse_args()
+    parser.add_argument(
+        "--command",
+        default="show running-config",
+        help="Command to retrieve config (default: 'show running-config')",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=30,
+        help="SSH connection timeout in seconds (default: 30)",
+    )
+    parser.add_argument(
+        "--output",
+        help="Write drift report to this file instead of stdout",
+    )
+    return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    baseline_file = args.baseline_file or default_baseline_path(args.host)
 
-    if args.host:
-        hosts = [args.host]
-    else:
-        path = Path(args.hosts)
-        if not path.exists():
-            log.error("Hosts file not found: %s", args.hosts)
-            return 1
-        hosts = [
-            ln.strip()
-            for ln in path.read_text().splitlines()
-            if ln.strip() and not ln.startswith("#")
-        ]
+    logger.info("Connecting to %s:%d as %s", args.host, args.port, args.username)
+    try:
+        client = ssh_connect(args.host, args.username, args.password, args.port, args.timeout)
+    except paramiko.AuthenticationException:
+        logger.error("Authentication failed for %s@%s", args.username, args.host)
+        return 1
+    except Exception as exc:
+        logger.error("Connection error: %s", exc)
+        return 1
 
-    drifted: dict[str, list[str]] = {}
-    for host in hosts:
-        diff = check_device(
-            host,
-            args.username,
-            password=args.password,
-            key_path=args.key_path,
-            port=args.port,
-        )
-        if diff:
-            drifted[host] = diff
+    try:
+        logger.info("Running: %s", args.command)
+        raw = get_running_config(client, args.command)
+    except Exception as exc:
+        logger.error("Failed to retrieve config: %s", exc)
+        return 1
+    finally:
+        client.close()
 
-    if not drifted:
-        print("All devices: running-config matches startup-config. No drift found.")
+    current_lines = strip_volatile_lines(raw)
+
+    if args.save_baseline:
+        path = Path(baseline_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(current_lines))
+        logger.info("Baseline saved: %s (%d lines)", baseline_file, len(current_lines))
+        print(f"Baseline saved: {baseline_file}")
         return 0
 
-    sections = []
-    for host, diff in drifted.items():
-        sections.append("=" * 60)
-        sections.append(f"DRIFT DETECTED: {host}")
-        sections.append("=" * 60)
-        sections.extend(diff)
-        sections.append("")
+    baseline_path = Path(baseline_file)
+    if not baseline_path.exists():
+        logger.error("No baseline at %s — run with --save-baseline first", baseline_file)
+        return 1
 
-    report = "\n".join(sections)
+    baseline_lines = baseline_path.read_text().splitlines()
+    diff = compute_diff(
+        baseline_lines,
+        current_lines,
+        label_a=baseline_file,
+        label_b=f"{args.host} (live {datetime.now().strftime('%Y-%m-%dT%H:%M:%S')})",
+    )
+
+    if not diff:
+        msg = f"[{datetime.now().isoformat()}] CLEAN: no drift detected on {args.host}"
+        logger.info("No drift detected on %s", args.host)
+        print(msg)
+        return 0
+
+    diff_lines = diff.splitlines()
+    added = sum(1 for ln in diff_lines if ln.startswith("+") and not ln.startswith("+++"))
+    removed = sum(1 for ln in diff_lines if ln.startswith("-") and not ln.startswith("---"))
+    logger.warning("DRIFT on %s: +%d lines, -%d lines", args.host, added, removed)
+
+    report = (
+        f"# Config Drift Report\n"
+        f"# Host:      {args.host}\n"
+        f"# Timestamp: {datetime.now().isoformat()}\n"
+        f"# Baseline:  {baseline_file}\n"
+        f"# Added:     +{added} lines\n"
+        f"# Removed:   -{removed} lines\n\n"
+        f"{diff}\n"
+    )
 
     if args.output:
         Path(args.output).write_text(report)
-        log.info("Report written to %s", args.output)
+        logger.info("Report written to %s", args.output)
     else:
         print(report)
 
-    return 1 if args.exit_nonzero else 0
+    return 2
 
 
 if __name__ == "__main__":
