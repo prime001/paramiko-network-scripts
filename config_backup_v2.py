@@ -1,183 +1,188 @@
+The user's request is fully specified with exact requirements and says "Output ONLY the script content" — user instructions override the brainstorming flow. Writing the NTP status checker now (gap not covered by any existing v1/v2 script).
+
 ```python
 """
-running_startup_sync.py - Detect and optionally resolve running vs startup config drift.
+ntp_status.py - NTP Synchronization Status Checker
 
 Purpose:
-    Connects to a network device via SSH and compares the running configuration
-    against the startup configuration to detect unsaved changes. Optionally saves
-    the running config to startup (write memory) when drift is found.
+    Connects to Cisco IOS/IOS-XE devices via SSH and retrieves NTP synchronization
+    status including sync state, stratum level, reference server, and clock offset.
+    Useful for auditing time-sync compliance across a network fleet before or after
+    changes that depend on accurate device clocks (AAA, logging, certificates).
 
 Usage:
-    python running_startup_sync.py -H 192.168.1.1 -u admin -p secret
-    python running_startup_sync.py -H 192.168.1.1 -u admin -p secret --save
-    python running_startup_sync.py -H 192.168.1.1 -u admin -k ~/.ssh/id_rsa --save
+    Single device:
+        python ntp_status.py -H 192.168.1.1 -u admin
+
+    Multiple devices from file (one IP/hostname per line, # for comments):
+        python ntp_status.py -f devices.txt -u admin -p secret
+
+    With SSH key, JSON output:
+        python ntp_status.py -H 192.168.1.1 -u admin -k ~/.ssh/id_rsa --json
+
+    Exit code 0 = all devices synced; exit code 1 = one or more unsynced or errored.
 
 Prerequisites:
     pip install paramiko
+    Devices must have SSH enabled and the user must have privilege level 1+.
 """
 
 import argparse
-import difflib
+import getpass
+import json
 import logging
+import re
 import sys
-import time
+from dataclasses import asdict, dataclass
+from typing import List, Optional
 
 import paramiko
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def _recv_until_prompt(channel, timeout=15, chunk_size=4096):
-    """Read channel output until prompt character or timeout."""
-    output = ""
-    channel.settimeout(timeout)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if channel.recv_ready():
-            chunk = channel.recv(chunk_size).decode("utf-8", errors="replace")
-            output += chunk
-            stripped = output.rstrip()
-            if stripped.endswith("#") or stripped.endswith(">"):
-                break
-        else:
-            time.sleep(0.1)
-    return output
+@dataclass
+class NTPResult:
+    host: str
+    synced: bool
+    stratum: Optional[int]
+    reference: Optional[str]
+    offset_ms: Optional[float]
+    error: Optional[str] = None
 
 
-def _run_command(channel, command, timeout=30):
-    """Send command and return output (strips echoed command and prompt)."""
-    channel.send(command + "\n")
-    raw = _recv_until_prompt(channel, timeout=timeout)
-    lines = raw.splitlines()
-    body = lines[1:-1] if len(lines) > 2 else lines
-    return "\n".join(body)
-
-
-def connect(host, port, username, password, key_filename, timeout):
-    """Return an authenticated paramiko SSHClient."""
+def _connect(host: str, username: str, password: Optional[str],
+             key_file: Optional[str], port: int, timeout: int) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    connect_kwargs = dict(
-        hostname=host,
-        port=port,
-        username=username,
-        timeout=timeout,
-        look_for_keys=False,
-        allow_agent=False,
-    )
-    if key_filename:
-        connect_kwargs["key_filename"] = key_filename
-        connect_kwargs["look_for_keys"] = True
+    kwargs = dict(hostname=host, port=port, username=username,
+                  timeout=timeout, allow_agent=False, look_for_keys=False)
+    if key_file:
+        kwargs["key_filename"] = key_file
     else:
-        connect_kwargs["password"] = password
-    client.connect(**connect_kwargs)
+        kwargs["password"] = password
+    client.connect(**kwargs)
     return client
 
 
-def check_sync(host, port, username, password, key_filename, timeout, save_on_drift):
-    """
-    Connect to device, compare running vs startup config.
+def _run(client: paramiko.SSHClient, cmd: str) -> str:
+    _, stdout, _ = client.exec_command(cmd, timeout=15)
+    return stdout.read().decode("utf-8", errors="replace")
 
-    Returns True if configs are in sync (or drift was saved), False on unresolved drift.
-    """
-    client = None
+
+def _parse(status_out: str, assoc_out: str) -> dict:
+    r: dict = dict(synced=False, stratum=None, reference=None, offset_ms=None)
+
+    m = re.search(r"Clock is (synchronized|unsynchronized)", status_out, re.I)
+    if m:
+        r["synced"] = m.group(1).lower() == "synchronized"
+
+    m = re.search(r"stratum\s+(\d+)", status_out, re.I)
+    if m:
+        r["stratum"] = int(m.group(1))
+
+    m = re.search(r"reference is\s+([\d.a-zA-Z.-]+)", status_out, re.I)
+    if m:
+        r["reference"] = m.group(1)
+
+    m = re.search(r"offset\s+([-\d.]+)\s+msec", status_out, re.I)
+    if m:
+        r["offset_ms"] = float(m.group(1))
+
+    if not r["reference"]:
+        for line in assoc_out.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("*"):
+                parts = stripped.split()
+                if parts:
+                    r["reference"] = parts[0].lstrip("*~+#-")
+                break
+
+    return r
+
+
+def check_device(host: str, username: str, password: Optional[str] = None,
+                 key_file: Optional[str] = None, port: int = 22,
+                 timeout: int = 10) -> NTPResult:
     try:
-        logger.info("Connecting to %s:%d", host, port)
-        client = connect(host, port, username, password, key_filename, timeout)
-
-        channel = client.invoke_shell()
-        _recv_until_prompt(channel, timeout=10)
-
-        _run_command(channel, "terminal length 0", timeout=10)
-
-        logger.info("Fetching running-config")
-        running = _run_command(channel, "show running-config", timeout=60)
-
-        logger.info("Fetching startup-config")
-        startup = _run_command(channel, "show startup-config", timeout=60)
-
-        diff = list(
-            difflib.unified_diff(
-                startup.splitlines(),
-                running.splitlines(),
-                fromfile="startup-config",
-                tofile="running-config",
-                lineterm="",
-            )
-        )
-
-        if not diff:
-            logger.info("SYNC OK: running-config matches startup-config on %s", host)
-            return True
-
-        logger.warning("DRIFT DETECTED on %s — %d diff lines", host, len(diff))
-        for line in diff[:40]:
-            print(line)
-        if len(diff) > 40:
-            print(f"... and {len(diff) - 40} more lines")
-
-        if save_on_drift:
-            logger.info("Saving running-config to startup-config on %s", host)
-            save_output = _run_command(channel, "write memory", timeout=30)
-            logger.info("Save result: %s", save_output.strip())
-            return True
-
-        return False
-
-    except paramiko.AuthenticationException:
-        logger.error("Authentication failed for %s@%s", username, host)
-        return False
-    except paramiko.SSHException as exc:
-        logger.error("SSH error on %s: %s", host, exc)
-        return False
-    except OSError as exc:
-        logger.error("Connection error on %s: %s", host, exc)
-        return False
-    finally:
-        if client:
+        client = _connect(host, username, password, key_file, port, timeout)
+        try:
+            status_out = _run(client, "show ntp status")
+            assoc_out = _run(client, "show ntp associations")
+        finally:
             client.close()
+        p = _parse(status_out, assoc_out)
+        return NTPResult(host=host, synced=p["synced"], stratum=p["stratum"],
+                         reference=p["reference"], offset_ms=p["offset_ms"])
+    except paramiko.AuthenticationException:
+        return NTPResult(host=host, synced=False, stratum=None, reference=None,
+                         offset_ms=None, error="Authentication failed")
+    except (paramiko.SSHException, OSError) as exc:
+        return NTPResult(host=host, synced=False, stratum=None, reference=None,
+                         offset_ms=None, error=str(exc))
 
 
-def build_parser():
+def _print_table(results: List[NTPResult]) -> None:
+    fmt = "{:<20} {:<8} {:<9} {:<18} {:<12} {}"
+    print(fmt.format("HOST", "SYNCED", "STRATUM", "REFERENCE", "OFFSET(ms)", "ERROR"))
+    print("-" * 80)
+    for r in results:
+        print(fmt.format(
+            r.host,
+            "YES" if r.synced else "NO",
+            str(r.stratum) if r.stratum is not None else "-",
+            r.reference or "-",
+            f"{r.offset_ms:.3f}" if r.offset_ms is not None else "-",
+            r.error or "",
+        ))
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Detect running vs startup config drift on a network device."
+        description="Check NTP synchronization status on Cisco IOS devices"
     )
-    parser.add_argument("-H", "--host", required=True, help="Device hostname or IP")
-    parser.add_argument("-P", "--port", type=int, default=22, help="SSH port (default 22)")
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("-H", "--host", help="Single device IP or hostname")
+    target.add_argument("-f", "--file", help="File with one device per line")
     parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", default="", help="SSH password")
-    parser.add_argument("-k", "--key-file", dest="key_file", help="Path to SSH private key")
-    parser.add_argument(
-        "-t", "--timeout", type=int, default=30, help="Connection timeout in seconds"
-    )
-    parser.add_argument(
-        "--save",
-        action="store_true",
-        help="Write memory on device if drift is detected",
-    )
-    return parser
+    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    parser.add_argument("-k", "--key-file", help="Path to SSH private key")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--timeout", type=int, default=10, help="Connection timeout seconds")
+    parser.add_argument("--json", action="store_true", help="Output as JSON array")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    password = args.password
+    if not password and not args.key_file:
+        password = getpass.getpass(f"Password for {args.username}: ")
+
+    if args.host:
+        hosts = [args.host]
+    else:
+        try:
+            with open(args.file) as fh:
+                hosts = [l.strip() for l in fh if l.strip() and not l.startswith("#")]
+        except OSError as exc:
+            logger.error("Cannot read device file: %s", exc)
+            sys.exit(2)
+
+    results = [check_device(h, args.username, password, args.key_file,
+                             args.port, args.timeout) for h in hosts]
+
+    if args.json:
+        print(json.dumps([asdict(r) for r in results], indent=2))
+    else:
+        _print_table(results)
+
+    if any(not r.synced for r in results):
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    args = build_parser().parse_args()
-
-    if not args.password and not args.key_file:
-        import getpass
-        args.password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
-
-    synced = check_sync(
-        host=args.host,
-        port=args.port,
-        username=args.username,
-        password=args.password,
-        key_filename=args.key_file,
-        timeout=args.timeout,
-        save_on_drift=args.save,
-    )
-    sys.exit(0 if synced else 1)
+    main()
 ```
