@@ -1,55 +1,38 @@
-```python
-"""
-mac_table_parser.py - Cisco MAC Address Table Parser
+CDP/LLDP Neighbor Discovery Tool
 
-Connects to a Cisco IOS/IOS-XE/NX-OS device via SSH, retrieves the MAC address
-table, and parses the output into structured records for filtering and export.
-Useful for port-to-MAC mapping, rogue device detection, and inventory auditing.
+Connects to a network device via SSH and parses CDP (Cisco Discovery Protocol)
+or LLDP (Link Layer Discovery Protocol) neighbor detail output into a structured
+neighbor topology table. Useful for quickly mapping adjacencies during audits,
+troubleshooting, or building topology documentation.
 
 Usage:
-    python mac_table_parser.py -d 192.168.1.1 -u admin -p secret
-    python mac_table_parser.py -d 192.168.1.1 -u admin --vlan 100
-    python mac_table_parser.py -d 192.168.1.1 -u admin --interface Gi1/0/1
-    python mac_table_parser.py -d 192.168.1.1 -u admin --output json
-    python mac_table_parser.py -d 192.168.1.1 -u admin --output csv > macs.csv
+    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin -p secret
+    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin -p secret --protocol lldp
+    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin -p secret --protocol both
+    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin -p secret --json
 
 Prerequisites:
     pip install paramiko
-    Device must have SSH enabled; account requires at minimum 'show' privilege.
-    Tested against IOS 15.x, IOS-XE 16.x/17.x, and NX-OS 9.x.
+    CDP or LLDP must be enabled on the target device.
+    Tested against Cisco IOS, IOS-XE, and NX-OS.
 """
 
 import argparse
-import csv
-import getpass
-import io
 import json
 import logging
 import re
 import sys
-from typing import Optional
 
 import paramiko
 
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
     level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger(__name__)
-
-# IOS/IOS-XE: "VLAN  MAC  Type  Ports"
-_IOS_RE = re.compile(
-    r"^\s*(\d+)\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+(\S+)\s+(\S+)\s*$",
-    re.IGNORECASE,
-)
-# NX-OS adds an "Age" column between Type and Port
-_NXOS_RE = re.compile(
-    r"^\s*(\d+)\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+(\S+)\s+\S+\s+(\S+)\s*$",
-    re.IGNORECASE,
-)
+logger = logging.getLogger(__name__)
 
 
-def _ssh_exec(host: str, port: int, username: str, password: str, cmd: str) -> str:
+def ssh_connect(host, username, password, port=22, timeout=30):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
@@ -58,134 +41,202 @@ def _ssh_exec(host: str, port: int, username: str, password: str, cmd: str) -> s
             port=port,
             username=username,
             password=password,
-            timeout=15,
-            allow_agent=False,
+            timeout=timeout,
             look_for_keys=False,
+            allow_agent=False,
         )
-        log.debug("Connected; running: %s", cmd)
-        _, stdout, stderr = client.exec_command(cmd, timeout=30)
-        output = stdout.read().decode("utf-8", errors="replace")
-        err = stderr.read().decode("utf-8", errors="replace").strip()
-        if err:
-            log.warning("Device stderr: %s", err)
-        return output
-    finally:
-        client.close()
+        return client
+    except paramiko.AuthenticationException:
+        logger.error("Authentication failed for %s@%s", username, host)
+        raise
+    except paramiko.SSHException as e:
+        logger.error("SSH error connecting to %s: %s", host, e)
+        raise
+    except Exception as e:
+        logger.error("Connection failed to %s: %s", host, e)
+        raise
 
 
-def _normalize_mac(raw: str) -> str:
-    """Collapse any MAC notation to XX:XX:XX:XX:XX:XX."""
-    digits = re.sub(r"[^0-9a-fA-F]", "", raw)
-    if len(digits) != 12:
-        return raw.upper()
-    return ":".join(digits[i:i + 2] for i in range(0, 12, 2)).upper()
+def run_command(client, command, timeout=30):
+    _, stdout, stderr = client.exec_command(command, timeout=timeout)
+    output = stdout.read().decode("utf-8", errors="replace")
+    err = stderr.read().decode("utf-8", errors="replace")
+    if err.strip():
+        logger.debug("stderr: %s", err.strip())
+    return output
 
 
-def parse_mac_table(raw: str) -> list:
-    entries = []
-    for line in raw.splitlines():
-        m = _IOS_RE.match(line) or _NXOS_RE.match(line)
+def parse_cdp_neighbors(output):
+    neighbors = []
+    blocks = re.split(r"-{5,}", output)
+
+    for block in blocks:
+        if not block.strip():
+            continue
+
+        neighbor = {}
+
+        m = re.search(r"Device ID:\s*(.+)", block)
         if m:
-            vlan, mac, entry_type, iface = m.groups()
-            entries.append({
-                "vlan": int(vlan),
-                "mac": _normalize_mac(mac),
-                "type": entry_type.lower(),
-                "interface": iface,
-            })
-    return entries
+            neighbor["device_id"] = m.group(1).strip()
+
+        m = re.search(r"IP(?:v4)? [Aa]ddress:\s*(\S+)", block)
+        if not m:
+            m = re.search(
+                r"Entry address\(es\):\s*\n\s*IP(?:v4)? address:\s*(\S+)", block
+            )
+        if m:
+            neighbor["ip_address"] = m.group(1).strip()
+
+        m = re.search(r"Platform:\s*([^,]+)", block)
+        if m:
+            neighbor["platform"] = m.group(1).strip()
+
+        m = re.search(r"Interface:\s*(\S+)", block)
+        if m:
+            neighbor["local_interface"] = m.group(1).rstrip(",")
+
+        m = re.search(r"Port ID \(outgoing port\):\s*(\S+)", block)
+        if m:
+            neighbor["remote_interface"] = m.group(1).strip()
+
+        m = re.search(r"Capabilities:\s*(.+)", block)
+        if m:
+            neighbor["capabilities"] = m.group(1).strip()
+
+        if neighbor.get("device_id"):
+            neighbors.append(neighbor)
+
+    return neighbors
 
 
-def apply_filters(
-    entries: list,
-    vlan: Optional[int],
-    interface: Optional[str],
-    mac_prefix: Optional[str],
-) -> list:
-    if vlan is not None:
-        entries = [e for e in entries if e["vlan"] == vlan]
-    if interface:
-        needle = interface.lower()
-        entries = [e for e in entries if needle in e["interface"].lower()]
-    if mac_prefix:
-        prefix = _normalize_mac(mac_prefix).replace(":", "").lower()
-        entries = [
-            e for e in entries
-            if e["mac"].replace(":", "").lower().startswith(prefix)
-        ]
-    return entries
+def parse_lldp_neighbors(output):
+    neighbors = []
+    blocks = re.split(r"-{5,}|={5,}", output)
+
+    for block in blocks:
+        if not block.strip():
+            continue
+
+        neighbor = {}
+
+        m = re.search(r"System Name:\s*(.+)", block)
+        if m:
+            neighbor["device_id"] = m.group(1).strip()
+
+        m = re.search(
+            r"Management [Aa]ddress(?:es)?:\s*\n\s*(\d+\.\d+\.\d+\.\d+)", block
+        )
+        if not m:
+            m = re.search(
+                r"Management [Aa]ddress[^:]*:\s*(\d+\.\d+\.\d+\.\d+)", block
+            )
+        if m:
+            neighbor["ip_address"] = m.group(1).strip()
+
+        m = re.search(r"System Description:\s*\n\s*(.+)", block)
+        if m:
+            neighbor["platform"] = m.group(1).strip()[:60]
+
+        m = re.search(r"Local Intf:\s*(\S+)", block)
+        if m:
+            neighbor["local_interface"] = m.group(1).strip()
+
+        m = re.search(r"Port id:\s*(\S+)", block)
+        if m:
+            neighbor["remote_interface"] = m.group(1).strip()
+
+        m = re.search(r"System Capabilities:\s*(.+)", block)
+        if m:
+            neighbor["capabilities"] = m.group(1).strip()
+
+        if neighbor.get("device_id"):
+            neighbors.append(neighbor)
+
+    return neighbors
 
 
-def render_table(entries: list) -> str:
-    if not entries:
-        return "(no matching entries)"
-    header = f"{'VLAN':<6}  {'MAC':<17}  {'TYPE':<10}  INTERFACE"
-    sep = "-" * 55
-    rows = [
-        f"{e['vlan']:<6}  {e['mac']:<17}  {e['type']:<10}  {e['interface']}"
-        for e in entries
-    ]
-    return "\n".join([header, sep] + rows + [sep, f"Total: {len(entries)} entries"])
+def print_table(neighbors, protocol):
+    if not neighbors:
+        print(f"No {protocol.upper()} neighbors found.")
+        return
+
+    headers = ["Device ID", "IP Address", "Local Intf", "Remote Intf", "Platform", "Capabilities"]
+    col_keys = ["device_id", "ip_address", "local_interface", "remote_interface", "platform", "capabilities"]
+
+    widths = [len(h) for h in headers]
+    for n in neighbors:
+        for i, key in enumerate(col_keys):
+            widths[i] = max(widths[i], len(str(n.get(key, ""))))
+
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    sep = "  ".join("-" * w for w in widths)
+
+    print(f"\n{protocol.upper()} Neighbors ({len(neighbors)} found)")
+    print(sep)
+    print(fmt.format(*headers))
+    print(sep)
+    for n in neighbors:
+        row = [str(n.get(k, "")) for k in col_keys]
+        print(fmt.format(*row))
+    print(sep)
 
 
-def render_csv(entries: list) -> str:
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["vlan", "mac", "type", "interface"])
-    writer.writeheader()
-    writer.writerows(entries)
-    return buf.getvalue()
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Parse and filter the MAC address table from a Cisco device.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+def main():
+    parser = argparse.ArgumentParser(
+        description="Parse CDP/LLDP neighbor tables from network devices"
     )
-    p.add_argument("-d", "--device", required=True, help="Device hostname or IP")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
-    p.add_argument("--port", type=int, default=22, help="SSH port")
-    p.add_argument("--vlan", type=int, default=None, help="Filter: show only this VLAN")
-    p.add_argument("--interface", default=None, help="Filter: partial interface name match")
-    p.add_argument("--mac-prefix", dest="mac_prefix", default=None,
-                   help="Filter: OUI or MAC prefix (e.g. 00:1A:2B)")
-    p.add_argument("--output", choices=["table", "json", "csv"], default="table",
-                   help="Output format")
-    p.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
-    return p
-
-
-if __name__ == "__main__":
-    args = build_arg_parser().parse_args()
+    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument(
+        "--protocol",
+        choices=["cdp", "lldp", "both"],
+        default="cdp",
+        help="Discovery protocol to query (default: cdp)",
+    )
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument(
+        "--timeout", type=int, default=30, help="SSH timeout in seconds (default: 30)"
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    password = args.password or getpass.getpass(
-        f"Password for {args.username}@{args.device}: "
-    )
-
-    log.info("Connecting to %s:%d as %s", args.device, args.port, args.username)
     try:
-        raw = _ssh_exec(args.device, args.port, args.username, password,
-                        "show mac address-table")
-    except paramiko.AuthenticationException:
-        log.error("Authentication failed")
-        sys.exit(1)
-    except (paramiko.SSHException, OSError) as exc:
-        log.error("Connection failed: %s", exc)
+        logger.info("Connecting to %s", args.device)
+        client = ssh_connect(
+            args.device, args.username, args.password, args.port, args.timeout
+        )
+    except Exception:
         sys.exit(1)
 
-    entries = parse_mac_table(raw)
-    log.info("Parsed %d total MAC entries", len(entries))
+    results = {}
 
-    entries = apply_filters(entries, args.vlan, args.interface, args.mac_prefix)
-    log.info("%d entries after filtering", len(entries))
+    try:
+        if args.protocol in ("cdp", "both"):
+            logger.info("Fetching CDP neighbors detail")
+            raw = run_command(client, "show cdp neighbors detail", args.timeout)
+            results["cdp"] = parse_cdp_neighbors(raw)
+            logger.info("Found %d CDP neighbor(s)", len(results["cdp"]))
 
-    if args.output == "json":
-        print(json.dumps(entries, indent=2))
-    elif args.output == "csv":
-        print(render_csv(entries), end="")
+        if args.protocol in ("lldp", "both"):
+            logger.info("Fetching LLDP neighbors detail")
+            raw = run_command(client, "show lldp neighbors detail", args.timeout)
+            results["lldp"] = parse_lldp_neighbors(raw)
+            logger.info("Found %d LLDP neighbor(s)", len(results["lldp"]))
+    finally:
+        client.close()
+
+    if args.json:
+        print(json.dumps(results, indent=2))
     else:
-        print(render_table(entries))
-```
+        for protocol, neighbors in results.items():
+            print_table(neighbors, protocol)
+
+
+if __name__ == "__main__":
+    main()
