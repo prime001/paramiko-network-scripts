@@ -1,213 +1,214 @@
 ```python
+#!/usr/bin/env python3
 """
-Device System Uptime and Performance Monitor
+Device Facts Collector
 
-Connects to network devices via SSH and collects system uptime and performance
-metrics (CPU, memory utilization). Generates reports in text, JSON, or CSV format.
+Collects system facts from network devices (hostname, model, OS version, serial number,
+uptime, memory, interfaces) via SSH using Paramiko. Useful for device inventory, 
+documentation, and change tracking.
 
 Usage:
-    python device_monitor.py --device 192.168.1.1 --username admin --password pass
-    python device_monitor.py --hosts devices.txt --username admin --password pass --output json
-    python device_monitor.py --hosts devices.txt --username admin --password pass --output csv
+    python device_facts.py --device 192.168.1.1 --username admin --password pass
+    python device_facts.py --device 192.168.1.1 --username admin --password pass --format json
+    python device_facts.py --device-file devices.txt --username admin --password pass
 
 Prerequisites:
-    - paramiko library installed (pip install paramiko)
+    - paramiko: pip install paramiko
     - Network devices must have SSH enabled
-    - User credentials must have access to show commands
-    - Supported: Cisco IOS, IOS XE, Nexus platforms
-
-Author: Network Automation Team
+    - SSH credentials with sufficient privileges to execute show commands
 """
 
-import paramiko
-import logging
 import argparse
 import json
-import csv
-from datetime import datetime
+import logging
+import sys
+from pathlib import Path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+import paramiko
 
 
-class DeviceMonitor:
-    """SSH-based device health monitor for collecting uptime and performance metrics."""
+def setup_logging(verbose: bool = False) -> None:
+    """Configure logging with appropriate level."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
 
-    def __init__(self, hostname, username, password, timeout=10):
-        self.hostname = hostname
-        self.username = username
-        self.password = password
-        self.timeout = timeout
-        self.client = paramiko.SSHClient()
-        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        self.metrics = {}
 
-    def connect(self):
-        """Establish SSH connection to device."""
-        try:
-            self.client.connect(
-                self.hostname,
-                username=self.username,
-                password=self.password,
-                timeout=self.timeout,
-                look_for_keys=False,
-                allow_agent=False
-            )
-            logger.info(f"Connected to {self.hostname}")
-            return True
-        except paramiko.AuthenticationException as e:
-            logger.error(f"Authentication failed for {self.hostname}: {e}")
-            return False
-        except paramiko.SSHException as e:
-            logger.error(f"SSH protocol error on {self.hostname}: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Connection error on {self.hostname}: {e}")
-            return False
+def connect_device(host: str, username: str, password: str,
+                  timeout: int = 10) -> paramiko.SSHClient:
+    """Establish SSH connection to device."""
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(host, username=username, password=password,
+                      timeout=timeout, look_for_keys=False,
+                      allow_agent=False)
+        return client
+    except paramiko.AuthenticationException as e:
+        raise ConnectionError(f"Authentication failed for {host}: {e}")
+    except paramiko.SSHException as e:
+        raise ConnectionError(f"SSH error connecting to {host}: {e}")
+    except Exception as e:
+        raise ConnectionError(f"Failed to connect to {host}: {e}")
 
-    def execute_command(self, command):
-        """Execute show command and return output."""
-        try:
-            stdin, stdout, stderr = self.client.exec_command(
-                command, timeout=self.timeout
-            )
-            output = stdout.read().decode('utf-8')
-            error = stderr.read().decode('utf-8')
-            if error and 'invalid' not in error.lower():
-                logger.warning(f"Error output from {self.hostname}: {error[:100]}")
-            return output
-        except Exception as e:
-            logger.error(f"Command execution failed on {self.hostname}: {e}")
-            return ""
 
-    def get_uptime(self):
-        """Extract device uptime from show version output."""
-        output = self.execute_command("show version")
-        for line in output.split('\n'):
-            if 'uptime' in line.lower():
-                self.metrics['uptime'] = line.strip()
-                return True
-        self.metrics['uptime'] = "Unable to retrieve"
-        return False
+def execute_command(client: paramiko.SSHClient, command: str) -> str:
+    """Execute command and return output."""
+    _, stdout, stderr = client.exec_command(command)
+    output = stdout.read().decode().strip()
+    error = stderr.read().decode().strip()
+    if error and "warning" not in error.lower():
+        logging.debug(f"Command '{command}' stderr: {error}")
+    return output
 
-    def get_cpu_utilization(self):
-        """Collect CPU utilization metrics."""
-        output = self.execute_command("show processes cpu | include CPU utilization")
-        self.metrics['cpu_utilization'] = (
-            output.strip() if output.strip() else "Not available"
-        )
 
-    def get_memory_utilization(self):
-        """Collect memory utilization metrics."""
-        output = self.execute_command("show memory | include Processor")
-        self.metrics['memory_utilization'] = (
-            output.strip() if output.strip() else "Not available"
-        )
+def extract_facts_ios(client: paramiko.SSHClient, host: str) -> dict:
+    """Extract facts from Cisco IOS/IOS-XE device."""
+    facts = {"host": host, "os": "ios", "facts": {}}
+    
+    try:
+        version_output = execute_command(client, "show version")
+        lines = version_output.split("\n")
+        
+        for line in lines:
+            if "Cisco" in line and "Version" in line:
+                parts = line.split("Version")
+                if len(parts) > 1:
+                    facts["facts"]["os_version"] = parts[1].strip()[:25]
+            if "uptime is" in line:
+                facts["facts"]["uptime"] = line.split("uptime is")[1].strip()
+            if "System Serial Number" in line:
+                facts["facts"]["serial_number"] = line.split(":")[-1].strip()
+            if "Model Number" in line or "Model:" in line:
+                facts["facts"]["model"] = line.split(":")[-1].strip()
+        
+        hostname_out = execute_command(client, "show running-config | include hostname")
+        if hostname_out and "hostname" in hostname_out:
+            hostname = hostname_out.split()[-1]
+            facts["facts"]["hostname"] = hostname
+        
+        interfaces_out = execute_command(client, "show ip interface brief")
+        interface_count = len([l for l in interfaces_out.split("\n")
+                              if l.strip() and "Interface" not in l])
+        facts["facts"]["interface_count"] = interface_count
+        
+    except Exception as e:
+        logging.debug(f"Error extracting IOS facts from {host}: {e}")
+    
+    return facts
 
-    def collect_metrics(self):
-        """Connect to device and collect all metrics."""
-        if not self.connect():
-            self.metrics['status'] = 'FAILED'
-            self.metrics['hostname'] = self.hostname
-            self.metrics['timestamp'] = datetime.now().isoformat()
-            return False
 
-        try:
-            self.get_uptime()
-            self.get_cpu_utilization()
-            self.get_memory_utilization()
-            self.metrics['hostname'] = self.hostname
-            self.metrics['timestamp'] = datetime.now().isoformat()
-            self.metrics['status'] = 'OK'
-            logger.info(f"Metrics collected successfully from {self.hostname}")
-            return True
-        except Exception as e:
-            logger.error(f"Metric collection failed on {self.hostname}: {e}")
-            self.metrics['status'] = 'ERROR'
-            return False
-        finally:
-            self.disconnect()
+def extract_facts_generic(client: paramiko.SSHClient, host: str) -> dict:
+    """Extract basic facts from generic device."""
+    facts = {"host": host, "os": "unknown", "facts": {}}
+    
+    try:
+        version_output = execute_command(client, "show version")
+        facts["facts"]["version"] = version_output[:150]
+    except Exception as e:
+        logging.debug(f"Error extracting facts from {host}: {e}")
+    
+    return facts
 
-    def disconnect(self):
-        """Close SSH connection."""
-        try:
-            self.client.close()
-            logger.debug(f"Disconnected from {self.hostname}")
-        except Exception as e:
-            logger.warning(f"Error during disconnect from {self.hostname}: {e}")
 
-    def get_metrics(self):
-        """Return collected metrics dictionary."""
-        return self.metrics
+def get_device_facts(host: str, username: str, password: str) -> dict:
+    """Collect facts from a network device."""
+    logger = logging.getLogger(__name__)
+    logger.info(f"Collecting facts from {host}")
+    
+    try:
+        client = connect_device(host, username, password)
+        facts = extract_facts_ios(client, host)
+        if not facts.get("facts"):
+            facts = extract_facts_generic(client, host)
+        client.close()
+        logger.info(f"Successfully collected facts from {host}")
+        return facts
+    except Exception as e:
+        logger.error(f"Failed to collect facts from {host}: {e}")
+        return {"host": host, "error": str(e)}
+
+
+def format_output(facts: dict, format_type: str = "table") -> str:
+    """Format facts for output."""
+    if format_type == "json":
+        return json.dumps(facts, indent=2)
+    
+    if "error" in facts:
+        return f"{facts['host']}: ERROR - {facts['error']}"
+    
+    output = f"\nDevice: {facts['host']} ({facts.get('os', 'unknown')})\n"
+    output += "-" * 50 + "\n"
+    for key, value in facts.get("facts", {}).items():
+        label = key.replace("_", " ").title()
+        output += f"  {label}: {value}\n"
+    return output
 
 
 def main():
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description='Collect uptime and performance metrics from network devices'
+        description="Collect system facts from network devices",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n"
+               "  %(prog)s --device 192.168.1.1 -u admin -p password\n"
+               "  %(prog)s --device-file devices.txt -u admin -p password --format json"
     )
-    parser.add_argument('--device', help='Single device IP or hostname')
-    parser.add_argument('--hosts', help='File containing device list (one per line)')
-    parser.add_argument('--username', required=True, help='SSH username')
-    parser.add_argument('--password', required=True, help='SSH password')
-    parser.add_argument('--timeout', type=int, default=10, help='SSH timeout seconds')
-    parser.add_argument(
-        '--output',
-        choices=['text', 'json', 'csv'],
-        default='text',
-        help='Output format'
-    )
-
+    
+    parser.add_argument("--device", help="Target device IP or hostname")
+    parser.add_argument("--device-file", help="File with device IPs (one per line)")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument("--format", choices=["table", "json"], default="table",
+                       help="Output format (default: table)")
+    parser.add_argument("-o", "--output", help="Output file (default: stdout)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
+    parser.add_argument("--timeout", type=int, default=10,
+                       help="SSH connection timeout in seconds (default: 10)")
+    
     args = parser.parse_args()
-
+    
+    if not args.device and not args.device_file:
+        parser.error("Either --device or --device-file must be specified")
+    
+    setup_logging(args.verbose)
+    logger = logging.getLogger(__name__)
+    
     devices = []
     if args.device:
         devices = [args.device]
-    elif args.hosts:
+    elif args.device_file:
         try:
-            with open(args.hosts, 'r') as f:
-                devices = [line.strip() for line in f if line.strip()]
-        except IOError as e:
-            logger.error(f"Cannot read hosts file: {e}")
-            return
-    else:
-        logger.error("Either --device or --hosts must be specified")
-        parser.print_help()
-        return
-
+            device_file = Path(args.device_file)
+            devices = device_file.read_text().strip().split("\n")
+            devices = [d.strip() for d in devices if d.strip()]
+        except FileNotFoundError:
+            logger.error(f"Device file not found: {args.device_file}")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"Error reading device file: {e}")
+            sys.exit(1)
+    
     results = []
     for device in devices:
-        monitor = DeviceMonitor(
-            device, args.username, args.password, args.timeout
-        )
-        if monitor.collect_metrics():
-            results.append(monitor.get_metrics())
-
-    if not results:
-        logger.warning("No devices were successfully monitored")
-        return
-
-    if args.output == 'json':
-        print(json.dumps(results, indent=2))
-    elif args.output == 'csv':
+        facts = get_device_facts(device, args.username, args.password)
+        results.append(facts)
+    
+    output_text = ""
+    for facts in results:
+        output_text += format_output(facts, args.format) + "\n"
+    
+    if args.output:
         try:
-            with open('device_metrics.csv', 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=results[0].keys())
-                writer.writeheader()
-                writer.writerows(results)
-            logger.info("Results written to device_metrics.csv")
+            Path(args.output).write_text(output_text)
+            logger.info(f"Output saved to {args.output}")
         except Exception as e:
-            logger.error(f"Failed to write CSV: {e}")
+            logger.error(f"Failed to write output file: {e}")
+            sys.exit(1)
     else:
-        for result in results:
-            print(f"\nDevice: {result.get('hostname')}")
-            print(f"Status: {result.get('status')}")
-            print(f"Timestamp: {result.get('timestamp')}")
-            print(f"Uptime: {result.get('uptime', 'N/A')}")
-            print(f"CPU: {result.get('cpu_utilization', 'N/A')}")
-            print(f"Memory: {result.get('memory_utilization', 'N/A')}")
+        print(output_text)
 
 
 if __name__ == "__main__":
