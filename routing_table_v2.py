@@ -1,225 +1,222 @@
-#!/usr/bin/env python3
-"""
-bgp_monitor.py - BGP peer session health monitor for Cisco IOS/IOS-XE devices.
+routing_table_v3.py - VRF-aware per-prefix route lookup and next-hop analysis.
 
 Purpose:
-    Connects via SSH and retrieves BGP summary data, reporting each peer's
-    session state, prefix counts, and session uptime. Flags any peer not in
-    Established state and exits non-zero so it integrates cleanly with monitoring
-    scripts or CI health checks.
+    Query specific IP prefixes on one or more Cisco IOS/IOS-XE devices and
+    report matching routing-table entries (protocol, admin distance, metric,
+    next-hop, egress interface, age).  Unlike a full-table dump, this tool
+    is designed for targeted verification after a change or for auditing
+    route propagation across a fleet.
 
 Usage:
-    python bgp_monitor.py -d 192.168.1.1 -u admin -p secret
-    python bgp_monitor.py -d 192.168.1.1 -u admin --key ~/.ssh/id_rsa
-    python bgp_monitor.py -d 192.168.1.1 -u admin -p secret --vrf MGMT
-    python bgp_monitor.py -d 192.168.1.1 -u admin -p secret --ipv6
+    python routing_table_v3.py -d 192.168.1.1 -u admin -p secret \
+        --prefixes 10.0.0.0/8 172.16.0.0/12
+
+    # Multiple devices, specific VRF, JSON output
+    python routing_table_v3.py -d 192.168.1.1,192.168.1.2 -u admin \
+        --prefixes 10.10.0.0/24 --vrf MGMT --output json
 
 Prerequisites:
     pip install paramiko
-    SSH must be enabled on the device and BGP must be configured.
-
-Exit codes:
-    0 - All peers Established
-    1 - One or more peers not Established, or connection/auth failure
-    2 - BGP not configured or no peers detected
+    SSH access with at least read-level privileges on target devices.
 """
 
 import argparse
 import getpass
+import json
 import logging
 import re
 import sys
+import time
+from dataclasses import asdict, dataclass
+from typing import List, Optional
 
 import paramiko
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+# IOS "show ip route <prefix>" — dynamic (BGP/OSPF/EIGRP/RIP) entries
+_DYN_RE = re.compile(
+    r"^\s*(?P<proto>[A-Z][A-Z*\s]{0,3})\s+"
+    r"(?P<prefix>\d+\.\d+\.\d+\.\d+(?:/\d+)?)\s+"
+    r"\[(?P<ad>\d+)/(?P<metric>\d+)\]\s+via\s+(?P<nexthop>\S+)"
+    r"(?:,\s*(?P<age>\S+))?(?:,\s*(?P<iface>\S+))?",
+    re.MULTILINE,
 )
-log = logging.getLogger(__name__)
+
+# Connected / local entries
+_CONN_RE = re.compile(
+    r"^\s*(?P<proto>[CL])\s+"
+    r"(?P<prefix>\d+\.\d+\.\d+\.\d+(?:/\d+)?)"
+    r"(?:\s+is\s+directly\s+connected,\s*(?P<iface>\S+))?",
+    re.MULTILINE,
+)
+
+# Static routes (S)
+_STATIC_RE = re.compile(
+    r"^\s*(?P<proto>S\*?)\s+"
+    r"(?P<prefix>\d+\.\d+\.\d+\.\d+(?:/\d+)?)\s+"
+    r"\[(?P<ad>\d+)/(?P<metric>\d+)\]\s+via\s+(?P<nexthop>\S+)"
+    r"(?:,\s*(?P<iface>\S+))?",
+    re.MULTILINE,
+)
 
 
-def ssh_connect(host, username, password=None, key_file=None, port=22, timeout=15):
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = {
-        "hostname": host,
-        "port": port,
-        "username": username,
-        "timeout": timeout,
-        "look_for_keys": False,
-        "allow_agent": False,
-    }
-    if key_file:
-        kwargs["key_filename"] = key_file
-    else:
-        kwargs["password"] = password
-    client.connect(**kwargs)
-    return client
+@dataclass
+class RouteEntry:
+    device: str
+    vrf: Optional[str]
+    queried_prefix: str
+    matched_prefix: str
+    protocol: str
+    admin_distance: Optional[int]
+    metric: Optional[int]
+    nexthop: Optional[str]
+    interface: Optional[str]
+    age: Optional[str]
 
 
-def run_command(client, command, timeout=20):
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    output = stdout.read().decode("utf-8", errors="replace")
-    err = stderr.read().decode("utf-8", errors="replace")
-    if err.strip():
-        log.debug("stderr: %s", err.strip())
+def _drain(channel, timeout: int = 10) -> str:
+    buf = ""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if channel.recv_ready():
+            buf += channel.recv(65535).decode("utf-8", errors="replace")
+            if re.search(r"[#>]\s*$", buf):
+                break
+        else:
+            time.sleep(0.1)
+    return buf
+
+
+def _exec(client: paramiko.SSHClient, command: str, timeout: int) -> str:
+    shell = client.invoke_shell()
+    _drain(shell, timeout=5)
+    shell.send("terminal length 0\n")
+    _drain(shell, timeout=3)
+    shell.send(command + "\n")
+    output = _drain(shell, timeout=timeout)
+    shell.close()
     return output
 
 
-def parse_bgp_summary(output):
-    """
-    Parse IOS/IOS-XE 'show [ip] bgp summary' output into structured peer data.
-    The State/PfxRcd column holds an integer when Established, otherwise a
-    state keyword (Idle, Active, Connect, OpenSent, OpenConfirm).
-    """
-    peers = []
-    peer_re = re.compile(
-        r"^(\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]+)\s+"
-        r"\d+\s+"
-        r"(\d+)\s+"
-        r"\d+\s+"
-        r"(\d+)\s+"
-        r"\d+\s+"
-        r"\d+\s+"
-        r"\d+\s+"
-        r"(\S+)\s+"
-        r"(\S+)$",
-        re.MULTILINE,
-    )
-    local_as_m = re.search(r"local AS number (\d+)", output, re.IGNORECASE)
-    router_id_m = re.search(r"BGP router identifier (\S+)", output, re.IGNORECASE)
+def _parse(raw: str, device: str, vrf: Optional[str], queried: str) -> List[RouteEntry]:
+    entries: List[RouteEntry] = []
 
-    for m in peer_re.finditer(output):
-        neighbor, remote_as, msg_sent, updown, state_field = m.groups()
-        try:
-            pfx_rcvd = int(state_field)
-            state = "Established"
-        except ValueError:
-            pfx_rcvd = 0
-            state = state_field
+    for pat in (_DYN_RE, _STATIC_RE):
+        for m in pat.finditer(raw):
+            entries.append(RouteEntry(
+                device=device, vrf=vrf, queried_prefix=queried,
+                matched_prefix=m.group("prefix"),
+                protocol=m.group("proto").strip(),
+                admin_distance=int(m.group("ad")),
+                metric=int(m.group("metric")),
+                nexthop=m.group("nexthop"),
+                interface=m.group("iface"),
+                age=m.group("age") if "age" in m.groupdict() else None,
+            ))
 
-        peers.append({
-            "neighbor": neighbor,
-            "remote_as": remote_as,
-            "updown": updown,
-            "state": state,
-            "pfx_rcvd": pfx_rcvd,
-        })
-
-    return {
-        "router_id": router_id_m.group(1) if router_id_m else "unknown",
-        "local_as": local_as_m.group(1) if local_as_m else "unknown",
-        "peers": peers,
-    }
-
-
-def print_report(data, host):
-    peers = data["peers"]
-    print(f"\nBGP Summary — {host}")
-    print(f"  Router ID : {data['router_id']}   Local AS: {data['local_as']}")
-    print(f"  Peers     : {len(peers)} total\n")
-
-    col = "{:<22} {:<10} {:<16} {:<14} {:<10}"
-    header = col.format("Neighbor", "AS", "Up/Down", "State", "PfxRcvd")
-    print(header)
-    print("-" * 72)
-
-    for p in peers:
-        flag = "  " if p["state"] == "Established" else "! "
-        print(flag + col.format(
-            p["neighbor"], p["remote_as"], p["updown"], p["state"], p["pfx_rcvd"]
+    for m in _CONN_RE.finditer(raw):
+        entries.append(RouteEntry(
+            device=device, vrf=vrf, queried_prefix=queried,
+            matched_prefix=m.group("prefix"),
+            protocol=m.group("proto").strip(),
+            admin_distance=None, metric=None, nexthop=None,
+            interface=m.group("iface"), age=None,
         ))
 
-    print()
-    not_up = [p for p in peers if p["state"] != "Established"]
-    if not_up:
-        log.warning("%d peer(s) not in Established state:", len(not_up))
-        for p in not_up:
-            log.warning("  ! %s (AS %s) state=%s updown=%s",
-                        p["neighbor"], p["remote_as"], p["state"], p["updown"])
-        return False
-
-    log.info("All %d BGP peer(s) Established.", len(peers))
-    return True
+    if not entries:
+        logger.warning("%s: prefix %s not found (vrf=%s)", device, queried, vrf or "global")
+    return entries
 
 
-def build_command(args):
-    if args.ipv6:
-        return "show bgp ipv6 unicast summary"
-    if args.vrf:
-        return f"show bgp vrf {args.vrf} summary"
-    return "show ip bgp summary"
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="BGP peer session monitor — flags non-Established peers."
-    )
-    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", default=None,
-                        help="SSH password (prompted if omitted and no key given)")
-    parser.add_argument("--key", dest="key_file", default=None,
-                        help="Path to SSH private key file")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--vrf", default=None, help="VRF name for BGP lookup")
-    parser.add_argument("--ipv6", action="store_true",
-                        help="Query IPv6 unicast BGP table instead of IPv4")
-    parser.add_argument("--timeout", type=int, default=15,
-                        help="SSH connection timeout in seconds (default: 15)")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Enable debug logging")
-    args = parser.parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    if not args.key_file and args.password is None:
-        args.password = getpass.getpass(f"Password for {args.username}@{args.device}: ")
-
-    command = build_command(args)
-    log.info("Connecting to %s:%d", args.device, args.port)
-
+def lookup(
+    host: str, username: str, password: str,
+    prefix: str, vrf: Optional[str],
+    port: int, timeout: int,
+) -> List[RouteEntry]:
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        client = ssh_connect(
-            args.device, args.username,
-            password=args.password,
-            key_file=args.key_file,
-            port=args.port,
-            timeout=args.timeout,
+        client.connect(
+            host, port=port, username=username, password=password,
+            timeout=timeout, look_for_keys=False, allow_agent=False,
         )
     except paramiko.AuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.device)
-        sys.exit(1)
-    except (paramiko.SSHException, OSError) as exc:
-        log.error("Connection failed: %s", exc)
-        sys.exit(1)
+        logger.error("%s: authentication failed", host)
+        return []
+    except Exception as exc:
+        logger.error("%s: connection error — %s", host, exc)
+        return []
 
     try:
-        log.debug("Running: %s", command)
-        output = run_command(client, command, timeout=args.timeout)
-        log.debug("Raw output:\n%s", output)
-    except Exception as exc:
-        log.error("Command execution failed: %s", exc)
-        sys.exit(1)
+        cmd = (
+            f"show ip route vrf {vrf} {prefix}" if vrf
+            else f"show ip route {prefix}"
+        )
+        raw = _exec(client, cmd, timeout)
+        return _parse(raw, host, vrf, prefix)
     finally:
         client.close()
 
-    if not output.strip():
-        log.error("No output received — BGP may not be configured or the VRF name is wrong.")
-        sys.exit(2)
 
-    data = parse_bgp_summary(output)
+def _print_table(entries: List[RouteEntry]) -> None:
+    if not entries:
+        print("No routes found.")
+        return
+    hdr = f"{'DEVICE':<18} {'VRF':<10} {'QUERIED':<20} {'MATCHED':<20} {'PROTO':<6} {'AD/MET':<10} {'NEXTHOP':<18} {'IFACE':<20} {'AGE'}"
+    print(hdr)
+    print("-" * len(hdr))
+    for e in entries:
+        ad_met = f"{e.admin_distance}/{e.metric}" if e.admin_distance is not None else "direct"
+        print(
+            f"{e.device:<18} {e.vrf or 'global':<10} {e.queried_prefix:<20} "
+            f"{e.matched_prefix:<20} {e.protocol:<6} {ad_met:<10} "
+            f"{e.nexthop or 'connected':<18} {e.interface or '':<20} {e.age or ''}"
+        )
 
-    if not data["peers"]:
-        log.warning("No BGP peers parsed from output. Use -v to see raw output.")
-        sys.exit(2)
 
-    all_good = print_report(data, args.device)
-    sys.exit(0 if all_good else 1)
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Look up specific prefixes in the routing table of Cisco IOS devices."
+    )
+    ap.add_argument("-d", "--devices", required=True,
+                    help="Comma-separated device IPs or hostnames")
+    ap.add_argument("-u", "--username", required=True)
+    ap.add_argument("-p", "--password", default=None,
+                    help="SSH password (prompted if omitted)")
+    ap.add_argument("--prefixes", nargs="+", required=True,
+                    help="Prefixes to look up, e.g. 10.0.0.0/8 192.168.1.1")
+    ap.add_argument("--vrf", default=None, help="VRF name (default: global routing table)")
+    ap.add_argument("--port", type=int, default=22)
+    ap.add_argument("--timeout", type=int, default=30)
+    ap.add_argument("--output", choices=["table", "json"], default="table")
+    ap.add_argument("--debug", action="store_true")
+    args = ap.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    logging.getLogger("paramiko").setLevel(logging.WARNING)
+
+    password = args.password or getpass.getpass(f"Password for {args.username}: ")
+    devices = [d.strip() for d in args.devices.split(",") if d.strip()]
+
+    all_entries: List[RouteEntry] = []
+    for device in devices:
+        for prefix in args.prefixes:
+            logger.info("Querying %s — prefix %s (vrf=%s)", device, prefix, args.vrf or "global")
+            all_entries.extend(lookup(
+                host=device, username=args.username, password=password,
+                prefix=prefix, vrf=args.vrf, port=args.port, timeout=args.timeout,
+            ))
+
+    if args.output == "json":
+        print(json.dumps([asdict(e) for e in all_entries], indent=2))
+    else:
+        _print_table(all_entries)
+
+    return 0 if all_entries else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
