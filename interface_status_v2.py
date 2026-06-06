@@ -1,214 +1,230 @@
 ```python
 """
-Network Device Health Monitor
+Interface Error Monitor - SSH-based interface error counter analysis for Cisco IOS/IOS-XE.
 
-Connects to network devices via SSH and collects system health metrics
-including CPU, memory, and uptime information. Supports multiple devices
-from a file or single device input.
+Purpose:
+    Connects to a network device via SSH, retrieves interface statistics, and reports
+    interfaces whose error counters exceed configurable thresholds. Useful for catching
+    degraded links (flapping, CRC storms, input drops) before they cause outages.
 
 Usage:
-    python device_health_monitor.py -d 192.168.1.1 -u admin -p password
-    python device_health_monitor.py -d devices.txt -u admin -p password --format json
+    python interface_error_monitor.py -d 192.168.1.1 -u admin
+    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret \\
+        --crc-errors 10 --flaps 5 --skip-down --output json
 
 Prerequisites:
-    - paramiko library installed
-    - SSH access to target network devices
-    - Valid device credentials (username/password)
-    - Devices support 'show version', 'show processes cpu', 'show memory' commands
+    pip install paramiko
+    SSH access to target device with privilege to run 'show interfaces'.
 """
 
 import argparse
+import getpass
 import json
 import logging
 import re
 import sys
-from pathlib import Path
-from typing import Dict, List, Optional
+from dataclasses import asdict, dataclass, field
+from typing import List, Optional
 
 import paramiko
 
-
-class DeviceHealthMonitor:
-    """Monitor and collect health metrics from network devices."""
-
-    def __init__(self, host: str, username: str, password: str, timeout: int = 10):
-        self.host = host
-        self.username = username
-        self.password = password
-        self.timeout = timeout
-        self.client = None
-        self.logger = logging.getLogger(__name__)
-
-    def connect(self) -> bool:
-        """Establish SSH connection."""
-        try:
-            self.client = paramiko.SSHClient()
-            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self.client.connect(
-                self.host,
-                username=self.username,
-                password=self.password,
-                timeout=self.timeout,
-                look_for_keys=False,
-                allow_agent=False,
-            )
-            self.logger.info(f"Connected to {self.host}")
-            return True
-        except (paramiko.SSHException, TimeoutError) as e:
-            self.logger.error(f"Connection failed to {self.host}: {e}")
-            return False
-        except Exception as e:
-            self.logger.error(f"Unexpected error on {self.host}: {e}")
-            return False
-
-    def execute_command(self, command: str) -> Optional[str]:
-        """Execute SSH command and return output."""
-        if not self.client:
-            return None
-
-        try:
-            _, stdout, stderr = self.client.exec_command(command, timeout=self.timeout)
-            output = stdout.read().decode("utf-8", errors="ignore").strip()
-            return output
-        except Exception as e:
-            self.logger.warning(f"Command failed on {self.host}: {e}")
-            return None
-
-    def collect_metrics(self) -> Dict:
-        """Collect device health metrics."""
-        metrics = {"device": self.host, "status": "unknown"}
-
-        version = self.execute_command("show version")
-        if version:
-            metrics["status"] = "reachable"
-            uptime = self._extract_uptime(version)
-            if uptime:
-                metrics["uptime"] = uptime
-
-        cpu = self.execute_command("show processes cpu")
-        if cpu:
-            cpu_usage = self._extract_cpu(cpu)
-            if cpu_usage is not None:
-                metrics["cpu_percent"] = cpu_usage
-
-        memory = self.execute_command("show memory")
-        if memory:
-            mem_data = self._extract_memory(memory)
-            if mem_data:
-                metrics["memory"] = mem_data
-
-        return metrics
-
-    @staticmethod
-    def _extract_uptime(output: str) -> Optional[str]:
-        """Extract uptime from show version."""
-        match = re.search(r"uptime is (.+?)(?:\n|$)", output, re.IGNORECASE)
-        return match.group(1).strip() if match else None
-
-    @staticmethod
-    def _extract_cpu(output: str) -> Optional[float]:
-        """Extract CPU utilization percentage."""
-        match = re.search(r"CPU utilization[:\s]+(\d+(?:\.\d+)?)\s*%", output)
-        return float(match.group(1)) if match else None
-
-    @staticmethod
-    def _extract_memory(output: str) -> Optional[Dict]:
-        """Extract memory usage."""
-        total_match = re.search(r"Total:?\s+(\d+)", output)
-        used_match = re.search(r"Used:?\s+(\d+)", output)
-
-        if total_match and used_match:
-            total = int(total_match.group(1))
-            used = int(used_match.group(1))
-            return {
-                "total_kb": total,
-                "used_kb": used,
-                "percent_used": round((used / total) * 100, 2),
-            }
-        return None
-
-    def disconnect(self) -> None:
-        """Close SSH connection."""
-        if self.client:
-            self.client.close()
-            self.logger.info(f"Disconnected from {self.host}")
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 
-def load_devices(source: str) -> List[str]:
-    """Load devices from file or return single device."""
-    if Path(source).is_file():
-        try:
-            with open(source) as f:
-                devices = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-            return devices
-        except IOError as e:
-            logging.error(f"Failed to read device file: {e}")
-            return []
-    return [source]
+@dataclass
+class InterfaceErrors:
+    name: str
+    status: str = "unknown"
+    input_errors: int = 0
+    crc_errors: int = 0
+    output_errors: int = 0
+    input_drops: int = 0
+    output_drops: int = 0
+    resets: int = 0
+    alerts: List[str] = field(default_factory=list)
 
 
-def format_text_output(results: List[Dict]) -> None:
-    """Print results in text format."""
-    print(f"\n{'Device':<20} {'Status':<12} {'CPU %':<10} {'Memory %':<12} {'Uptime':<30}")
-    print("-" * 85)
-
-    for result in results:
-        device = result.get("device", "unknown")
-        status = result.get("status", "unknown")
-        cpu = result.get("cpu_percent", "-")
-        cpu_str = f"{cpu:.1f}%" if isinstance(cpu, float) else cpu
-        mem = result.get("memory", {})
-        mem_str = f"{mem.get('percent_used', '-')}%" if mem else "-"
-        uptime = result.get("uptime", "-")
-
-        print(f"{device:<20} {status:<12} {cpu_str:<10} {mem_str:<12} {uptime:<30}")
-
-
-def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description="Collect health metrics from network devices"
+def ssh_connect(host: str, username: str, password: str, port: int) -> paramiko.SSHClient:
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        host, port=port, username=username, password=password,
+        timeout=15, look_for_keys=False, allow_agent=False,
     )
-    parser.add_argument("-d", "--device", required=True,
-                        help="Device IP/hostname or file with device list")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", required=True, help="SSH password")
-    parser.add_argument("-t", "--timeout", type=int, default=10,
-                        help="SSH timeout in seconds")
-    parser.add_argument("-f", "--format", choices=["text", "json"], default="text",
-                        help="Output format")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Enable verbose logging")
+    return client
 
-    args = parser.parse_args()
 
-    log_level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s - %(levelname)s - %(message)s"
-    )
+def run_command(client: paramiko.SSHClient, command: str) -> str:
+    transport = client.get_transport()
+    channel = transport.open_session()
+    channel.settimeout(30)
+    channel.exec_command(command)
+    output = b""
+    while True:
+        if channel.recv_ready():
+            chunk = channel.recv(4096)
+            if not chunk:
+                break
+            output += chunk
+        elif channel.exit_status_ready():
+            while channel.recv_ready():
+                output += channel.recv(4096)
+            break
+    channel.close()
+    return output.decode("utf-8", errors="replace")
 
-    devices = load_devices(args.device)
-    if not devices:
-        logging.error("No devices specified")
-        sys.exit(1)
 
-    results = []
-    for device in devices:
-        monitor = DeviceHealthMonitor(device, args.username, args.password, args.timeout)
-        if monitor.connect():
-            metrics = monitor.collect_metrics()
-            results.append(metrics)
-            monitor.disconnect()
-        else:
-            results.append({"device": device, "status": "unreachable"})
+def parse_interfaces(raw: str) -> List[InterfaceErrors]:
+    interfaces: List[InterfaceErrors] = []
+    current: Optional[InterfaceErrors] = None
 
-    if args.format == "json":
-        print(json.dumps(results, indent=2))
+    for line in raw.splitlines():
+        m = re.match(
+            r'^(\S+(?:Ethernet|Serial|Tunnel|Loopback|Vlan|Port-channel)\S*)\s+is\s+(\S+)',
+            line, re.IGNORECASE,
+        )
+        if m:
+            if current:
+                interfaces.append(current)
+            current = InterfaceErrors(name=m.group(1), status=m.group(2).lower())
+            continue
+
+        if current is None:
+            continue
+
+        m = re.search(r'(\d+) input errors?,\s*(\d+) CRC', line)
+        if m:
+            current.input_errors = int(m.group(1))
+            current.crc_errors = int(m.group(2))
+            continue
+
+        m = re.search(r'(\d+) output errors?', line)
+        if m:
+            current.output_errors = int(m.group(1))
+            continue
+
+        m = re.search(r'(\d+) input drops?', line)
+        if m:
+            current.input_drops = int(m.group(1))
+            continue
+
+        m = re.search(r'(\d+) output drops?', line)
+        if m:
+            current.output_drops = int(m.group(1))
+            continue
+
+        m = re.search(r'(\d+) interface resets?', line)
+        if m:
+            current.resets = int(m.group(1))
+            continue
+
+    if current:
+        interfaces.append(current)
+    return interfaces
+
+
+def apply_thresholds(interfaces, args) -> List[InterfaceErrors]:
+    checks = [
+        ("input_errors", args.input_errors, "input errors"),
+        ("crc_errors", args.crc_errors, "CRC errors"),
+        ("output_errors", args.output_errors, "output errors"),
+        ("input_drops", args.input_drops, "input drops"),
+        ("output_drops", args.output_drops, "output drops"),
+        ("resets", args.resets, "interface resets"),
+    ]
+    flagged = []
+    for iface in interfaces:
+        if args.skip_down and iface.status != "up":
+            continue
+        for attr, threshold, label in checks:
+            val = getattr(iface, attr)
+            if val >= threshold:
+                iface.alerts.append(f"{label}={val} (threshold {threshold})")
+        if iface.alerts:
+            flagged.append(iface)
+    return flagged
+
+
+def print_table(flagged: List[InterfaceErrors], total: int) -> None:
+    print(f"\nScanned {total} interfaces — {len(flagged)} exceeded thresholds.\n")
+    if not flagged:
+        print("No interfaces exceeded configured thresholds.")
+        return
+    hdr = f"{'Interface':<32} {'Status':<10} {'In-Err':>8} {'CRC':>8} {'Out-Err':>8} {'Resets':>8}  Alerts"
+    print(hdr)
+    print("-" * len(hdr))
+    for i in flagged:
+        print(
+            f"{i.name:<32} {i.status:<10} {i.input_errors:>8} {i.crc_errors:>8} "
+            f"{i.output_errors:>8} {i.resets:>8}  {'; '.join(i.alerts)}"
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Report interface error counters exceeding thresholds.")
+    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    p.add_argument("--port", type=int, default=22)
+    p.add_argument("--input-errors", type=int, default=100, metavar="N")
+    p.add_argument("--crc-errors", type=int, default=50, metavar="N")
+    p.add_argument("--output-errors", type=int, default=100, metavar="N")
+    p.add_argument("--input-drops", type=int, default=500, metavar="N")
+    p.add_argument("--output-drops", type=int, default=500, metavar="N")
+    p.add_argument("--resets", type=int, default=10, metavar="N", help="Interface reset threshold")
+    p.add_argument("--skip-down", action="store_true", help="Ignore down interfaces")
+    p.add_argument("--output", choices=["table", "json"], default="table")
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    password = args.password or getpass.getpass(f"Password for {args.username}@{args.device}: ")
+
+    try:
+        client = ssh_connect(args.device, args.username, password, args.port)
+    except paramiko.AuthenticationException:
+        print(f"ERROR: Authentication failed for {args.username}@{args.device}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"ERROR: Cannot connect to {args.device}: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        raw = run_command(client, "show interfaces")
+    except Exception as exc:
+        print(f"ERROR: Command failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        client.close()
+
+    all_interfaces = parse_interfaces(raw)
+    if not all_interfaces:
+        print("WARNING: No interfaces parsed — check device output.", file=sys.stderr)
+        return 2
+
+    flagged = apply_thresholds(all_interfaces, args)
+
+    if args.output == "json":
+        result = {
+            "device": args.device,
+            "total_interfaces": len(all_interfaces),
+            "flagged_count": len(flagged),
+            "flagged": [asdict(i) for i in flagged],
+        }
+        print(json.dumps(result, indent=2))
     else:
-        format_text_output(results)
+        print_table(flagged, len(all_interfaces))
+
+    return 1 if flagged else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 ```
