@@ -1,35 +1,27 @@
-#!/usr/bin/env python3
+```python
 """
-vlan_audit.py - Cross-device VLAN consistency auditor
+mac_table.py - MAC Address Table Collector
 
-Purpose:
-    Connects to multiple network switches via SSH and audits VLAN consistency
-    across the fleet. Identifies VLANs present on some switches but missing on
-    others, helping catch provisioning gaps before they cause traffic black-holes.
+Connects to one or more Cisco switches via SSH and retrieves the MAC address
+table, producing a consolidated view of MAC-to-port mappings across the network.
+Useful for locating devices, auditing port assignments, and detecting rogue MACs.
 
 Usage:
-    python vlan_audit.py --hosts 10.0.0.1 10.0.0.2 10.0.0.3 \
-        --username admin --password secret
-
-    python vlan_audit.py --inventory switches.txt \
-        --username netops --key-file ~/.ssh/id_rsa --output audit.json
+    python mac_table.py -d 192.168.1.1 -u admin -p secret
+    python mac_table.py -H switches.txt -u admin --key ~/.ssh/id_rsa
+    python mac_table.py -d 10.0.0.1,10.0.0.2 -u cisco -p cisco --vlan 100 -o results.csv
 
 Prerequisites:
     pip install paramiko
-
-    Devices must have SSH enabled. The account needs read access to
-    run 'show vlan brief' (Cisco IOS/NX-OS). Exits 0 when all VLANs are
-    consistent, 2 when discrepancies are found (useful in CI pipelines).
 """
 
 import argparse
-import getpass
-import json
+import csv
 import logging
 import re
 import sys
-from collections import defaultdict
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from typing import List, Optional
 
 import paramiko
 
@@ -40,176 +32,169 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Legacy token-ring VLANs that IOS always reports; skip them in comparisons.
-_LEGACY_VLANS = {1002, 1003, 1004, 1005}
+_MAC_RE = re.compile(
+    r"([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}|"
+    r"[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2})",
+    re.IGNORECASE,
+)
 
 
-def ssh_connect(
+@dataclass
+class MacEntry:
+    device: str
+    vlan: str
+    mac: str
+    mac_type: str
+    port: str
+
+
+def _ssh_connect(
     host: str,
     username: str,
     password: Optional[str],
-    key_file: Optional[str],
+    key_path: Optional[str],
     port: int,
-    timeout: int,
 ) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs: dict = {
-        "hostname": host,
-        "username": username,
-        "port": port,
-        "timeout": timeout,
-        "look_for_keys": False,
-        "allow_agent": False,
-    }
-    if key_file:
-        kwargs["key_filename"] = key_file
+    kwargs = dict(hostname=host, username=username, port=port, timeout=10)
+    if key_path:
+        kwargs["key_filename"] = key_path
     else:
         kwargs["password"] = password
     client.connect(**kwargs)
     return client
 
 
-def run_command(client: paramiko.SSHClient, command: str, timeout: int = 15) -> str:
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    out = stdout.read().decode("utf-8", errors="replace")
-    err = stderr.read().decode("utf-8", errors="replace").strip()
+def _run(client: paramiko.SSHClient, command: str) -> str:
+    _, stdout, stderr = client.exec_command(command, timeout=15)
+    out = stdout.read().decode(errors="replace")
+    err = stderr.read().decode(errors="replace").strip()
     if err:
         log.debug("stderr: %s", err)
     return out
 
 
-def parse_vlan_brief(output: str) -> Dict[int, dict]:
-    """Return {vlan_id: {name, status}} from 'show vlan brief' output."""
-    vlans: Dict[int, dict] = {}
-    pattern = re.compile(
-        r"^(\d+)\s+(\S+)\s+(active|act/unsup|suspended|unsupported)",
-        re.IGNORECASE,
-    )
-    for line in output.splitlines():
-        m = pattern.match(line.strip())
-        if not m:
+def _parse(device: str, raw: str, vlan_filter: Optional[str]) -> List[MacEntry]:
+    """Parse IOS/IOS-XE 'show mac address-table' output."""
+    entries = []
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
             continue
-        vid = int(m.group(1))
-        if vid in _LEGACY_VLANS:
+        vlan_col, mac_col, type_col, port_col = parts[0], parts[1], parts[2], parts[3]
+        if not vlan_col.isdigit():
             continue
-        vlans[vid] = {"name": m.group(2), "status": m.group(3).lower()}
-    return vlans
+        if not _MAC_RE.match(mac_col):
+            continue
+        if vlan_filter and vlan_col != vlan_filter:
+            continue
+        entries.append(MacEntry(
+            device=device,
+            vlan=vlan_col,
+            mac=mac_col.lower(),
+            mac_type=type_col,
+            port=port_col,
+        ))
+    return entries
 
 
-def build_audit_report(device_vlans: Dict[str, Dict[int, dict]]) -> dict:
-    """Produce a consistency report comparing VLAN tables across all devices."""
-    all_vlans: set = set()
-    for vlans in device_vlans.values():
-        all_vlans.update(vlans)
-
-    presence: Dict[int, List[str]] = defaultdict(list)
-    for vid in all_vlans:
-        for host, vlans in device_vlans.items():
-            if vid in vlans:
-                presence[vid].append(host)
-
-    n_devices = len(device_vlans)
-    universal = sorted(v for v, hosts in presence.items() if len(hosts) == n_devices)
-    partial = {v: hosts for v, hosts in presence.items() if len(hosts) < n_devices}
-
-    per_device = {}
-    for host, vlans in device_vlans.items():
-        per_device[host] = {
-            "vlan_count": len(vlans),
-            "missing_vlans": sorted(v for v in partial if v not in vlans),
-            "device_only_vlans": sorted(v for v in vlans if presence[v] == [host]),
-        }
-
-    return {
-        "universal_vlans": universal,
-        "inconsistent_vlans": {str(v): sorted(hosts) for v, hosts in sorted(partial.items())},
-        "per_device": per_device,
-    }
+def collect_device(
+    host: str,
+    username: str,
+    password: Optional[str],
+    key_path: Optional[str],
+    port: int,
+    vlan_filter: Optional[str],
+) -> List[MacEntry]:
+    try:
+        client = _ssh_connect(host, username, password, key_path, port)
+    except Exception as exc:
+        log.error("SSH connect failed for %s: %s", host, exc)
+        return []
+    try:
+        cmd = "show mac address-table"
+        if vlan_filter:
+            cmd += f" vlan {vlan_filter}"
+        raw = _run(client, cmd)
+        entries = _parse(host, raw, vlan_filter)
+        log.info("%s: %d MAC entries collected", host, len(entries))
+        return entries
+    except Exception as exc:
+        log.error("Command failed on %s: %s", host, exc)
+        return []
+    finally:
+        client.close()
 
 
-def load_inventory(path: str) -> List[str]:
-    with open(path) as fh:
-        return [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
+def _print_table(entries: List[MacEntry]) -> None:
+    if not entries:
+        print("No MAC entries found.")
+        return
+    fmt = "{:<18} {:>5} {:<20} {:<10} {}"
+    print(fmt.format("Device", "VLAN", "MAC", "Type", "Port"))
+    print("-" * 72)
+    for e in entries:
+        print(fmt.format(e.device, e.vlan, e.mac, e.mac_type, e.port))
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Audit VLAN consistency across multiple switches",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+def _write_csv(entries: List[MacEntry], path: str) -> None:
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["device", "vlan", "mac", "type", "port"])
+        for e in entries:
+            writer.writerow([e.device, e.vlan, e.mac, e.mac_type, e.port])
+    log.info("Results written to %s", path)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Collect MAC address tables from Cisco switches via SSH."
     )
-    src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--hosts", nargs="+", metavar="HOST")
-    src.add_argument("--inventory", metavar="FILE", help="One host per line")
-
-    p.add_argument("--username", required=True)
-    creds = p.add_mutually_exclusive_group()
-    creds.add_argument("--password")
-    creds.add_argument("--key-file", metavar="PATH")
-
-    p.add_argument("--port", type=int, default=22)
-    p.add_argument("--timeout", type=int, default=10, metavar="SEC")
-    p.add_argument("--output", metavar="FILE", help="Write JSON report here")
-    p.add_argument("--verbose", action="store_true")
-    return p
-
-
-def main() -> None:
-    args = build_parser().parse_args()
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    hosts = args.hosts if args.hosts else load_inventory(args.inventory)
-    if not hosts:
-        log.error("No hosts to audit")
-        sys.exit(1)
-
-    if not args.password and not args.key_file:
-        args.password = getpass.getpass(f"Password for {args.username}: ")
-
-    device_vlans: Dict[str, Dict[int, dict]] = {}
-    failed: List[str] = []
-
-    for host in hosts:
-        log.info("Querying %s", host)
-        try:
-            client = ssh_connect(
-                host, args.username, args.password, args.key_file,
-                args.port, args.timeout,
-            )
-            raw = run_command(client, "show vlan brief")
-            client.close()
-            vlans = parse_vlan_brief(raw)
-            device_vlans[host] = vlans
-            log.info("%s: %d VLANs found", host, len(vlans))
-        except paramiko.AuthenticationException:
-            log.error("%s: authentication failed", host)
-            failed.append(host)
-        except (paramiko.SSHException, OSError) as exc:
-            log.error("%s: %s", host, exc)
-            failed.append(host)
-
-    if not device_vlans:
-        log.error("No devices responded")
-        sys.exit(1)
-
-    report = build_audit_report(device_vlans)
-    report["failed_hosts"] = failed
-
-    serialized = json.dumps(report, indent=2)
-    if args.output:
-        with open(args.output, "w") as fh:
-            fh.write(serialized)
-        log.info("Report written to %s", args.output)
-    else:
-        print(serialized)
-
-    n_inconsistent = len(report["inconsistent_vlans"])
-    if n_inconsistent:
-        log.warning("%d VLAN(s) inconsistent across fleet", n_inconsistent)
-        sys.exit(2)
-    log.info("All VLANs consistent across %d device(s)", len(device_vlans))
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("-d", "--devices", help="Comma-separated device IPs/hostnames")
+    target.add_argument("-H", "--host-file", metavar="FILE", help="File with one host per line")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    cred = parser.add_mutually_exclusive_group(required=True)
+    cred.add_argument("-p", "--password", help="SSH password")
+    cred.add_argument("--key", metavar="PATH", help="Path to SSH private key")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--vlan", help="Filter to a specific VLAN ID")
+    parser.add_argument("-o", "--output", metavar="FILE", help="Write results to CSV")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    args = _parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.devices:
+        hosts = [h.strip() for h in args.devices.split(",") if h.strip()]
+    else:
+        try:
+            with open(args.host_file) as fh:
+                hosts = [l.strip() for l in fh if l.strip() and not l.startswith("#")]
+        except OSError as exc:
+            log.error("Cannot read host file: %s", exc)
+            sys.exit(1)
+
+    if not hosts:
+        log.error("No hosts to connect to.")
+        sys.exit(1)
+
+    all_entries: List[MacEntry] = []
+    for host in hosts:
+        all_entries.extend(
+            collect_device(host, args.username, args.password, args.key, args.port, args.vlan)
+        )
+
+    _print_table(all_entries)
+
+    if args.output:
+        _write_csv(all_entries, args.output)
+
+    log.info("Done — %d total entries from %d device(s).", len(all_entries), len(hosts))
+```
