@@ -1,196 +1,224 @@
 ```python
 """
-arp_table_v3.py - Multi-device ARP table aggregator with conflict detection.
+arp_conflict_detector.py - Multi-device ARP conflict and duplicate-IP detector.
 
-Connects to one or more network devices via SSH, collects ARP tables, merges
-the results, and flags anomalies: duplicate MACs mapping to different IPs
-(potential ARP spoofing or HSRP/VRRP) and duplicate IPs with different MACs
-(IP conflict or misconfiguration).
+Purpose:
+    Connects to multiple network devices via SSH, collects ARP tables, then
+    cross-correlates entries to surface IP conflicts (same IP mapped to
+    different MACs across devices) and suspicious MAC conflicts (same MAC
+    claiming multiple IPs in ways that suggest spoofing or misconfiguration).
+
+    Useful for auditing layer-2/3 boundary issues, catching ARP poisoning,
+    diagnosing HSRP/VRRP misconfiguration, and verifying address uniqueness
+    before subnet migrations.
 
 Usage:
-    python arp_table_v3.py -d 192.168.1.1 192.168.1.2 -u admin -p secret
-    python arp_table_v3.py --hosts-file devices.txt -u admin --csv arp_out.csv
-    python arp_table_v3.py -d 10.0.0.1 -u admin -p secret --conflicts-only
+    python arp_conflict_detector.py -d 10.0.0.1 10.0.0.2 -u admin -p secret
+    python arp_conflict_detector.py --device-file routers.txt -u netops --key ~/.ssh/id_rsa
+    python arp_conflict_detector.py -d 10.0.0.1 -u admin --json > conflicts.json
 
 Prerequisites:
-    pip install paramiko
-    Devices must support "show arp" (Cisco IOS/NX-OS syntax).
+    - Python 3.7+
+    - paramiko: pip install paramiko
+    - SSH access to Cisco IOS/IOS-XE/NX-OS devices
+    - Devices must support 'show ip arp'
 """
 
 import argparse
-import csv
-import getpass
+import json
 import logging
 import re
-import socket
 import sys
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from getpass import getpass
 
 import paramiko
 
 logging.basicConfig(
-    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
+    level=logging.INFO,
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-ARP_RE = re.compile(
-    r"(?:Internet|Arpa)\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+|-)\s+"
-    r"([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+(\S+)"
+# Matches Cisco IOS: "Internet  192.168.1.1  5  aabb.cc00.0100  ARPA  Gi0/0"
+ARP_LINE_RE = re.compile(
+    r"Internet\s+"
+    r"(\d{1,3}(?:\.\d{1,3}){3})\s+"
+    r"\S+\s+"
+    r"([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+"
+    r"ARPA\s+"
+    r"(\S+)"
 )
 
 
-def ssh_run(host: str, username: str, password: str, command: str, timeout: int) -> str:
+def normalize_mac(dotted):
+    """Convert Cisco dotted hex (aabb.ccdd.eeff) to colon-separated lowercase."""
+    digits = re.sub(r"[^0-9a-fA-F]", "", dotted)
+    if len(digits) != 12:
+        return dotted.lower()
+    return ":".join(digits[i : i + 2] for i in range(0, 12, 2)).lower()
+
+
+def ssh_run(host, port, username, password, key_path, command, timeout):
+    """Open an SSH session, run one command, return stdout. Returns None on error."""
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        client.connect(
-            host,
+        kwargs = dict(
+            hostname=host,
+            port=port,
             username=username,
-            password=password,
             timeout=timeout,
-            look_for_keys=False,
+            look_for_keys=bool(key_path),
             allow_agent=False,
         )
+        if key_path:
+            kwargs["key_filename"] = key_path
+        else:
+            kwargs["password"] = password
+
+        client.connect(**kwargs)
         _, stdout, stderr = client.exec_command(command, timeout=timeout)
         output = stdout.read().decode("utf-8", errors="replace")
         err = stderr.read().decode("utf-8", errors="replace").strip()
         if err:
-            log.debug("%s stderr: %s", host, err)
+            logger.debug("%s stderr: %s", host, err)
         return output
-    except (paramiko.AuthenticationException, paramiko.SSHException) as exc:
-        log.error("%s SSH error: %s", host, exc)
-        return ""
-    except socket.timeout:
-        log.error("%s connection timed out", host)
-        return ""
+    except paramiko.AuthenticationException:
+        logger.error("Authentication failed: %s", host)
+    except paramiko.SSHException as exc:
+        logger.error("SSH error on %s: %s", host, exc)
+    except OSError as exc:
+        logger.error("Connection failed to %s: %s", host, exc)
     finally:
         client.close()
+    return None
 
 
-def parse_arp(output: str, source_host: str) -> List[Dict]:
+def collect_arp(host, port, username, password, key_path, timeout):
+    """Return list of (ip, mac, interface) tuples from the device ARP table."""
+    raw = ssh_run(host, port, username, password, key_path, "show ip arp", timeout)
+    if raw is None:
+        return []
     entries = []
-    for line in output.splitlines():
-        m = ARP_RE.search(line)
+    for line in raw.splitlines():
+        m = ARP_LINE_RE.search(line)
         if m:
-            ip, age, mac, iface = m.groups()
-            entries.append({
-                "ip": ip,
-                "age": age,
-                "mac": mac.lower(),
-                "interface": iface,
-                "source": source_host,
-            })
+            entries.append((m.group(1), normalize_mac(m.group(2)), m.group(3)))
+    logger.info("%s: collected %d ARP entries", host, len(entries))
     return entries
 
 
-def detect_conflicts(
-    entries: List[Dict],
-) -> Tuple[Dict[str, List], Dict[str, List]]:
-    mac_to_ips: Dict[str, List] = defaultdict(list)
-    ip_to_macs: Dict[str, List] = defaultdict(list)
+def detect_conflicts(device_arps):
+    """
+    Cross-correlate ARP tables from all devices.
 
-    for e in entries:
-        mac_to_ips[e["mac"]].append(e["ip"])
-        ip_to_macs[e["ip"]].append(e["mac"])
+    Returns:
+        ip_conflicts  – {ip:  {mac: [device, ...]}}  same IP → different MACs
+        mac_conflicts – {mac: {ip:  [device, ...]}}  same MAC → many IPs
+    """
+    ip_to_macs = defaultdict(lambda: defaultdict(list))
+    mac_to_ips = defaultdict(lambda: defaultdict(list))
 
-    dup_macs = {m: list(set(ips)) for m, ips in mac_to_ips.items() if len(set(ips)) > 1}
-    dup_ips = {ip: list(set(macs)) for ip, macs in ip_to_macs.items() if len(set(macs)) > 1}
-    return dup_macs, dup_ips
+    for device, entries in device_arps.items():
+        for ip, mac, _iface in entries:
+            ip_to_macs[ip][mac].append(device)
+            mac_to_ips[mac][ip].append(device)
 
-
-def print_table(entries: List[Dict], conflicts_only: bool, dup_macs: Dict, dup_ips: Dict):
-    header = f"{'IP':<18} {'MAC':<18} {'Age':>5}  {'Interface':<20} {'Source':<16} {'Flag'}"
-    print(header)
-    print("-" * len(header))
-    for e in entries:
-        flags = []
-        if e["mac"] in dup_macs:
-            flags.append("DUP-MAC")
-        if e["ip"] in dup_ips:
-            flags.append("DUP-IP")
-        flag_str = ",".join(flags)
-        if conflicts_only and not flag_str:
-            continue
-        print(
-            f"{e['ip']:<18} {e['mac']:<18} {e['age']:>5}  "
-            f"{e['interface']:<20} {e['source']:<16} {flag_str}"
-        )
+    ignored_macs = {"ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"}
+    ip_conflicts = {ip: dict(macs) for ip, macs in ip_to_macs.items() if len(macs) > 1}
+    mac_conflicts = {
+        mac: dict(ips)
+        for mac, ips in mac_to_ips.items()
+        if len(ips) > 1 and mac not in ignored_macs
+    }
+    return ip_conflicts, mac_conflicts
 
 
-def write_csv(path: str, entries: List[Dict], dup_macs: Dict, dup_ips: Dict):
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["ip", "mac", "age", "interface", "source", "flags"])
-        writer.writeheader()
-        for e in entries:
-            flags = []
-            if e["mac"] in dup_macs:
-                flags.append("DUP-MAC")
-            if e["ip"] in dup_ips:
-                flags.append("DUP-IP")
-            writer.writerow({**e, "flags": ",".join(flags)})
-    log.info("CSV written to %s", path)
+def report(ip_conflicts, mac_conflicts, as_json):
+    if as_json:
+        print(json.dumps({"ip_conflicts": ip_conflicts, "mac_conflicts": mac_conflicts}, indent=2))
+        return
+
+    if ip_conflicts:
+        print("\n=== IP Conflicts (same IP mapped to multiple MACs) ===")
+        for ip, macs in sorted(ip_conflicts.items()):
+            print(f"  {ip}")
+            for mac, devices in macs.items():
+                print(f"    {mac}  [{', '.join(devices)}]")
+    else:
+        print("\nNo IP conflicts detected.")
+
+    if mac_conflicts:
+        print("\n=== MAC Conflicts (same MAC maps to multiple IPs) ===")
+        for mac, ips in sorted(mac_conflicts.items()):
+            print(f"  {mac}")
+            for ip, devices in ips.items():
+                print(f"    {ip}  [{', '.join(devices)}]")
+    else:
+        print("\nNo MAC conflicts detected.")
+
+    print(
+        f"\nSummary: {len(ip_conflicts)} IP conflict(s), "
+        f"{len(mac_conflicts)} MAC conflict(s)."
+    )
 
 
-def load_hosts_file(path: str) -> List[str]:
-    with open(path) as f:
-        return [line.strip() for line in f if line.strip() and not line.startswith("#")]
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Detect ARP conflicts across multiple network devices."
+    )
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("-d", "--devices", nargs="+", metavar="HOST")
+    src.add_argument("--device-file", metavar="FILE", help="One device per line")
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", default=None)
+    parser.add_argument("--key", metavar="PATH", help="SSH private key path")
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument("--timeout", type=int, default=15)
+    parser.add_argument("--json", action="store_true", dest="as_json")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    return parser.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Multi-device ARP aggregator with conflict detection")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("-d", "--devices", nargs="+", metavar="HOST", help="Device IPs or hostnames")
-    group.add_argument("--hosts-file", metavar="FILE", help="File with one host per line")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--timeout", type=int, default=15, help="Connection timeout in seconds")
-    parser.add_argument("--csv", metavar="FILE", help="Write results to CSV file")
-    parser.add_argument("--conflicts-only", action="store_true", help="Print only conflicting entries")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    args = parser.parse_args()
+    args = parse_args()
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
 
-    if args.debug:
-        log.setLevel(logging.DEBUG)
+    if args.devices:
+        devices = args.devices
+    else:
+        try:
+            with open(args.device_file) as fh:
+                devices = [
+                    ln.strip()
+                    for ln in fh
+                    if ln.strip() and not ln.startswith("#")
+                ]
+        except OSError as exc:
+            logger.error("Cannot read device file: %s", exc)
+            sys.exit(1)
 
-    password = args.password or getpass.getpass(f"Password for {args.username}: ")
-    hosts = args.devices if args.devices else load_hosts_file(args.hosts_file)
+    password = args.password
+    if not password and not args.key:
+        password = getpass(f"SSH password for {args.username}: ")
 
-    all_entries: List[Dict] = []
-    for host in hosts:
-        log.info("Connecting to %s", host)
-        output = ssh_run(host, args.username, password, "show arp", args.timeout)
-        if not output:
-            log.warning("No output from %s — skipping", host)
-            continue
-        entries = parse_arp(output, host)
-        log.info("%s: %d ARP entries", host, len(entries))
-        all_entries.extend(entries)
+    device_arps = {}
+    for host in devices:
+        entries = collect_arp(
+            host, args.port, args.username, password, args.key, args.timeout
+        )
+        if entries:
+            device_arps[host] = entries
 
-    if not all_entries:
-        log.error("No ARP data collected from any device")
+    if not device_arps:
+        logger.error("No ARP data collected from any device.")
         sys.exit(1)
 
-    dup_macs, dup_ips = detect_conflicts(all_entries)
-
-    if dup_macs:
-        log.warning("Duplicate MACs (same MAC, multiple IPs): %d", len(dup_macs))
-        for mac, ips in dup_macs.items():
-            log.warning("  %s -> %s", mac, ", ".join(ips))
-
-    if dup_ips:
-        log.warning("Duplicate IPs (same IP, multiple MACs): %d", len(dup_ips))
-        for ip, macs in dup_ips.items():
-            log.warning("  %s -> %s", ip, ", ".join(macs))
-
-    print_table(all_entries, args.conflicts_only, dup_macs, dup_ips)
-    print(f"\nTotal entries: {len(all_entries)} | Duplicate MACs: {len(dup_macs)} | Duplicate IPs: {len(dup_ips)}")
-
-    if args.csv:
-        write_csv(args.csv, all_entries, dup_macs, dup_ips)
+    ip_conflicts, mac_conflicts = detect_conflicts(device_arps)
+    report(ip_conflicts, mac_conflicts, args.as_json)
+    sys.exit(0 if not ip_conflicts and not mac_conflicts else 1)
 
 
 if __name__ == "__main__":
