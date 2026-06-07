@@ -1,169 +1,197 @@
-```python
-#!/usr/bin/env python3
-"""
-Device Config Change Detector.
+config_change_sentinel.py - Detect unauthorized or accidental config drift.
 
-Monitors network device configurations for unauthorized changes.
-Compares running config against a stored baseline to identify differences.
+Purpose:
+    Fetches the running configuration from a network device via SSH and
+    compares it against a saved baseline.  Reports clean when hashes match;
+    exits non-zero and prints a change summary when drift is detected.
+    On first run, or when --update-baseline is passed, the current config
+    becomes the new baseline.
 
 Usage:
-    python device_config_change_detector.py 192.168.1.1 \
-        --username admin --baseline baseline.json --action detect
+    python config_change_sentinel.py -d 192.168.1.1 -u admin
+    python config_change_sentinel.py -d 192.168.1.1 -u admin -p secret --verbose
+    python config_change_sentinel.py -d 192.168.1.1 -u admin --update-baseline
 
 Prerequisites:
-    - paramiko library
-    - Network devices accessible via SSH
+    pip install paramiko
+    SSH access to a Cisco IOS/IOS-XE (or compatible) device.
+    Baseline files are stored in ./baselines/ by default.
 """
 
-import logging
 import argparse
 import hashlib
-import json
-from pathlib import Path
-from datetime import datetime
+import logging
+import os
+import sys
+import time
+from getpass import getpass
+
 import paramiko
-from paramiko.ssh_exception import AuthenticationException, SSHException
+
+BASELINE_DIR = "baselines"
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler('config_changes.log'), logging.StreamHandler()]
+    format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 
-class ConfigChangeDetector:
-    """Detect configuration changes on network devices via SSH."""
-
-    def __init__(self, device, username, password=None, timeout=10):
-        self.device = device
-        self.username = username
-        self.password = password
-        self.timeout = timeout
-        self.ssh = paramiko.SSHClient()
-        self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-    def connect(self):
-        """Establish SSH connection."""
-        try:
-            self.ssh.connect(
-                self.device, username=self.username, password=self.password,
-                timeout=self.timeout, look_for_keys=True, allow_agent=True
-            )
-            logger.info(f"Connected to {self.device}")
-            return True
-        except (AuthenticationException, SSHException) as e:
-            logger.error(f"Connection failed for {self.device}: {e}")
-            return False
-
-    def get_running_config(self):
-        """Retrieve running configuration."""
-        try:
-            _, stdout, stderr = self.ssh.exec_command("show running-config")
-            config = stdout.read().decode('utf-8')
-            if stderr.read().decode('utf-8'):
-                logger.warning("Command produced stderr output")
-            return config
-        except Exception as e:
-            logger.error(f"Error retrieving config: {e}")
-            return None
-
-    def compute_hash(self, config):
-        """Compute SHA-256 hash of configuration."""
-        return hashlib.sha256(config.encode()).hexdigest()
-
-    def detect_changes(self, baseline_path):
-        """Compare running config against baseline."""
-        current_config = self.get_running_config()
-        if not current_config:
-            return False
-
-        current_hash = self.compute_hash(current_config)
-        baseline = self._load_baseline(baseline_path)
-
-        if not baseline or current_hash == baseline.get('hash'):
-            logger.info(f"No changes detected on {self.device}")
-            return False
-
-        logger.warning(f"Configuration change detected on {self.device}")
-        logger.warning(
-            f"Previous hash: {baseline.get('hash')}, Current: {current_hash}"
+def fetch_running_config(hostname, username, password, port=22, timeout=30):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname,
+            port=port,
+            username=username,
+            password=password,
+            timeout=timeout,
+            look_for_keys=False,
+            allow_agent=False,
         )
-        return True
+        channel = client.invoke_shell()
+        time.sleep(1)
+        channel.recv(4096)
 
-    def _load_baseline(self, baseline_path):
-        """Load baseline metadata."""
-        try:
-            with open(baseline_path, 'r') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            logger.warning(f"Baseline load error: {e}")
-            return None
+        for cmd in ("terminal length 0\n", "show running-config\n"):
+            channel.send(cmd)
+            time.sleep(0.5 if "terminal" in cmd else 4)
 
-    def update_baseline(self, baseline_path):
-        """Update baseline with current configuration."""
-        config = self.get_running_config()
-        if not config:
-            return False
+        output = b""
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if channel.recv_ready():
+                chunk = channel.recv(65535)
+                output += chunk
+                deadline = time.time() + 2
+            else:
+                time.sleep(0.1)
 
-        baseline_data = {
-            'device': self.device,
-            'hash': self.compute_hash(config),
-            'timestamp': datetime.now().isoformat(),
-            'lines': len(config.split('\n'))
-        }
+        return output.decode("utf-8", errors="replace")
+    finally:
+        client.close()
 
-        try:
-            Path(baseline_path).parent.mkdir(parents=True, exist_ok=True)
-            with open(baseline_path, 'w') as f:
-                json.dump(baseline_data, f, indent=2)
-            logger.info(f"Baseline updated: {baseline_path}")
-            return True
-        except IOError as e:
-            logger.error(f"Baseline write error: {e}")
-            return False
 
-    def disconnect(self):
-        """Close SSH connection."""
-        self.ssh.close()
+def config_hash(config_text):
+    """SHA-256 of config with volatile timestamp lines stripped."""
+    filtered = "\n".join(
+        line for line in config_text.splitlines()
+        if not line.startswith("! Last configuration change")
+        and not line.startswith("! NVRAM config last updated")
+    )
+    return hashlib.sha256(filtered.encode()).hexdigest()
+
+
+def baseline_path(hostname, baseline_dir):
+    safe_name = hostname.replace(".", "_").replace(":", "_")
+    return os.path.join(baseline_dir, f"{safe_name}.cfg")
+
+
+def load_baseline(path):
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        text = f.read()
+    return text, config_hash(text)
+
+
+def save_baseline(path, config_text):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(config_text)
+    logger.info("Baseline saved: %s", path)
+
+
+def diff_summary(baseline_text, current_text):
+    baseline_lines = set(baseline_text.splitlines())
+    current_lines = set(current_text.splitlines())
+    return current_lines - baseline_lines, baseline_lines - current_lines
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Compare device running-config against a saved baseline."
+    )
+    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    p.add_argument("--port", type=int, default=22)
+    p.add_argument("--timeout", type=int, default=30, help="SSH timeout in seconds")
+    p.add_argument("--baseline-dir", default=BASELINE_DIR)
+    p.add_argument("--baseline", help="Explicit baseline file path")
+    p.add_argument(
+        "--update-baseline",
+        action="store_true",
+        help="Overwrite baseline with current config and exit",
+    )
+    p.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Print individual added/removed lines",
+    )
+    return p
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Detect configuration changes on network devices'
-    )
-    parser.add_argument('device', help='Target device IP or hostname')
-    parser.add_argument('-u', '--username', required=True, help='SSH username')
-    parser.add_argument('-p', '--password', help='SSH password')
-    parser.add_argument('-b', '--baseline', required=True,
-                        help='Baseline configuration file path')
-    parser.add_argument('-a', '--action', choices=['detect', 'update'],
-                        default='detect', help='Action: detect or update')
-    parser.add_argument('-t', '--timeout', type=int, default=10,
-                        help='SSH connection timeout in seconds')
+    args = build_parser().parse_args()
+    password = args.password or getpass(f"Password for {args.username}@{args.device}: ")
 
-    args = parser.parse_args()
-    detector = ConfigChangeDetector(
-        args.device, args.username, args.password, args.timeout
-    )
-
+    logger.info("Connecting to %s", args.device)
     try:
-        if not detector.connect():
-            return 1
+        current = fetch_running_config(
+            args.device, args.username, password,
+            port=args.port, timeout=args.timeout,
+        )
+    except paramiko.AuthenticationException:
+        logger.error("Authentication failed for %s@%s", args.username, args.device)
+        sys.exit(1)
+    except (paramiko.SSHException, OSError) as exc:
+        logger.error("Connection error: %s", exc)
+        sys.exit(1)
 
-        if args.action == 'detect':
-            changed = detector.detect_changes(args.baseline)
-            return 1 if changed else 0
-        else:
-            success = detector.update_baseline(args.baseline)
-            return 0 if success else 1
-    except KeyboardInterrupt:
-        logger.info("Operation cancelled by user")
-        return 130
-    finally:
-        detector.disconnect()
+    bpath = args.baseline or baseline_path(args.device, args.baseline_dir)
+
+    if args.update_baseline:
+        save_baseline(bpath, current)
+        print(f"Baseline updated: {bpath}")
+        return
+
+    result = load_baseline(bpath)
+    if result is None:
+        logger.warning("No baseline at %s — establishing one now.", bpath)
+        save_baseline(bpath, current)
+        print("First run: baseline established. Re-run to detect changes.")
+        return
+
+    baseline_text, baseline_hash = result
+    current_hash = config_hash(current)
+
+    if current_hash == baseline_hash:
+        print(f"[OK] {args.device}: config matches baseline ({current_hash[:16]}...)")
+        return
+
+    added, removed = diff_summary(baseline_text, current)
+    print(
+        f"[DRIFT] {args.device}: configuration has changed!\n"
+        f"  Lines added  : {len(added)}\n"
+        f"  Lines removed: {len(removed)}\n"
+        f"  Baseline hash: {baseline_hash[:16]}...\n"
+        f"  Current hash : {current_hash[:16]}..."
+    )
+
+    if args.verbose:
+        if added:
+            print("\nAdded:")
+            for line in sorted(added):
+                print(f"  + {line}")
+        if removed:
+            print("\nRemoved:")
+            for line in sorted(removed):
+                print(f"  - {line}")
+
+    sys.exit(2)
 
 
-if __name__ == '__main__':
-    exit(main())
-```
+if __name__ == "__main__":
+    main()
