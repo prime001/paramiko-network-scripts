@@ -1,222 +1,215 @@
-routing_table_v3.py - VRF-aware per-prefix route lookup and next-hop analysis.
+The `paramiko-network-scripts` repo isn't on the local filesystem — the user wants the script content printed directly. Here it is:
 
-Purpose:
-    Query specific IP prefixes on one or more Cisco IOS/IOS-XE devices and
-    report matching routing-table entries (protocol, admin distance, metric,
-    next-hop, egress interface, age).  Unlike a full-table dump, this tool
-    is designed for targeted verification after a change or for auditing
-    route propagation across a fleet.
+```
+"""
+routing_table_monitor.py - Routing Table Change Monitor
+
+Captures the routing table from a Cisco IOS/IOS-XE/NX-OS device via SSH and
+compares it against a saved baseline to detect added, removed, or rerouted
+prefixes.  Designed for change-management workflows: save a pre-change baseline,
+make your change, then diff to confirm only the expected routes moved.
 
 Usage:
-    python routing_table_v3.py -d 192.168.1.1 -u admin -p secret \
-        --prefixes 10.0.0.0/8 172.16.0.0/12
+    # Save a pre-change baseline
+    python routing_table_monitor.py -H 10.0.0.1 -u admin -p secret --save pre.json
 
-    # Multiple devices, specific VRF, JSON output
-    python routing_table_v3.py -d 192.168.1.1,192.168.1.2 -u admin \
-        --prefixes 10.10.0.0/24 --vrf MGMT --output json
+    # Compare post-change state against the baseline
+    python routing_table_monitor.py -H 10.0.0.1 -u admin -p secret --compare pre.json
+
+    # Dump current routes as JSON (useful for inventory pipelines)
+    python routing_table_monitor.py -H 10.0.0.1 -u admin -p secret --output routes.json
+
+    # Target a specific VRF
+    python routing_table_monitor.py -H 10.0.0.1 -u admin -p secret --vrf MGMT --compare pre.json
 
 Prerequisites:
     pip install paramiko
-    SSH access with at least read-level privileges on target devices.
+    SSH enabled on the device; credentials with at least 'show' privilege
 """
 
 import argparse
-import getpass
 import json
 import logging
 import re
 import sys
-import time
-from dataclasses import asdict, dataclass
-from typing import List, Optional
+from datetime import datetime, timezone
+from pathlib import Path
 
 import paramiko
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-# IOS "show ip route <prefix>" — dynamic (BGP/OSPF/EIGRP/RIP) entries
-_DYN_RE = re.compile(
-    r"^\s*(?P<proto>[A-Z][A-Z*\s]{0,3})\s+"
-    r"(?P<prefix>\d+\.\d+\.\d+\.\d+(?:/\d+)?)\s+"
-    r"\[(?P<ad>\d+)/(?P<metric>\d+)\]\s+via\s+(?P<nexthop>\S+)"
-    r"(?:,\s*(?P<age>\S+))?(?:,\s*(?P<iface>\S+))?",
-    re.MULTILINE,
+_PREFIX_RE = re.compile(
+    r"^\s*[A-Z*i>][A-Z*i\s]{0,3}"
+    r"\s+(\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?)"
 )
-
-# Connected / local entries
-_CONN_RE = re.compile(
-    r"^\s*(?P<proto>[CL])\s+"
-    r"(?P<prefix>\d+\.\d+\.\d+\.\d+(?:/\d+)?)"
-    r"(?:\s+is\s+directly\s+connected,\s*(?P<iface>\S+))?",
-    re.MULTILINE,
-)
-
-# Static routes (S)
-_STATIC_RE = re.compile(
-    r"^\s*(?P<proto>S\*?)\s+"
-    r"(?P<prefix>\d+\.\d+\.\d+\.\d+(?:/\d+)?)\s+"
-    r"\[(?P<ad>\d+)/(?P<metric>\d+)\]\s+via\s+(?P<nexthop>\S+)"
-    r"(?:,\s*(?P<iface>\S+))?",
-    re.MULTILINE,
-)
+_NEXTHOP_RE = re.compile(r"via\s+(\d{1,3}(?:\.\d{1,3}){3})")
+_AD_METRIC_RE = re.compile(r"\[(\d+)/(\d+)\]")
+_PROTO_RE = re.compile(r"^\s*([A-Z*i][A-Z*i\s]{0,2})")
 
 
-@dataclass
-class RouteEntry:
-    device: str
-    vrf: Optional[str]
-    queried_prefix: str
-    matched_prefix: str
-    protocol: str
-    admin_distance: Optional[int]
-    metric: Optional[int]
-    nexthop: Optional[str]
-    interface: Optional[str]
-    age: Optional[str]
-
-
-def _drain(channel, timeout: int = 10) -> str:
-    buf = ""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if channel.recv_ready():
-            buf += channel.recv(65535).decode("utf-8", errors="replace")
-            if re.search(r"[#>]\s*$", buf):
-                break
-        else:
-            time.sleep(0.1)
-    return buf
-
-
-def _exec(client: paramiko.SSHClient, command: str, timeout: int) -> str:
-    shell = client.invoke_shell()
-    _drain(shell, timeout=5)
-    shell.send("terminal length 0\n")
-    _drain(shell, timeout=3)
-    shell.send(command + "\n")
-    output = _drain(shell, timeout=timeout)
-    shell.close()
-    return output
-
-
-def _parse(raw: str, device: str, vrf: Optional[str], queried: str) -> List[RouteEntry]:
-    entries: List[RouteEntry] = []
-
-    for pat in (_DYN_RE, _STATIC_RE):
-        for m in pat.finditer(raw):
-            entries.append(RouteEntry(
-                device=device, vrf=vrf, queried_prefix=queried,
-                matched_prefix=m.group("prefix"),
-                protocol=m.group("proto").strip(),
-                admin_distance=int(m.group("ad")),
-                metric=int(m.group("metric")),
-                nexthop=m.group("nexthop"),
-                interface=m.group("iface"),
-                age=m.group("age") if "age" in m.groupdict() else None,
-            ))
-
-    for m in _CONN_RE.finditer(raw):
-        entries.append(RouteEntry(
-            device=device, vrf=vrf, queried_prefix=queried,
-            matched_prefix=m.group("prefix"),
-            protocol=m.group("proto").strip(),
-            admin_distance=None, metric=None, nexthop=None,
-            interface=m.group("iface"), age=None,
-        ))
-
-    if not entries:
-        logger.warning("%s: prefix %s not found (vrf=%s)", device, queried, vrf or "global")
-    return entries
-
-
-def lookup(
-    host: str, username: str, password: str,
-    prefix: str, vrf: Optional[str],
-    port: int, timeout: int,
-) -> List[RouteEntry]:
+def _connect(host, username, password, port, timeout):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        host,
+        port=port,
+        username=username,
+        password=password,
+        timeout=timeout,
+        look_for_keys=False,
+        allow_agent=False,
+    )
+    return client
+
+
+def _run(client, cmd, timeout=30):
+    _, stdout, stderr = client.exec_command(cmd, timeout=timeout)
+    out = stdout.read().decode("utf-8", errors="replace")
+    err = stderr.read().decode("utf-8", errors="replace").strip()
+    if err:
+        log.debug("stderr: %s", err)
+    return out
+
+
+def parse_routes(raw):
+    """Return dict keyed by prefix with nexthop/protocol metadata."""
+    routes = {}
+    for line in raw.splitlines():
+        pm = _PREFIX_RE.match(line)
+        if not pm:
+            continue
+        prefix = pm.group(1)
+        if "/" not in prefix:
+            prefix += "/32"
+        proto_m = _PROTO_RE.match(line)
+        proto = proto_m.group(1).strip().lstrip("*> ") if proto_m else "?"
+        nh_m = _NEXTHOP_RE.search(line)
+        ad_m = _AD_METRIC_RE.search(line)
+        routes[prefix] = {
+            "protocol": proto,
+            "nexthop": nh_m.group(1) if nh_m else None,
+            "admin_distance": int(ad_m.group(1)) if ad_m else None,
+            "metric": int(ad_m.group(2)) if ad_m else None,
+        }
+    return routes
+
+
+def diff_routes(baseline, current):
+    b, c = set(baseline), set(current)
+    added = {p: current[p] for p in c - b}
+    removed = {p: baseline[p] for p in b - c}
+    changed = {
+        p: {"before": baseline[p], "after": current[p]}
+        for p in b & c
+        if baseline[p]["nexthop"] != current[p]["nexthop"]
+    }
+    return added, removed, changed
+
+
+def print_diff(added, removed, changed):
+    if not any([added, removed, changed]):
+        print("No routing table changes detected.")
+        return
+    if added:
+        print(f"\n[+] {len(added)} prefix(es) ADDED:")
+        for pfx, r in sorted(added.items()):
+            print(f"    {pfx:<22}  via {r['nexthop'] or 'N/A'}  ({r['protocol']})")
+    if removed:
+        print(f"\n[-] {len(removed)} prefix(es) REMOVED:")
+        for pfx, r in sorted(removed.items()):
+            print(f"    {pfx:<22}  was via {r['nexthop'] or 'N/A'}  ({r['protocol']})")
+    if changed:
+        print(f"\n[~] {len(changed)} prefix(es) with CHANGED nexthop:")
+        for pfx, d in sorted(changed.items()):
+            print(f"    {pfx:<22}  {d['before']['nexthop']} -> {d['after']['nexthop']}")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Detect routing table changes on a network device"
+    )
+    p.add_argument("-H", "--host", required=True, help="Device hostname or IP")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", required=True, help="SSH password")
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds")
+    p.add_argument("--vrf", help="VRF name (omit for global table)")
+    p.add_argument(
+        "--save", metavar="FILE", nargs="?", const="baseline.json",
+        help="Save snapshot as baseline JSON (default filename: baseline.json)",
+    )
+    p.add_argument(
+        "--compare", metavar="FILE",
+        help="Compare current routing table against a baseline JSON file",
+    )
+    p.add_argument("--output", metavar="FILE", help="Write current routes to JSON")
+    p.add_argument("--debug", action="store_true")
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    cmd = f"show ip route vrf {args.vrf}" if args.vrf else "show ip route"
+
+    log.info("Connecting to %s:%d", args.host, args.port)
     try:
-        client.connect(
-            host, port=port, username=username, password=password,
-            timeout=timeout, look_for_keys=False, allow_agent=False,
-        )
+        client = _connect(args.host, args.username, args.password, args.port, args.timeout)
     except paramiko.AuthenticationException:
-        logger.error("%s: authentication failed", host)
-        return []
-    except Exception as exc:
-        logger.error("%s: connection error — %s", host, exc)
-        return []
+        log.error("Authentication failed")
+        sys.exit(1)
+    except (paramiko.SSHException, OSError) as exc:
+        log.error("Connection error: %s", exc)
+        sys.exit(1)
 
     try:
-        cmd = (
-            f"show ip route vrf {vrf} {prefix}" if vrf
-            else f"show ip route {prefix}"
-        )
-        raw = _exec(client, cmd, timeout)
-        return _parse(raw, host, vrf, prefix)
+        log.info("Running: %s", cmd)
+        raw = _run(client, cmd, timeout=args.timeout)
     finally:
         client.close()
 
+    routes = parse_routes(raw)
+    log.info("Parsed %d routes", len(routes))
 
-def _print_table(entries: List[RouteEntry]) -> None:
-    if not entries:
-        print("No routes found.")
-        return
-    hdr = f"{'DEVICE':<18} {'VRF':<10} {'QUERIED':<20} {'MATCHED':<20} {'PROTO':<6} {'AD/MET':<10} {'NEXTHOP':<18} {'IFACE':<20} {'AGE'}"
-    print(hdr)
-    print("-" * len(hdr))
-    for e in entries:
-        ad_met = f"{e.admin_distance}/{e.metric}" if e.admin_distance is not None else "direct"
-        print(
-            f"{e.device:<18} {e.vrf or 'global':<10} {e.queried_prefix:<20} "
-            f"{e.matched_prefix:<20} {e.protocol:<6} {ad_met:<10} "
-            f"{e.nexthop or 'connected':<18} {e.interface or '':<20} {e.age or ''}"
+    snapshot = {
+        "host": args.host,
+        "vrf": args.vrf or "global",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "route_count": len(routes),
+        "routes": routes,
+    }
+
+    if args.output:
+        Path(args.output).write_text(json.dumps(snapshot, indent=2))
+        log.info("Routes written to %s", args.output)
+
+    if args.save:
+        Path(args.save).write_text(json.dumps(snapshot, indent=2))
+        log.info("Baseline saved: %s (%d routes)", args.save, len(routes))
+
+    if args.compare:
+        bl_path = Path(args.compare)
+        if not bl_path.exists():
+            log.error("Baseline file not found: %s", args.compare)
+            sys.exit(1)
+        bl = json.loads(bl_path.read_text())
+        log.info(
+            "Baseline: %s  %d routes", bl.get("timestamp", "?"), len(bl.get("routes", {}))
         )
+        added, removed, changed = diff_routes(bl.get("routes", {}), routes)
+        print_diff(added, removed, changed)
+        if added or removed or changed:
+            sys.exit(2)
+        return
 
-
-def main() -> int:
-    ap = argparse.ArgumentParser(
-        description="Look up specific prefixes in the routing table of Cisco IOS devices."
-    )
-    ap.add_argument("-d", "--devices", required=True,
-                    help="Comma-separated device IPs or hostnames")
-    ap.add_argument("-u", "--username", required=True)
-    ap.add_argument("-p", "--password", default=None,
-                    help="SSH password (prompted if omitted)")
-    ap.add_argument("--prefixes", nargs="+", required=True,
-                    help="Prefixes to look up, e.g. 10.0.0.0/8 192.168.1.1")
-    ap.add_argument("--vrf", default=None, help="VRF name (default: global routing table)")
-    ap.add_argument("--port", type=int, default=22)
-    ap.add_argument("--timeout", type=int, default=30)
-    ap.add_argument("--output", choices=["table", "json"], default="table")
-    ap.add_argument("--debug", action="store_true")
-    args = ap.parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-    logging.getLogger("paramiko").setLevel(logging.WARNING)
-
-    password = args.password or getpass.getpass(f"Password for {args.username}: ")
-    devices = [d.strip() for d in args.devices.split(",") if d.strip()]
-
-    all_entries: List[RouteEntry] = []
-    for device in devices:
-        for prefix in args.prefixes:
-            logger.info("Querying %s — prefix %s (vrf=%s)", device, prefix, args.vrf or "global")
-            all_entries.extend(lookup(
-                host=device, username=args.username, password=password,
-                prefix=prefix, vrf=args.vrf, port=args.port, timeout=args.timeout,
-            ))
-
-    if args.output == "json":
-        print(json.dumps([asdict(e) for e in all_entries], indent=2))
-    else:
-        _print_table(all_entries)
-
-    return 0 if all_entries else 1
+    if not args.save and not args.output:
+        print(json.dumps(snapshot, indent=2))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
+```
