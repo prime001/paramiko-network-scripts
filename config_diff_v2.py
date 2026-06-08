@@ -1,201 +1,178 @@
-```python
-"""
-Device Health Monitor
+The file path needs to be outside `/opt/NetAutoCommitter` since the user asked for a script for a different repo (`paramiko-network-scripts`). The output should just be the script content printed directly — they said "Output ONLY the script content, no markdown fences, no explanation."
 
-Purpose:
-    Monitor network device health metrics (CPU, memory, uptime) via SSH using paramiko.
-    Supports Cisco IOS and IOS-XE devices.
+"""
+config_drift_detector.py - Detect configuration drift against a golden baseline.
+
+Fetches the running config from a network device via SSH and compares it to a
+locally stored baseline file, producing a unified diff. Useful for compliance
+checks, change audits, and catching unauthorized modifications.
 
 Usage:
-    python device_health_monitor.py --device 192.168.1.1 --username admin --password secret
-    python device_health_monitor.py -d 10.0.0.1 -u admin --key-file ~/.ssh/id_rsa
+    python config_drift_detector.py -H 192.168.1.1 -u admin -b baseline.cfg
+    python config_drift_detector.py -H 192.168.1.1 -u admin -b baseline.cfg --save
+    python config_drift_detector.py -H 192.168.1.1 -u admin -b baseline.cfg --section "ip access"
 
 Prerequisites:
-    - paramiko: pip install paramiko
-    - Device SSH access enabled
-    - User with read permissions to execute show commands
-    - Device supports 'show version', 'show processes cpu', 'show memory'
+    pip install paramiko
+    A baseline config file created from a known-good device state.
 """
 
 import argparse
-import json
+import difflib
+import getpass
 import logging
 import re
 import sys
+from pathlib import Path
 
 import paramiko
 
-
 logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s",
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-class DeviceHealthMonitor:
-    """Monitor network device health via SSH."""
-
-    def __init__(self, host, username, password=None, key_file=None, port=22, timeout=10):
-        self.host = host
-        self.username = username
-        self.password = password
-        self.key_file = key_file
-        self.port = port
-        self.timeout = timeout
-        self.client = None
-
-    def connect(self):
-        """Establish SSH connection to device."""
-        try:
-            self.client = paramiko.SSHClient()
-            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-            if self.key_file:
-                self.client.connect(
-                    self.host,
-                    port=self.port,
-                    username=self.username,
-                    key_filename=self.key_file,
-                    timeout=self.timeout,
-                    allow_agent=False,
-                    look_for_keys=False
-                )
-            else:
-                self.client.connect(
-                    self.host,
-                    port=self.port,
-                    username=self.username,
-                    password=self.password,
-                    timeout=self.timeout,
-                    allow_agent=False,
-                    look_for_keys=False
-                )
-            logger.info(f"Connected to {self.host}")
-        except paramiko.AuthenticationException as e:
-            logger.error(f"Authentication failed: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Connection error: {e}")
-            raise
-
-    def exec_cmd(self, command):
-        """Execute command on device and return output."""
-        if not self.client:
-            return None
-        try:
-            _, stdout, stderr = self.client.exec_command(command, timeout=self.timeout)
-            return stdout.read().decode('utf-8')
-        except Exception as e:
-            logger.error(f"Command execution error: {e}")
-            return None
-
-    def get_uptime(self):
-        """Extract uptime from device output."""
-        output = self.exec_cmd('show version')
-        if output:
-            match = re.search(r'uptime is (.+)', output, re.IGNORECASE)
-            return match.group(1).strip() if match else 'Unknown'
-        return None
-
-    def get_cpu(self):
-        """Extract CPU utilization percentage."""
-        output = self.exec_cmd('show processes cpu | include CPU utilization')
-        if output:
-            match = re.search(r'(\d+)%', output)
-            return int(match.group(1)) if match else None
-        return None
-
-    def get_memory(self):
-        """Extract memory utilization percentage."""
-        output = self.exec_cmd('show memory')
-        if output:
-            match = re.search(r'Processor.*?(\d+)K\s+total,\s+(\d+)K\s+used', output)
-            if match:
-                total, used = int(match.group(1)), int(match.group(2))
-                return round((used / total * 100), 2) if total > 0 else 0
-        return None
-
-    def collect(self):
-        """Collect all health metrics."""
-        try:
-            self.connect()
-            metrics = {
-                'host': self.host,
-                'uptime': self.get_uptime(),
-                'cpu_percent': self.get_cpu(),
-                'memory_percent': self.get_memory(),
-                'status': 'success'
-            }
-        except Exception as e:
-            metrics = {'host': self.host, 'status': 'failed', 'error': str(e)}
-        finally:
-            if self.client:
-                self.client.close()
-        return metrics
+def fetch_running_config(host: str, port: int, username: str, password: str, timeout: int) -> str:
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(host, port=port, username=username, password=password, timeout=timeout)
+        _, stdout, stderr = client.exec_command("show running-config", timeout=timeout)
+        output = stdout.read().decode(errors="replace")
+        err = stderr.read().decode(errors="replace").strip()
+        if err:
+            log.warning("stderr from device: %s", err)
+        if not output.strip():
+            raise RuntimeError("Empty response from device — check credentials and command support")
+        return output
+    finally:
+        client.close()
 
 
-def format_output(metrics, fmt):
-    """Format metrics for display."""
-    if metrics['status'] == 'failed':
-        return f"FAILED: {metrics.get('error', 'Unknown error')}"
-
-    if fmt == 'json':
-        return json.dumps(metrics, indent=2)
-
-    lines = [f"Device: {metrics['host']}", '-' * 40]
-    if metrics['uptime']:
-        lines.append(f"Uptime: {metrics['uptime']}")
-    if metrics['cpu_percent'] is not None:
-        lines.append(f"CPU: {metrics['cpu_percent']}%")
-    if metrics['memory_percent'] is not None:
-        lines.append(f"Memory: {metrics['memory_percent']}%")
-
-    return '\n'.join(lines)
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='Monitor network device health metrics via SSH'
+def normalize(config: str) -> list[str]:
+    """Strip timestamps, nonces, and trailing whitespace that produce false diffs."""
+    noise = re.compile(
+        r"^(! Last configuration change|! NVRAM config|Building configuration|"
+        r"Current configuration|ntp clock-period|crypto pki certificate chain)",
+        re.IGNORECASE,
     )
-    parser.add_argument('-d', '--device', required=True, help='Device IP or hostname')
-    parser.add_argument('-u', '--username', required=True, help='SSH username')
-    parser.add_argument('-p', '--password', help='SSH password')
-    parser.add_argument('-k', '--key-file', help='SSH private key file path')
-    parser.add_argument('--port', type=int, default=22, help='SSH port (default: 22)')
-    parser.add_argument('--timeout', type=int, default=10, help='Command timeout in seconds')
-    parser.add_argument(
-        '-o', '--output',
-        choices=['text', 'json'],
-        default='text',
-        help='Output format (default: text)'
-    )
-    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging')
+    lines = []
+    for line in config.splitlines():
+        stripped = line.rstrip()
+        if noise.match(stripped):
+            continue
+        lines.append(stripped)
+    return lines
 
-    args = parser.parse_args()
 
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
+def filter_section(lines: list[str], keyword: str) -> list[str]:
+    """Return only blocks whose header line contains keyword."""
+    result, in_block = [], False
+    for line in lines:
+        if line and not line.startswith(" ") and not line.startswith("!"):
+            in_block = keyword.lower() in line.lower()
+        if in_block:
+            result.append(line)
+    return result
 
-    if not args.password and not args.key_file:
-        parser.error('Either --password or --key-file must be provided')
 
-    monitor = DeviceHealthMonitor(
-        host=args.device,
-        username=args.username,
-        password=args.password,
-        key_file=args.key_file,
-        port=args.port,
-        timeout=args.timeout
+def compute_diff(baseline: list[str], current: list[str], label_a: str, label_b: str) -> list[str]:
+    return list(
+        difflib.unified_diff(
+            baseline,
+            current,
+            fromfile=label_a,
+            tofile=label_b,
+            lineterm="",
+        )
     )
 
-    metrics = monitor.collect()
-    output = format_output(metrics, args.output)
-    print(output)
 
-    return 0 if metrics['status'] == 'success' else 1
+def load_baseline(path: Path) -> str:
+    if not path.exists():
+        raise FileNotFoundError(f"Baseline file not found: {path}")
+    return path.read_text(errors="replace")
 
 
-if __name__ == '__main__':
+def save_baseline(path: Path, config: str) -> None:
+    path.write_text(config)
+    log.info("Baseline saved to %s", path)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Detect configuration drift against a golden baseline config."
+    )
+    p.add_argument("-H", "--host", required=True, help="Device hostname or IP")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    p.add_argument("-P", "--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("-b", "--baseline", required=True, help="Path to baseline config file")
+    p.add_argument("--section", help="Filter diff to config blocks containing this keyword")
+    p.add_argument("--save", action="store_true", help="Overwrite baseline with current config")
+    p.add_argument("--timeout", type=int, default=30, help="SSH timeout in seconds (default: 30)")
+    p.add_argument("-q", "--quiet", action="store_true", help="Suppress info logs; only print diff")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    if args.quiet:
+        log.setLevel(logging.WARNING)
+
+    password = args.password or getpass.getpass(f"Password for {args.username}@{args.host}: ")
+    baseline_path = Path(args.baseline)
+
+    log.info("Connecting to %s:%d", args.host, args.port)
+    try:
+        current_raw = fetch_running_config(
+            args.host, args.port, args.username, password, args.timeout
+        )
+    except (paramiko.AuthenticationException, paramiko.SSHException) as exc:
+        log.error("SSH error: %s", exc)
+        return 1
+    except OSError as exc:
+        log.error("Connection failed: %s", exc)
+        return 1
+
+    if args.save:
+        save_baseline(baseline_path, current_raw)
+        log.info("Baseline updated. No diff produced.")
+        return 0
+
+    try:
+        baseline_raw = load_baseline(baseline_path)
+    except FileNotFoundError as exc:
+        log.error("%s", exc)
+        return 1
+
+    baseline_lines = normalize(baseline_raw)
+    current_lines = normalize(current_raw)
+
+    if args.section:
+        baseline_lines = filter_section(baseline_lines, args.section)
+        current_lines = filter_section(current_lines, args.section)
+        log.info("Filtered to section keyword: %r", args.section)
+
+    diff = compute_diff(
+        baseline_lines,
+        current_lines,
+        label_a=f"baseline:{baseline_path.name}",
+        label_b=f"live:{args.host}",
+    )
+
+    if not diff:
+        log.info("No drift detected — running config matches baseline.")
+        return 0
+
+    changed = sum(1 for line in diff if line.startswith(("+", "-")) and not line.startswith(("+++", "---")))
+    log.info("Drift detected (%d changed lines)", changed)
+    print("\n".join(diff))
+    return 2
+
+
+if __name__ == "__main__":
     sys.exit(main())
-```
