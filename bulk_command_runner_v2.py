@@ -1,200 +1,230 @@
 ```python
 """
-mac_table.py - MAC Address Table Collector
+NTP Synchronization Status Checker
 
-Connects to one or more Cisco switches via SSH and retrieves the MAC address
-table, producing a consolidated view of MAC-to-port mappings across the network.
-Useful for locating devices, auditing port assignments, and detecting rogue MACs.
+Connects to Cisco IOS/IOS-XE network devices via SSH and reports NTP
+synchronization state, stratum level, reference clock, and clock offset.
+Useful for verifying NTP health across a fleet before change windows or
+after network modifications that could disrupt time synchronization.
 
 Usage:
-    python mac_table.py -d 192.168.1.1 -u admin -p secret
-    python mac_table.py -H switches.txt -u admin --key ~/.ssh/id_rsa
-    python mac_table.py -d 10.0.0.1,10.0.0.2 -u cisco -p cisco --vlan 100 -o results.csv
+    Single device:
+        python ntp_status.py -H 192.168.1.1 -u admin -p secret
+
+    Multiple devices (comma-separated):
+        python ntp_status.py -H 192.168.1.1,192.168.1.2 -u admin -p secret
+
+    From hosts file (one host per line, # for comments):
+        python ntp_status.py --hosts-file devices.txt -u admin --ask-pass
+
+    CSV output:
+        python ntp_status.py --hosts-file devices.txt -u admin -p secret --csv
 
 Prerequisites:
     pip install paramiko
+    Devices must allow SSH; user account needs read access to NTP commands.
+    Tested against Cisco IOS 15.x and IOS-XE 16.x/17.x.
 """
 
 import argparse
 import csv
+import getpass
 import logging
 import re
 import sys
-from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import paramiko
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+    level=logging.WARNING,
 )
-log = logging.getLogger(__name__)
-
-_MAC_RE = re.compile(
-    r"([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}|"
-    r"[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2})",
-    re.IGNORECASE,
-)
-
-
-@dataclass
-class MacEntry:
-    device: str
-    vlan: str
-    mac: str
-    mac_type: str
-    port: str
+logger = logging.getLogger(__name__)
 
 
 def _ssh_connect(
-    host: str,
-    username: str,
-    password: Optional[str],
-    key_path: Optional[str],
-    port: int,
+    host: str, username: str, password: str, port: int, timeout: int
 ) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = dict(hostname=host, username=username, port=port, timeout=10)
-    if key_path:
-        kwargs["key_filename"] = key_path
-    else:
-        kwargs["password"] = password
-    client.connect(**kwargs)
+    client.connect(
+        hostname=host,
+        port=port,
+        username=username,
+        password=password,
+        timeout=timeout,
+        look_for_keys=False,
+        allow_agent=False,
+    )
     return client
 
 
-def _run(client: paramiko.SSHClient, command: str) -> str:
-    _, stdout, stderr = client.exec_command(command, timeout=15)
-    out = stdout.read().decode(errors="replace")
-    err = stderr.read().decode(errors="replace").strip()
+def _run_command(client: paramiko.SSHClient, command: str, timeout: int = 15) -> str:
+    _, stdout, stderr = client.exec_command(command, timeout=timeout)
+    output = stdout.read().decode("utf-8", errors="replace")
+    err = stderr.read().decode("utf-8", errors="replace").strip()
     if err:
-        log.debug("stderr: %s", err)
-    return out
+        logger.debug("stderr for '%s': %s", command, err)
+    return output
 
 
-def _parse(device: str, raw: str, vlan_filter: Optional[str]) -> List[MacEntry]:
-    """Parse IOS/IOS-XE 'show mac address-table' output."""
-    entries = []
-    for line in raw.splitlines():
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        vlan_col, mac_col, type_col, port_col = parts[0], parts[1], parts[2], parts[3]
-        if not vlan_col.isdigit():
-            continue
-        if not _MAC_RE.match(mac_col):
-            continue
-        if vlan_filter and vlan_col != vlan_filter:
-            continue
-        entries.append(MacEntry(
-            device=device,
-            vlan=vlan_col,
-            mac=mac_col.lower(),
-            mac_type=type_col,
-            port=port_col,
-        ))
-    return entries
+def parse_ntp_status(output: str) -> Dict[str, Optional[str]]:
+    """Extract key fields from 'show ntp status' output."""
+    result: Dict[str, Optional[str]] = {
+        "synchronized": "unknown",
+        "stratum": None,
+        "reference": None,
+        "offset_ms": None,
+    }
+
+    sync_match = re.search(r"Clock is (synchronized|unsynchronized)", output, re.IGNORECASE)
+    if sync_match:
+        result["synchronized"] = sync_match.group(1).lower()
+
+    stratum_match = re.search(r"stratum\s+(\d+)", output, re.IGNORECASE)
+    if stratum_match:
+        result["stratum"] = stratum_match.group(1)
+
+    ref_match = re.search(r"reference is\s+(\S+)", output, re.IGNORECASE)
+    if ref_match:
+        result["reference"] = ref_match.group(1)
+
+    offset_match = re.search(r"offset\s+([+-]?[\d.]+)\s+msec", output, re.IGNORECASE)
+    if offset_match:
+        result["offset_ms"] = offset_match.group(1)
+
+    return result
 
 
-def collect_device(
+def check_device(
     host: str,
     username: str,
-    password: Optional[str],
-    key_path: Optional[str],
-    port: int,
-    vlan_filter: Optional[str],
-) -> List[MacEntry]:
+    password: str,
+    port: int = 22,
+    timeout: int = 15,
+) -> Dict:
+    result: Dict = {"host": host, "status": "error", "error": None}
+    client = None
     try:
-        client = _ssh_connect(host, username, password, key_path, port)
-    except Exception as exc:
-        log.error("SSH connect failed for %s: %s", host, exc)
-        return []
-    try:
-        cmd = "show mac address-table"
-        if vlan_filter:
-            cmd += f" vlan {vlan_filter}"
-        raw = _run(client, cmd)
-        entries = _parse(host, raw, vlan_filter)
-        log.info("%s: %d MAC entries collected", host, len(entries))
-        return entries
-    except Exception as exc:
-        log.error("Command failed on %s: %s", host, exc)
-        return []
+        client = _ssh_connect(host, username, password, port, timeout)
+        raw = _run_command(client, "show ntp status", timeout=timeout)
+        result.update(parse_ntp_status(raw))
+        result["status"] = "ok"
+    except paramiko.AuthenticationException:
+        result["error"] = "authentication failed"
+        logger.error("%s: authentication failed", host)
+    except paramiko.SSHException as exc:
+        result["error"] = f"SSH error: {exc}"
+        logger.error("%s: SSH error: %s", host, exc)
+    except OSError as exc:
+        result["error"] = f"connection failed: {exc}"
+        logger.error("%s: %s", host, exc)
     finally:
-        client.close()
+        if client:
+            client.close()
+    return result
 
 
-def _print_table(entries: List[MacEntry]) -> None:
-    if not entries:
-        print("No MAC entries found.")
-        return
-    fmt = "{:<18} {:>5} {:<20} {:<10} {}"
-    print(fmt.format("Device", "VLAN", "MAC", "Type", "Port"))
-    print("-" * 72)
-    for e in entries:
-        print(fmt.format(e.device, e.vlan, e.mac, e.mac_type, e.port))
-
-
-def _write_csv(entries: List[MacEntry], path: str) -> None:
-    with open(path, "w", newline="") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(["device", "vlan", "mac", "type", "port"])
-        for e in entries:
-            writer.writerow([e.device, e.vlan, e.mac, e.mac_type, e.port])
-    log.info("Results written to %s", path)
-
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Collect MAC address tables from Cisco switches via SSH."
+def print_table(results: List[Dict]) -> None:
+    header = (
+        f"{'HOST':<20} {'SYNC':<15} {'STRATUM':<9} {'REFERENCE':<18} {'OFFSET (ms)':<13} ERROR"
     )
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("-d", "--devices", help="Comma-separated device IPs/hostnames")
-    target.add_argument("-H", "--host-file", metavar="FILE", help="File with one host per line")
+    print(header)
+    print("-" * len(header))
+    for r in results:
+        sync = r.get("synchronized") or "-"
+        stratum = r.get("stratum") or "-"
+        ref = r.get("reference") or "-"
+        offset = r.get("offset_ms") or "-"
+        error = r.get("error") or ""
+        print(f"{r['host']:<20} {sync:<15} {stratum:<9} {ref:<18} {offset:<13} {error}")
+
+
+def print_csv(results: List[Dict]) -> None:
+    writer = csv.DictWriter(
+        sys.stdout,
+        fieldnames=["host", "status", "synchronized", "stratum", "reference", "offset_ms", "error"],
+        extrasaction="ignore",
+    )
+    writer.writeheader()
+    writer.writerows(results)
+
+
+def load_hosts(path: str) -> List[str]:
+    with open(path) as fh:
+        return [line.strip() for line in fh if line.strip() and not line.startswith("#")]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Check NTP synchronization status on network devices via SSH.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-H", "--hosts", help="Comma-separated device IPs/hostnames")
+    group.add_argument("--hosts-file", metavar="FILE", help="File with one host per line")
     parser.add_argument("-u", "--username", required=True, help="SSH username")
-    cred = parser.add_mutually_exclusive_group(required=True)
-    cred.add_argument("-p", "--password", help="SSH password")
-    cred.add_argument("--key", metavar="PATH", help="Path to SSH private key")
+    parser.add_argument("-p", "--password", help="SSH password (omit to prompt)")
+    parser.add_argument(
+        "--ask-pass", action="store_true", help="Always prompt for password"
+    )
     parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--vlan", help="Filter to a specific VLAN ID")
-    parser.add_argument("-o", "--output", metavar="FILE", help="Write results to CSV")
+    parser.add_argument(
+        "--timeout", type=int, default=15, help="Connection timeout in seconds (default: 15)"
+    )
+    parser.add_argument("--csv", action="store_true", help="Write results as CSV to stdout")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    return parser.parse_args()
+    return parser
 
 
-if __name__ == "__main__":
-    args = _parse_args()
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    if args.devices:
-        hosts = [h.strip() for h in args.devices.split(",") if h.strip()]
+    password = args.password
+    if args.ask_pass or not password:
+        password = getpass.getpass(f"SSH password for {args.username}: ")
+
+    if args.hosts:
+        hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
     else:
         try:
-            with open(args.host_file) as fh:
-                hosts = [l.strip() for l in fh if l.strip() and not l.startswith("#")]
+            hosts = load_hosts(args.hosts_file)
         except OSError as exc:
-            log.error("Cannot read host file: %s", exc)
-            sys.exit(1)
+            print(f"Error reading hosts file: {exc}", file=sys.stderr)
+            return 1
 
     if not hosts:
-        log.error("No hosts to connect to.")
-        sys.exit(1)
+        print("No hosts to check.", file=sys.stderr)
+        return 1
 
-    all_entries: List[MacEntry] = []
+    results = []
     for host in hosts:
-        all_entries.extend(
-            collect_device(host, args.username, args.password, args.key, args.port, args.vlan)
+        logger.info("Checking %s", host)
+        results.append(check_device(host, args.username, password, args.port, args.timeout))
+
+    if args.csv:
+        print_csv(results)
+    else:
+        print_table(results)
+        failed = sum(1 for r in results if r["status"] == "error")
+        unsynced = sum(1 for r in results if r.get("synchronized") == "unsynchronized")
+        print(
+            f"\n{len(results)} device(s) | {failed} unreachable | {unsynced} unsynchronized"
         )
 
-    _print_table(all_entries)
+    any_issue = any(
+        r["status"] == "error" or r.get("synchronized") == "unsynchronized"
+        for r in results
+    )
+    return 1 if any_issue else 0
 
-    if args.output:
-        _write_csv(all_entries, args.output)
 
-    log.info("Done — %d total entries from %d device(s).", len(all_entries), len(hosts))
+if __name__ == "__main__":
+    sys.exit(main())
 ```
