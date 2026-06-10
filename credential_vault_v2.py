@@ -1,232 +1,180 @@
-Credential Vault v3 - SSH Credential Rotation Tracker with Live Verification
+password_rotation.py - Network device password rotation utility.
 
-Extends credential vault functionality with rotation scheduling and live
-SSH verification via paramiko. Tracks credential age, flags stale entries,
-and validates credentials against real devices before committing to vault.
-
-Usage:
-    python credential_vault_v3.py --add --host 192.168.1.1 --username admin
-    python credential_vault_v3.py --verify --host 192.168.1.1
-    python credential_vault_v3.py --rotate --host 192.168.1.1 --username admin
-    python credential_vault_v3.py --list [--stale-days 90]
-    python credential_vault_v3.py --delete --host 192.168.1.1
+Rotates local user passwords on network devices via SSH, verifies the new
+credentials work before logging success, and reports per-host results.
+Designed for scheduled credential hygiene on Cisco IOS/IOS-XE devices.
 
 Prerequisites:
-    pip install paramiko cryptography
-    VAULT_KEY env var or --vault-key arg sets the Fernet encryption key.
-    Generate a key with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    pip install paramiko
+
+Usage:
+    python password_rotation.py --hosts 192.168.1.1 192.168.1.2 \
+        --username admin --old-password OldPass123 --new-password NewPass456
+
+    python password_rotation.py --inventory hosts.txt \
+        --username admin --old-password OldPass123 --new-password NewPass456 \
+        --port 22 --dry-run
 """
 
 import argparse
-import getpass
-import json
 import logging
-import os
-import socket
 import sys
-from datetime import datetime, timezone
+import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import List
 
 import paramiko
-from cryptography.fernet import Fernet, InvalidToken
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-DEFAULT_VAULT_PATH = Path.home() / ".network_vault_v3.enc"
-DEFAULT_PORT = 22
-DEFAULT_TIMEOUT = 10
-DEFAULT_STALE_DAYS = 90
+
+@dataclass
+class RotationResult:
+    host: str
+    success: bool
+    error: str = ""
 
 
-def load_vault(vault_path: Path, fernet: Fernet) -> dict:
-    if not vault_path.exists():
-        return {}
-    try:
-        encrypted = vault_path.read_bytes()
-        return json.loads(fernet.decrypt(encrypted))
-    except InvalidToken:
-        log.error("Invalid vault key -- cannot decrypt vault.")
-        sys.exit(1)
-
-
-def save_vault(vault_path: Path, fernet: Fernet, data: dict) -> None:
-    encrypted = fernet.encrypt(json.dumps(data).encode())
-    vault_path.write_bytes(encrypted)
-    vault_path.chmod(0o600)
-
-
-def verify_ssh(host: str, username: str, password: str, port: int, timeout: int) -> bool:
+def _open_client(host: str, port: int, username: str, password: str) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        hostname=host,
+        port=port,
+        username=username,
+        password=password,
+        timeout=15,
+        look_for_keys=False,
+        allow_agent=False,
+    )
+    return client
+
+
+def _verify_login(host: str, port: int, username: str, password: str) -> bool:
     try:
-        client.connect(
-            hostname=host,
-            port=port,
-            username=username,
-            password=password,
-            timeout=timeout,
-            allow_agent=False,
-            look_for_keys=False,
-        )
-        log.info("SSH verification succeeded for %s@%s:%d", username, host, port)
+        client = _open_client(host, port, username, password)
+        client.close()
         return True
-    except paramiko.AuthenticationException:
-        log.warning("Authentication failed for %s@%s", username, host)
+    except Exception:
         return False
-    except (socket.timeout, paramiko.ssh_exception.NoValidConnectionsError, OSError) as exc:
-        log.warning("Connection failed for %s: %s", host, exc)
-        return False
+
+
+def _rotate_ios_password(client: paramiko.SSHClient, username: str, new_password: str) -> None:
+    """Drive an interactive IOS shell to update the username secret and save."""
+    shell = client.invoke_shell()
+    shell.settimeout(10)
+
+    def send_wait(cmd: str, delay: float = 0.6) -> None:
+        shell.send(cmd + "\n")
+        time.sleep(delay)
+        while shell.recv_ready():
+            shell.recv(4096)
+
+    send_wait("enable")
+    send_wait("configure terminal")
+    send_wait(f"username {username} secret {new_password}")
+    send_wait("end")
+    send_wait("write memory", delay=2.0)
+    shell.close()
+
+
+def rotate_password(
+    host: str,
+    port: int,
+    username: str,
+    old_password: str,
+    new_password: str,
+) -> RotationResult:
+    log.info("Connecting to %s", host)
+    try:
+        client = _open_client(host, port, username, old_password)
+    except Exception as exc:
+        return RotationResult(host=host, success=False, error=f"connect: {exc}")
+
+    try:
+        _rotate_ios_password(client, username, new_password)
+    except Exception as exc:
+        return RotationResult(host=host, success=False, error=f"rotation: {exc}")
     finally:
         client.close()
 
-
-def cmd_add(args, vault: dict, fernet: Fernet, vault_path: Path) -> None:
-    password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
-    if args.verify_live:
-        if not verify_ssh(args.host, args.username, password, args.port, args.timeout):
-            log.error("Live verification failed -- credential not stored.")
-            sys.exit(1)
-    vault[args.host] = {
-        "username": args.username,
-        "password": password,
-        "port": args.port,
-        "added": datetime.now(timezone.utc).isoformat(),
-        "last_rotated": datetime.now(timezone.utc).isoformat(),
-        "verified": args.verify_live,
-    }
-    save_vault(vault_path, fernet, vault)
-    log.info("Stored credentials for %s", args.host)
-
-
-def cmd_verify(args, vault: dict) -> None:
-    entry = vault.get(args.host)
-    if not entry:
-        log.error("No credentials found for %s", args.host)
-        sys.exit(1)
-    ok = verify_ssh(
-        args.host, entry["username"], entry["password"], entry["port"], args.timeout
-    )
-    sys.exit(0 if ok else 1)
-
-
-def cmd_rotate(args, vault: dict, fernet: Fernet, vault_path: Path) -> None:
-    if args.host not in vault:
-        log.error("No credentials found for %s -- use --add first.", args.host)
-        sys.exit(1)
-    new_password = getpass.getpass(f"New password for {args.username}@{args.host}: ")
-    if args.verify_live:
-        if not verify_ssh(args.host, args.username, new_password, args.port, args.timeout):
-            log.error("Live verification failed -- credential not rotated.")
-            sys.exit(1)
-    vault[args.host].update(
-        {
-            "username": args.username,
-            "password": new_password,
-            "last_rotated": datetime.now(timezone.utc).isoformat(),
-            "verified": args.verify_live,
-        }
-    )
-    save_vault(vault_path, fernet, vault)
-    log.info("Rotated credentials for %s", args.host)
-
-
-def cmd_list(args, vault: dict) -> None:
-    if not vault:
-        print("Vault is empty.")
-        return
-    now = datetime.now(timezone.utc)
-    print(f"{'Host':<20} {'Username':<16} {'Port':<6} {'Last Rotated':<22} {'Status'}")
-    print("-" * 80)
-    for host, entry in sorted(vault.items()):
-        rotated = datetime.fromisoformat(entry["last_rotated"])
-        age_days = (now - rotated).days
-        status = f"STALE ({age_days}d)" if age_days >= args.stale_days else f"OK ({age_days}d)"
-        print(
-            f"{host:<20} {entry['username']:<16} {entry['port']:<6} "
-            f"{entry['last_rotated'][:19]:<22} {status}"
+    time.sleep(1)
+    if not _verify_login(host, port, username, new_password):
+        log.error("%s: post-rotation verification failed — manual remediation required", host)
+        return RotationResult(
+            host=host,
+            success=False,
+            error="new credentials did not authenticate after rotation",
         )
 
-
-def cmd_delete(args, vault: dict, fernet: Fernet, vault_path: Path) -> None:
-    if args.host not in vault:
-        log.error("No credentials found for %s", args.host)
-        sys.exit(1)
-    del vault[args.host]
-    save_vault(vault_path, fernet, vault)
-    log.info("Deleted credentials for %s", args.host)
+    log.info("%s: rotation verified successfully", host)
+    return RotationResult(host=host, success=True)
 
 
-def build_fernet(args) -> Fernet:
-    key = args.vault_key or os.environ.get("VAULT_KEY")
-    if not key:
-        log.error("Provide --vault-key or set VAULT_KEY environment variable.")
-        sys.exit(1)
-    try:
-        return Fernet(key.encode() if isinstance(key, str) else key)
-    except Exception:
-        log.error(
-            "Invalid Fernet key. Generate one with: "
-            "python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
-        )
-        sys.exit(1)
+def load_inventory(path: str) -> List[str]:
+    return [
+        line.strip()
+        for line in Path(path).read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Network credential vault with rotation tracking and SSH verification"
+        description="Rotate SSH user passwords on network devices",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--add", action="store_true", help="Add or overwrite credentials")
-    group.add_argument("--verify", action="store_true", help="Verify stored credentials via SSH")
-    group.add_argument("--rotate", action="store_true", help="Rotate credentials for a host")
-    group.add_argument("--list", action="store_true", help="List all stored credentials")
-    group.add_argument("--delete", action="store_true", help="Remove credentials for a host")
-
-    parser.add_argument("--host", help="Device hostname or IP")
-    parser.add_argument("--username", help="SSH username")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="SSH port (default: 22)")
-    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Connection timeout seconds")
-    parser.add_argument("--vault-path", type=Path, default=DEFAULT_VAULT_PATH, help="Vault file path")
-    parser.add_argument("--vault-key", help="Fernet encryption key (or set VAULT_KEY env var)")
-    parser.add_argument("--verify-live", action="store_true", help="Test credentials against device before storing")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--hosts", nargs="+", metavar="IP", help="One or more device IPs")
+    source.add_argument("--inventory", metavar="FILE", help="File with one host per line")
+    parser.add_argument("--username", required=True, help="SSH username whose password is rotated")
+    parser.add_argument("--old-password", required=True, help="Current password")
+    parser.add_argument("--new-password", required=True, help="Replacement password")
+    parser.add_argument("--port", type=int, default=22, help="SSH port")
     parser.add_argument(
-        "--stale-days",
-        type=int,
-        default=DEFAULT_STALE_DAYS,
-        help="Days before credential flagged stale (default: 90)",
+        "--dry-run",
+        action="store_true",
+        help="Test connectivity with current credentials only; make no changes",
     )
     return parser.parse_args()
 
 
-if __name__ == "__main__":
+def main() -> int:
     args = parse_args()
-    fernet = build_fernet(args)
-    vault = load_vault(args.vault_path, fernet)
+    hosts = args.hosts if args.hosts else load_inventory(args.inventory)
 
-    if args.add:
-        if not args.host or not args.username:
-            log.error("--add requires --host and --username")
-            sys.exit(1)
-        cmd_add(args, vault, fernet, args.vault_path)
-    elif args.verify:
-        if not args.host:
-            log.error("--verify requires --host")
-            sys.exit(1)
-        cmd_verify(args, vault)
-    elif args.rotate:
-        if not args.host or not args.username:
-            log.error("--rotate requires --host and --username")
-            sys.exit(1)
-        cmd_rotate(args, vault, fernet, args.vault_path)
-    elif args.list:
-        cmd_list(args, vault)
-    elif args.delete:
-        if not args.host:
-            log.error("--delete requires --host")
-            sys.exit(1)
-        cmd_delete(args, vault, fernet, args.vault_path)
+    if not hosts:
+        log.error("No hosts to process")
+        return 1
+
+    results: List[RotationResult] = []
+    for host in hosts:
+        if args.dry_run:
+            ok = _verify_login(host, args.port, args.username, args.old_password)
+            log.info("dry-run %s: %s", host, "reachable" if ok else "UNREACHABLE")
+            results.append(RotationResult(host=host, success=ok, error="" if ok else "unreachable"))
+        else:
+            result = rotate_password(
+                host, args.port, args.username, args.old_password, args.new_password
+            )
+            results.append(result)
+
+    succeeded = sum(1 for r in results if r.success)
+    failed = len(results) - succeeded
+    log.info("Summary: %d/%d hosts succeeded", succeeded, len(results))
+
+    for r in results:
+        if not r.success:
+            log.warning("FAILED %s — %s", r.host, r.error)
+
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
