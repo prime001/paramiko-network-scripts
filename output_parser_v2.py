@@ -1,208 +1,183 @@
-BGP Summary Parser
+cdp_neighbor_map.py - Cisco CDP Neighbor Discovery Parser
 
 Purpose:
-    Connects to a network device via SSH and parses 'show ip bgp summary' (or
-    equivalent) output into structured data. Reports neighbor states, prefixes
-    received, uptime, and flags any sessions that are not Established.
+    Connects to a Cisco network device via SSH, retrieves CDP neighbor
+    detail output, and parses it into structured records showing device
+    identity, platform, capabilities, and link adjacency information.
+    Useful for automated topology discovery and neighbor validation.
 
 Usage:
-    python bgp_summary_parser.py -H 192.168.1.1 -u admin -p secret
-    python bgp_summary_parser.py -H 10.0.0.1 -u admin --key ~/.ssh/id_rsa --afi ipv6
-    python bgp_summary_parser.py -H 10.0.0.1 -u admin -p secret --warn-only
+    python cdp_neighbor_map.py -H 192.168.1.1 -u admin -p secret
+    python cdp_neighbor_map.py -H 192.168.1.1 -u admin --json
+    python cdp_neighbor_map.py -H 192.168.1.1 -u admin -o neighbors.json
 
 Prerequisites:
     pip install paramiko
-    SSH access to the target device with show-level privileges.
-    Tested against Cisco IOS, IOS-XE, and NX-OS output formats.
+    Target device must have CDP enabled and SSH accessible.
+    Tested against IOS 15.x and IOS-XE 16.x/17.x.
 """
 
 import argparse
+import getpass
+import json
 import logging
 import re
 import sys
-from dataclasses import dataclass
-from typing import List, Optional
 
 import paramiko
 
-logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.WARNING)
-log = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
-@dataclass
-class BgpNeighbor:
-    neighbor: str
-    as_number: str
-    msg_rcvd: str
-    msg_sent: str
-    uptime: str
-    state_prefixes: str
-    established: bool
-
-
-def ssh_run(host: str, port: int, username: str, password: Optional[str],
-            key_path: Optional[str], command: str, timeout: int) -> str:
+def ssh_connect(host, username, password, port=22, timeout=10):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    connect_kwargs: dict = dict(
-        hostname=host, port=port, username=username,
-        timeout=timeout, look_for_keys=False, allow_agent=False,
+    client.connect(
+        host,
+        port=port,
+        username=username,
+        password=password,
+        timeout=timeout,
+        look_for_keys=False,
+        allow_agent=False,
     )
-    if key_path:
-        connect_kwargs["key_filename"] = key_path
-    elif password:
-        connect_kwargs["password"] = password
-    else:
-        raise ValueError("Provide --password or --key")
-
-    try:
-        client.connect(**connect_kwargs)
-        _, stdout, stderr = client.exec_command(command, timeout=timeout)
-        output = stdout.read().decode(errors="replace")
-        err = stderr.read().decode(errors="replace").strip()
-        if err:
-            log.debug("stderr: %s", err)
-        return output
-    finally:
-        client.close()
+    return client
 
 
-def parse_bgp_summary(output: str) -> List[BgpNeighbor]:
-    """Parse IOS/IOS-XE/NX-OS tabular BGP summary output."""
+def run_command(client, command, timeout=15):
+    _, stdout, stderr = client.exec_command(command, timeout=timeout)
+    output = stdout.read().decode("utf-8", errors="replace")
+    err = stderr.read().decode("utf-8", errors="replace")
+    if err.strip():
+        logger.warning("Device stderr: %s", err.strip())
+    return output
+
+
+def parse_cdp_neighbors(raw_output):
     neighbors = []
-    in_table = False
-    header_re = re.compile(r"Neighbor\s+V\s+AS\b", re.IGNORECASE)
-    row_re = re.compile(
-        r"^(\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]+)\s+"  # neighbor IP (v4 or v6)
-        r"\d+\s+"                                           # BGP version
-        r"(\d+)\s+"                                         # remote AS
-        r"(\d+)\s+"                                         # MsgRcvd
-        r"(\d+)\s+"                                         # MsgSent
-        r"\S+\s+"                                           # TblVer
-        r"\S+\s+"                                           # InQ
-        r"\S+\s+"                                           # OutQ
-        r"(\S+)\s+"                                         # Up/Down
-        r"(\S+)"                                            # State/PfxRcd
-    )
-    for line in output.splitlines():
-        if header_re.search(line):
-            in_table = True
+    blocks = re.split(r"-{10,}", raw_output)
+
+    for block in blocks:
+        block = block.strip()
+        if not block:
             continue
-        if not in_table:
-            continue
-        m = row_re.match(line.strip())
+
+        m = re.search(r"Device ID:\s*(.+)", block)
         if not m:
             continue
-        neighbor, asn, msg_rcvd, msg_sent, uptime, state = m.groups()
-        try:
-            pfx = int(state)
-            established = True
-            label = f"{pfx} pfx"
-        except ValueError:
-            established = False
-            label = state
-        neighbors.append(BgpNeighbor(
-            neighbor=neighbor, as_number=asn, msg_rcvd=msg_rcvd,
-            msg_sent=msg_sent, uptime=uptime,
-            state_prefixes=label, established=established,
-        ))
+        neighbor = {"device_id": m.group(1).strip()}
+
+        m = re.search(r"IP(?:v4)? [Aa]ddress:\s*(\d+\.\d+\.\d+\.\d+)", block)
+        neighbor["ip_address"] = m.group(1) if m else "unknown"
+
+        m = re.search(r"Platform:\s*([^,]+),", block)
+        neighbor["platform"] = m.group(1).strip() if m else "unknown"
+
+        m = re.search(r"Capabilities:\s*(.+)", block)
+        neighbor["capabilities"] = m.group(1).strip() if m else ""
+
+        m = re.search(r"Interface:\s*([^,]+),", block)
+        neighbor["local_interface"] = m.group(1).strip() if m else "unknown"
+
+        m = re.search(r"Port ID \(outgoing port\):\s*(.+)", block)
+        neighbor["remote_interface"] = m.group(1).strip() if m else "unknown"
+
+        # Grab first line of version string only
+        m = re.search(r"Version\s*:\s*\n?\s*(.+)", block)
+        neighbor["software_version"] = m.group(1).strip() if m else ""
+
+        neighbors.append(neighbor)
+
     return neighbors
 
 
-def extract_local_as(output: str) -> str:
-    m = re.search(r"local AS number\s+(\d+)", output, re.IGNORECASE)
-    if not m:
-        m = re.search(r"BGP router identifier[^,]*,\s*local AS number\s+(\d+)", output, re.IGNORECASE)
-    return m.group(1) if m else ""
-
-
-def print_table(neighbors: List[BgpNeighbor], local_as: str) -> None:
-    if local_as:
-        print(f"Local AS: {local_as}")
-    print()
-    hdr = "{:<22} {:<8} {:<10} {:<10} {:<13} {}"
-    print(hdr.format("Neighbor", "AS", "MsgRcvd", "MsgSent", "Uptime", "State/Pfx"))
-    print("-" * 72)
-    for n in neighbors:
-        label = n.state_prefixes if n.established else f"[{n.state_prefixes}]"
-        print(hdr.format(n.neighbor, n.as_number, n.msg_rcvd, n.msg_sent, n.uptime, label))
-
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Parse BGP summary output from a network device.")
-    p.add_argument("-H", "--host", required=True, help="Device IP or hostname")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", default=None, help="SSH password")
-    p.add_argument("--key", dest="key_path", default=None, help="SSH private key path")
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("--afi", choices=["ipv4", "ipv6", "vpnv4"], default="ipv4",
-                   help="Address family to query (default: ipv4)")
-    p.add_argument("--timeout", type=int, default=30, help="SSH timeout seconds (default: 30)")
-    p.add_argument("--warn-only", action="store_true",
-                   help="Exit 0 even when non-Established sessions exist")
-    p.add_argument("--debug", action="store_true", help="Enable debug logging")
-    return p
-
-
-def main() -> int:
-    args = build_parser().parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-    logging.getLogger("paramiko").setLevel(logging.CRITICAL)
-
-    if not args.password and not args.key_path:
-        print("ERROR: provide --password or --key", file=sys.stderr)
-        return 2
-
-    commands = {
-        "ipv4": "show ip bgp summary",
-        "ipv6": "show bgp ipv6 unicast summary",
-        "vpnv4": "show bgp vpnv4 unicast all summary",
-    }
-
-    print(f"Connecting to {args.host}:{args.port} ...")
-    try:
-        output = ssh_run(
-            host=args.host, port=args.port, username=args.username,
-            password=args.password, key_path=args.key_path,
-            command=commands[args.afi], timeout=args.timeout,
-        )
-    except paramiko.AuthenticationException:
-        print("ERROR: Authentication failed", file=sys.stderr)
-        return 1
-    except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
-
-    log.debug("Raw output:\n%s", output)
-
-    if not output.strip():
-        print("ERROR: empty response from device", file=sys.stderr)
-        return 1
-
-    local_as = extract_local_as(output)
-    neighbors = parse_bgp_summary(output)
-
+def format_table(neighbors):
     if not neighbors:
-        print("No BGP neighbors parsed. Raw output:")
-        print(output)
-        return 0
+        return "No CDP neighbors found."
 
-    print_table(neighbors, local_as)
+    headers = ["Device ID", "IP Address", "Platform", "Local Intf", "Remote Intf", "Capabilities"]
+    rows = [
+        [
+            n.get("device_id", ""),
+            n.get("ip_address", ""),
+            n.get("platform", ""),
+            n.get("local_interface", ""),
+            n.get("remote_interface", ""),
+            n.get("capabilities", ""),
+        ]
+        for n in neighbors
+    ]
 
-    down = [n for n in neighbors if not n.established]
-    print(f"\nSummary: {len(neighbors) - len(down)}/{len(neighbors)} neighbors Established")
+    col_widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            col_widths[i] = max(col_widths[i], len(cell))
 
-    if down:
-        print("\nNon-Established sessions:")
-        for n in down:
-            print(f"  {n.neighbor:<22} AS {n.as_number:<8} state={n.state_prefixes}")
-        if not args.warn_only:
-            return 1
+    sep = "+-" + "-+-".join("-" * w for w in col_widths) + "-+"
+    header_row = "| " + " | ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers)) + " |"
 
-    return 0
+    lines = [sep, header_row, sep]
+    for row in rows:
+        lines.append("| " + " | ".join(cell.ljust(col_widths[i]) for i, cell in enumerate(row)) + " |")
+    lines.append(sep)
+
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Parse CDP neighbor details from a Cisco device via SSH."
+    )
+    parser.add_argument("-H", "--host", required=True, help="Device hostname or IP")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--json", action="store_true", dest="as_json", help="Output as JSON")
+    parser.add_argument("-o", "--output", help="Write output to file instead of stdout")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    password = args.password or getpass.getpass(f"Password for {args.username}@{args.host}: ")
+
+    logger.info("Connecting to %s:%d", args.host, args.port)
+    try:
+        client = ssh_connect(args.host, args.username, password, port=args.port)
+    except paramiko.AuthenticationException:
+        logger.error("Authentication failed for %s@%s", args.username, args.host)
+        sys.exit(1)
+    except (paramiko.SSHException, OSError) as exc:
+        logger.error("Connection failed: %s", exc)
+        sys.exit(1)
+
+    try:
+        logger.info("Running 'show cdp neighbors detail'")
+        raw = run_command(client, "show cdp neighbors detail")
+    finally:
+        client.close()
+
+    neighbors = parse_cdp_neighbors(raw)
+    logger.info("Parsed %d CDP neighbor(s)", len(neighbors))
+
+    result = json.dumps(neighbors, indent=2) if args.as_json else format_table(neighbors)
+
+    if args.output:
+        try:
+            with open(args.output, "w") as fh:
+                fh.write(result + "\n")
+            logger.info("Output written to %s", args.output)
+        except OSError as exc:
+            logger.error("Failed to write output file: %s", exc)
+            sys.exit(1)
+    else:
+        print(result)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
