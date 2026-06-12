@@ -1,182 +1,275 @@
-cdp_neighbor_map.py - Cisco CDP Neighbor Discovery Parser
+CDP/LLDP Neighbor Discovery and Topology Mapper
 
-Purpose:
-    Connects to a Cisco network device via SSH, retrieves CDP neighbor
-    detail output, and parses it into structured records showing device
-    identity, platform, capabilities, and link adjacency information.
-    Useful for automated topology discovery and neighbor validation.
+Connects to a network device via SSH, collects CDP and/or LLDP neighbor
+information, parses the structured output, and produces a topology map
+suitable for documentation, troubleshooting, or automated inventory.
 
 Usage:
-    python cdp_neighbor_map.py -H 192.168.1.1 -u admin -p secret
-    python cdp_neighbor_map.py -H 192.168.1.1 -u admin --json
-    python cdp_neighbor_map.py -H 192.168.1.1 -u admin -o neighbors.json
+    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin -p secret
+    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin --ask-pass --protocol lldp
+    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin -p secret --output json
+    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin -p secret --output csv -o neighbors.csv
 
 Prerequisites:
     pip install paramiko
-    Target device must have CDP enabled and SSH accessible.
-    Tested against IOS 15.x and IOS-XE 16.x/17.x.
+    Device must have CDP and/or LLDP enabled and SSH accessible.
+    Account requires at least privilege 1 (show commands only).
 """
 
 import argparse
+import csv
 import getpass
 import json
 import logging
 import re
 import sys
+import time
+from dataclasses import asdict, dataclass
+from typing import List, Optional
 
 import paramiko
 
 logging.basicConfig(
-    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
+    level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-def ssh_connect(host, username, password, port=22, timeout=10):
+@dataclass
+class Neighbor:
+    local_port: str
+    device_id: str
+    remote_port: str
+    platform: str
+    software_version: str
+    ip_address: str
+    capabilities: str
+    protocol: str  # "cdp" or "lldp"
+
+
+def ssh_connect(host: str, username: str, password: str, port: int = 22) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(
-        host,
+        hostname=host,
         port=port,
         username=username,
         password=password,
-        timeout=timeout,
+        timeout=15,
         look_for_keys=False,
         allow_agent=False,
     )
     return client
 
 
-def run_command(client, command, timeout=15):
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    output = stdout.read().decode("utf-8", errors="replace")
-    err = stderr.read().decode("utf-8", errors="replace")
-    if err.strip():
-        logger.warning("Device stderr: %s", err.strip())
-    return output
+def run_command(client: paramiko.SSHClient, command: str, timeout: int = 30) -> str:
+    channel = client.invoke_shell()
+    channel.settimeout(timeout)
+    time.sleep(0.5)
+    channel.recv(65535)  # drain banner/prompt
+
+    channel.send(command + "\n")
+    time.sleep(2)
+
+    output = []
+    while channel.recv_ready():
+        chunk = channel.recv(65535).decode("utf-8", errors="replace")
+        output.append(chunk)
+        time.sleep(0.3)
+
+    channel.close()
+    return "".join(output)
 
 
-def parse_cdp_neighbors(raw_output):
-    neighbors = []
-    blocks = re.split(r"-{10,}", raw_output)
+def parse_cdp_neighbors(raw: str) -> List[Neighbor]:
+    neighbors: List[Neighbor] = []
+    blocks = re.split(r"-{10,}", raw)
 
     for block in blocks:
-        block = block.strip()
-        if not block:
+        if "Device ID" not in block:
             continue
 
-        m = re.search(r"Device ID:\s*(.+)", block)
-        if not m:
-            continue
-        neighbor = {"device_id": m.group(1).strip()}
+        def extract(pattern: str, default: str = "") -> str:
+            m = re.search(pattern, block, re.IGNORECASE)
+            return m.group(1).strip() if m else default
 
-        m = re.search(r"IP(?:v4)? [Aa]ddress:\s*(\d+\.\d+\.\d+\.\d+)", block)
-        neighbor["ip_address"] = m.group(1) if m else "unknown"
+        device_id = extract(r"Device ID:\s*(.+)")
+        ip_address = extract(r"IP(?:v4)? address:\s*(\S+)")
+        platform = extract(r"Platform:\s*([^,\n]+)")
+        capabilities = extract(r"Capabilities:\s*(.+)")
+        local_port = extract(r"Interface:\s*(\S+)")
+        remote_port = extract(r"Port ID \(outgoing port\):\s*(.+)")
+        software_version = extract(r"Version\s*:\s*(.+)")
+        if not software_version:
+            software_version = extract(r"(Cisco IOS[^\n]+)")
 
-        m = re.search(r"Platform:\s*([^,]+),", block)
-        neighbor["platform"] = m.group(1).strip() if m else "unknown"
-
-        m = re.search(r"Capabilities:\s*(.+)", block)
-        neighbor["capabilities"] = m.group(1).strip() if m else ""
-
-        m = re.search(r"Interface:\s*([^,]+),", block)
-        neighbor["local_interface"] = m.group(1).strip() if m else "unknown"
-
-        m = re.search(r"Port ID \(outgoing port\):\s*(.+)", block)
-        neighbor["remote_interface"] = m.group(1).strip() if m else "unknown"
-
-        # Grab first line of version string only
-        m = re.search(r"Version\s*:\s*\n?\s*(.+)", block)
-        neighbor["software_version"] = m.group(1).strip() if m else ""
-
-        neighbors.append(neighbor)
+        if device_id:
+            neighbors.append(
+                Neighbor(
+                    local_port=local_port,
+                    device_id=device_id,
+                    remote_port=remote_port,
+                    platform=platform,
+                    software_version=software_version[:80] if software_version else "",
+                    ip_address=ip_address,
+                    capabilities=capabilities,
+                    protocol="cdp",
+                )
+            )
 
     return neighbors
 
 
-def format_table(neighbors):
+def parse_lldp_neighbors(raw: str) -> List[Neighbor]:
+    neighbors: List[Neighbor] = []
+    blocks = re.split(r"-{10,}", raw)
+
+    for block in blocks:
+        if "System Name" not in block and "Port Description" not in block:
+            continue
+
+        def extract(pattern: str, default: str = "") -> str:
+            m = re.search(pattern, block, re.IGNORECASE)
+            return m.group(1).strip() if m else default
+
+        device_id = extract(r"System Name:\s*(.+)")
+        if not device_id:
+            device_id = extract(r"Chassis id:\s*(.+)")
+        ip_address = extract(r"IP:\s*(\S+)")
+        platform = extract(r"System Description:\s*(.+)")
+        capabilities = extract(r"System Capabilities:\s*(.+)")
+        local_port = extract(r"Local (?:Interface|Intf):\s*(\S+)")
+        remote_port = extract(r"Port id:\s*(.+)")
+
+        if device_id:
+            neighbors.append(
+                Neighbor(
+                    local_port=local_port,
+                    device_id=device_id,
+                    remote_port=remote_port,
+                    platform=platform[:80] if platform else "",
+                    software_version="",
+                    ip_address=ip_address,
+                    capabilities=capabilities,
+                    protocol="lldp",
+                )
+            )
+
+    return neighbors
+
+
+def print_table(neighbors: List[Neighbor]) -> None:
     if not neighbors:
-        return "No CDP neighbors found."
+        print("No neighbors found.")
+        return
 
-    headers = ["Device ID", "IP Address", "Platform", "Local Intf", "Remote Intf", "Capabilities"]
-    rows = [
-        [
-            n.get("device_id", ""),
-            n.get("ip_address", ""),
-            n.get("platform", ""),
-            n.get("local_interface", ""),
-            n.get("remote_interface", ""),
-            n.get("capabilities", ""),
-        ]
-        for n in neighbors
-    ]
-
-    col_widths = [len(h) for h in headers]
-    for row in rows:
-        for i, cell in enumerate(row):
-            col_widths[i] = max(col_widths[i], len(cell))
-
-    sep = "+-" + "-+-".join("-" * w for w in col_widths) + "-+"
-    header_row = "| " + " | ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers)) + " |"
-
-    lines = [sep, header_row, sep]
-    for row in rows:
-        lines.append("| " + " | ".join(cell.ljust(col_widths[i]) for i, cell in enumerate(row)) + " |")
-    lines.append(sep)
-
-    return "\n".join(lines)
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Parse CDP neighbor details from a Cisco device via SSH."
+    header = (
+        f"{'Proto':<5} {'Local Port':<22} {'Device ID':<30} "
+        f"{'Remote Port':<22} {'IP Address':<17} {'Platform':<30}"
     )
-    parser.add_argument("-H", "--host", required=True, help="Device hostname or IP")
+    print(header)
+    print("-" * len(header))
+    for n in neighbors:
+        print(
+            f"{n.protocol.upper():<5} {n.local_port:<22} {n.device_id:<30} "
+            f"{n.remote_port:<22} {n.ip_address:<17} {n.platform[:29]:<30}"
+        )
+
+
+def write_json(neighbors: List[Neighbor], path: Optional[str]) -> None:
+    data = [asdict(n) for n in neighbors]
+    text = json.dumps(data, indent=2)
+    if path:
+        with open(path, "w") as f:
+            f.write(text)
+        log.info("JSON written to %s", path)
+    else:
+        print(text)
+
+
+def write_csv(neighbors: List[Neighbor], path: Optional[str]) -> None:
+    fields = list(asdict(neighbors[0]).keys()) if neighbors else []
+    dest = open(path, "w", newline="") if path else sys.stdout
+    try:
+        writer = csv.DictWriter(dest, fieldnames=fields)
+        writer.writeheader()
+        for n in neighbors:
+            writer.writerow(asdict(n))
+    finally:
+        if path:
+            dest.close()
+            log.info("CSV written to %s", path)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Collect and parse CDP/LLDP neighbor data from a network device."
+    )
+    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
     parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
+    parser.add_argument("-p", "--password", default=None, help="SSH password (omit to prompt)")
     parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--json", action="store_true", dest="as_json", help="Output as JSON")
-    parser.add_argument("-o", "--output", help="Write output to file instead of stdout")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--protocol",
+        choices=["cdp", "lldp", "both"],
+        default="both",
+        help="Neighbor discovery protocol to query (default: both)",
+    )
+    parser.add_argument(
+        "--output",
+        choices=["table", "json", "csv"],
+        default="table",
+        help="Output format (default: table)",
+    )
+    parser.add_argument("-o", "--outfile", default=None, help="Write output to file")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
-    if args.verbose:
+    if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    password = args.password or getpass.getpass(f"Password for {args.username}@{args.host}: ")
+    password = args.password or getpass.getpass(f"Password for {args.username}@{args.device}: ")
 
-    logger.info("Connecting to %s:%d", args.host, args.port)
+    log.info("Connecting to %s:%s", args.device, args.port)
     try:
-        client = ssh_connect(args.host, args.username, password, port=args.port)
+        client = ssh_connect(args.device, args.username, password, args.port)
     except paramiko.AuthenticationException:
-        logger.error("Authentication failed for %s@%s", args.username, args.host)
+        log.error("Authentication failed for %s@%s", args.username, args.device)
         sys.exit(1)
-    except (paramiko.SSHException, OSError) as exc:
-        logger.error("Connection failed: %s", exc)
+    except Exception as exc:
+        log.error("Connection failed: %s", exc)
         sys.exit(1)
 
+    neighbors: List[Neighbor] = []
+
     try:
-        logger.info("Running 'show cdp neighbors detail'")
-        raw = run_command(client, "show cdp neighbors detail")
+        if args.protocol in ("cdp", "both"):
+            log.info("Running: show cdp neighbors detail")
+            raw_cdp = run_command(client, "show cdp neighbors detail")
+            cdp_neighbors = parse_cdp_neighbors(raw_cdp)
+            log.info("Found %d CDP neighbor(s)", len(cdp_neighbors))
+            neighbors.extend(cdp_neighbors)
+
+        if args.protocol in ("lldp", "both"):
+            log.info("Running: show lldp neighbors detail")
+            raw_lldp = run_command(client, "show lldp neighbors detail")
+            lldp_neighbors = parse_lldp_neighbors(raw_lldp)
+            log.info("Found %d LLDP neighbor(s)", len(lldp_neighbors))
+            neighbors.extend(lldp_neighbors)
     finally:
         client.close()
 
-    neighbors = parse_cdp_neighbors(raw)
-    logger.info("Parsed %d CDP neighbor(s)", len(neighbors))
+    if not neighbors:
+        log.warning("No neighbors discovered. Verify CDP/LLDP is enabled on the device.")
+        sys.exit(0)
 
-    result = json.dumps(neighbors, indent=2) if args.as_json else format_table(neighbors)
-
-    if args.output:
-        try:
-            with open(args.output, "w") as fh:
-                fh.write(result + "\n")
-            logger.info("Output written to %s", args.output)
-        except OSError as exc:
-            logger.error("Failed to write output file: %s", exc)
-            sys.exit(1)
-    else:
-        print(result)
+    if args.output == "table":
+        print_table(neighbors)
+    elif args.output == "json":
+        write_json(neighbors, args.outfile)
+    elif args.output == "csv":
+        write_csv(neighbors, args.outfile)
 
 
 if __name__ == "__main__":
