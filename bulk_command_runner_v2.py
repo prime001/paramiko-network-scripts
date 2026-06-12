@@ -1,56 +1,49 @@
-```python
-"""
-NTP Synchronization Status Checker
+device_health_check.py - Network device health snapshot collector
 
-Connects to Cisco IOS/IOS-XE network devices via SSH and reports NTP
-synchronization state, stratum level, reference clock, and clock offset.
-Useful for verifying NTP health across a fleet before change windows or
-after network modifications that could disrupt time synchronization.
+Connects to one or more Cisco IOS/IOS-XE devices and collects CPU utilization,
+memory usage, uptime, and interface error counters. Results are printed as a
+formatted table and optionally written to JSON.
 
 Usage:
-    Single device:
-        python ntp_status.py -H 192.168.1.1 -u admin -p secret
-
-    Multiple devices (comma-separated):
-        python ntp_status.py -H 192.168.1.1,192.168.1.2 -u admin -p secret
-
-    From hosts file (one host per line, # for comments):
-        python ntp_status.py --hosts-file devices.txt -u admin --ask-pass
-
-    CSV output:
-        python ntp_status.py --hosts-file devices.txt -u admin -p secret --csv
+    python device_health_check.py -H 192.168.1.1 -u admin -p secret
+    python device_health_check.py --host-file hosts.txt -u admin --ask-pass
+    python device_health_check.py -H 10.0.0.1 -u admin -p secret --json out.json
 
 Prerequisites:
     pip install paramiko
-    Devices must allow SSH; user account needs read access to NTP commands.
-    Tested against Cisco IOS 15.x and IOS-XE 16.x/17.x.
+    SSH access enabled on target devices (ip ssh version 2)
 """
 
 import argparse
-import csv
 import getpass
+import json
 import logging
 import re
 import sys
-from typing import Dict, List, Optional
 
 import paramiko
 
 logging.basicConfig(
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%H:%M:%S",
     level=logging.WARNING,
+    format="%(levelname)s %(message)s",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-def _ssh_connect(
-    host: str, username: str, password: str, port: int, timeout: int
-) -> paramiko.SSHClient:
+def ssh_exec(client, command, timeout=10):
+    _, stdout, stderr = client.exec_command(command, timeout=timeout)
+    out = stdout.read().decode(errors="replace")
+    err = stderr.read().decode(errors="replace")
+    if err.strip():
+        log.debug("stderr from '%s': %s", command, err.strip())
+    return out
+
+
+def connect(host, username, password, port=22, timeout=10):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(
-        hostname=host,
+        host,
         port=port,
         username=username,
         password=password,
@@ -61,170 +54,124 @@ def _ssh_connect(
     return client
 
 
-def _run_command(client: paramiko.SSHClient, command: str, timeout: int = 15) -> str:
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    output = stdout.read().decode("utf-8", errors="replace")
-    err = stderr.read().decode("utf-8", errors="replace").strip()
-    if err:
-        logger.debug("stderr for '%s': %s", command, err)
-    return output
+def parse_cpu(output):
+    """Extract 5-second CPU % from 'show processes cpu'."""
+    match = re.search(r"CPU utilization.*?(\d+)%/", output)
+    return int(match.group(1)) if match else None
 
 
-def parse_ntp_status(output: str) -> Dict[str, Optional[str]]:
-    """Extract key fields from 'show ntp status' output."""
-    result: Dict[str, Optional[str]] = {
-        "synchronized": "unknown",
-        "stratum": None,
-        "reference": None,
-        "offset_ms": None,
-    }
-
-    sync_match = re.search(r"Clock is (synchronized|unsynchronized)", output, re.IGNORECASE)
-    if sync_match:
-        result["synchronized"] = sync_match.group(1).lower()
-
-    stratum_match = re.search(r"stratum\s+(\d+)", output, re.IGNORECASE)
-    if stratum_match:
-        result["stratum"] = stratum_match.group(1)
-
-    ref_match = re.search(r"reference is\s+(\S+)", output, re.IGNORECASE)
-    if ref_match:
-        result["reference"] = ref_match.group(1)
-
-    offset_match = re.search(r"offset\s+([+-]?[\d.]+)\s+msec", output, re.IGNORECASE)
-    if offset_match:
-        result["offset_ms"] = offset_match.group(1)
-
-    return result
+def parse_memory(output):
+    """Return (used_kb, free_kb) from 'show memory statistics'."""
+    match = re.search(r"Processor\s+\S+\s+(\d+)\s+(\d+)", output)
+    if match:
+        used = int(match.group(1)) // 1024
+        free = int(match.group(2)) // 1024
+        return used, free
+    return None, None
 
 
-def check_device(
-    host: str,
-    username: str,
-    password: str,
-    port: int = 22,
-    timeout: int = 15,
-) -> Dict:
-    result: Dict = {"host": host, "status": "error", "error": None}
-    client = None
+def parse_uptime(output):
+    """Extract uptime string from 'show version'."""
+    match = re.search(r"uptime is (.+)", output)
+    return match.group(1).strip() if match else "unknown"
+
+
+def parse_interface_errors(output):
+    """Count interfaces with non-zero input errors."""
+    error_ifaces = []
+    current = None
+    for line in output.splitlines():
+        iface_match = re.match(r"^(\S+) is ", line)
+        if iface_match:
+            current = iface_match.group(1)
+        if current and re.search(r"\b[1-9]\d* input errors", line):
+            error_ifaces.append(current)
+    return error_ifaces
+
+
+def collect_health(host, username, password, port=22):
+    result = {"host": host, "error": None}
     try:
-        client = _ssh_connect(host, username, password, port, timeout)
-        raw = _run_command(client, "show ntp status", timeout=timeout)
-        result.update(parse_ntp_status(raw))
-        result["status"] = "ok"
+        client = connect(host, username, password, port=port)
+        result["cpu_5s_pct"] = parse_cpu(ssh_exec(client, "show processes cpu"))
+        used, free = parse_memory(ssh_exec(client, "show memory statistics"))
+        result["mem_used_kb"] = used
+        result["mem_free_kb"] = free
+        result["uptime"] = parse_uptime(ssh_exec(client, "show version"))
+        result["error_interfaces"] = parse_interface_errors(
+            ssh_exec(client, "show interfaces")
+        )
+        client.close()
     except paramiko.AuthenticationException:
         result["error"] = "authentication failed"
-        logger.error("%s: authentication failed", host)
-    except paramiko.SSHException as exc:
-        result["error"] = f"SSH error: {exc}"
-        logger.error("%s: SSH error: %s", host, exc)
-    except OSError as exc:
-        result["error"] = f"connection failed: {exc}"
-        logger.error("%s: %s", host, exc)
-    finally:
-        if client:
-            client.close()
+    except Exception as exc:
+        result["error"] = str(exc)
     return result
 
 
-def print_table(results: List[Dict]) -> None:
-    header = (
-        f"{'HOST':<20} {'SYNC':<15} {'STRATUM':<9} {'REFERENCE':<18} {'OFFSET (ms)':<13} ERROR"
-    )
+def print_table(results):
+    header = f"{'Host':<20} {'CPU%':>5} {'Mem Used(KB)':>13} {'Mem Free(KB)':>13} {'Err Ifaces':>10}  Uptime"
     print(header)
     print("-" * len(header))
     for r in results:
-        sync = r.get("synchronized") or "-"
-        stratum = r.get("stratum") or "-"
-        ref = r.get("reference") or "-"
-        offset = r.get("offset_ms") or "-"
-        error = r.get("error") or ""
-        print(f"{r['host']:<20} {sync:<15} {stratum:<9} {ref:<18} {offset:<13} {error}")
+        if r["error"]:
+            print(f"{r['host']:<20}  ERROR: {r['error']}")
+            continue
+        cpu = f"{r['cpu_5s_pct']:>4}%" if r["cpu_5s_pct"] is not None else "   n/a"
+        mem_used = f"{r['mem_used_kb']:>13,}" if r["mem_used_kb"] is not None else "          n/a"
+        mem_free = f"{r['mem_free_kb']:>13,}" if r["mem_free_kb"] is not None else "          n/a"
+        err_count = len(r.get("error_interfaces", []))
+        uptime = r.get("uptime", "unknown")
+        print(f"{r['host']:<20} {cpu} {mem_used} {mem_free} {err_count:>10}  {uptime}")
 
 
-def print_csv(results: List[Dict]) -> None:
-    writer = csv.DictWriter(
-        sys.stdout,
-        fieldnames=["host", "status", "synchronized", "stratum", "reference", "offset_ms", "error"],
-        extrasaction="ignore",
-    )
-    writer.writeheader()
-    writer.writerows(results)
-
-
-def load_hosts(path: str) -> List[str]:
-    with open(path) as fh:
-        return [line.strip() for line in fh if line.strip() and not line.startswith("#")]
-
-
-def build_parser() -> argparse.ArgumentParser:
+def parse_args():
     parser = argparse.ArgumentParser(
-        description="Check NTP synchronization status on network devices via SSH.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Collect CPU, memory, and error stats from Cisco IOS devices."
     )
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("-H", "--hosts", help="Comma-separated device IPs/hostnames")
-    group.add_argument("--hosts-file", metavar="FILE", help="File with one host per line")
+    group.add_argument("-H", "--host", help="Single device IP or hostname")
+    group.add_argument("--host-file", help="File with one host per line")
     parser.add_argument("-u", "--username", required=True, help="SSH username")
     parser.add_argument("-p", "--password", help="SSH password (omit to prompt)")
-    parser.add_argument(
-        "--ask-pass", action="store_true", help="Always prompt for password"
-    )
+    parser.add_argument("--ask-pass", action="store_true", help="Prompt for password")
     parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument(
-        "--timeout", type=int, default=15, help="Connection timeout in seconds (default: 15)"
-    )
-    parser.add_argument("--csv", action="store_true", help="Write results as CSV to stdout")
+    parser.add_argument("--json", metavar="FILE", help="Write results to JSON file")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    return parser
+    return parser.parse_args()
 
 
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
+if __name__ == "__main__":
+    args = parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    password = args.password
-    if args.ask_pass or not password:
-        password = getpass.getpass(f"SSH password for {args.username}: ")
+    if args.ask_pass or not args.password:
+        password = getpass.getpass("SSH password: ")
+    else:
+        password = args.password
 
-    if args.hosts:
-        hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
+    if args.host:
+        hosts = [args.host]
     else:
         try:
-            hosts = load_hosts(args.hosts_file)
-        except OSError as exc:
-            print(f"Error reading hosts file: {exc}", file=sys.stderr)
-            return 1
-
-    if not hosts:
-        print("No hosts to check.", file=sys.stderr)
-        return 1
+            with open(args.host_file) as f:
+                hosts = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+        except OSError as e:
+            sys.exit(f"Cannot read host file: {e}")
 
     results = []
     for host in hosts:
-        logger.info("Checking %s", host)
-        results.append(check_device(host, args.username, password, args.port, args.timeout))
+        log.debug("Connecting to %s", host)
+        results.append(collect_health(host, args.username, password, port=args.port))
 
-    if args.csv:
-        print_csv(results)
-    else:
-        print_table(results)
-        failed = sum(1 for r in results if r["status"] == "error")
-        unsynced = sum(1 for r in results if r.get("synchronized") == "unsynchronized")
-        print(
-            f"\n{len(results)} device(s) | {failed} unreachable | {unsynced} unsynchronized"
-        )
+    print_table(results)
 
-    any_issue = any(
-        r["status"] == "error" or r.get("synchronized") == "unsynchronized"
-        for r in results
-    )
-    return 1 if any_issue else 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-```
+    if args.json:
+        try:
+            with open(args.json, "w") as f:
+                json.dump(results, f, indent=2)
+            print(f"\nResults written to {args.json}")
+        except OSError as e:
+            sys.exit(f"Cannot write JSON: {e}")
