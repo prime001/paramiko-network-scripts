@@ -1,213 +1,206 @@
-The output is the script content only, as requested. Here it is:
-
-```
-"""
-interface_flap_detector.py - Detect interface flaps on network devices via SSH.
-...
-```
-
-Since the write was blocked by permissions, here is the full script content:
-
----
-
 ```python
+#!/usr/bin/env python3
 """
-interface_flap_detector.py - Detect interface flaps on network devices via SSH.
+interface_errors.py - Network Interface Error Counter Monitor
 
-Polls interface operational state at a configurable interval and reports
-interfaces that changed state (up->down or down->up) during the monitoring
-window. Useful for identifying unstable links before they cause service
-degradation or trigger routing reconvergence.
-
-Usage:
-    python interface_flap_detector.py -d 192.168.1.1 -u admin
-    python interface_flap_detector.py -d 192.168.1.1 -u admin -p secret \
-        --interval 10 --duration 120 --output flaps.txt
+Connects to a Cisco IOS/IOS-XE device via SSH and polls interface error
+counters to surface problematic interfaces. Reports CRC errors, input
+errors, input/output drops, and interface resets that exceed a configurable
+threshold. Useful for catching degrading links before they cause outages.
 
 Prerequisites:
     pip install paramiko
-    SSH enabled on target device with read-level credentials.
-    Tested against Cisco IOS/IOS-XE. Adjust STATE_RE for other platforms.
+
+Usage:
+    python interface_errors.py -d 192.168.1.1 -u admin -p secret
+    python interface_errors.py -d 192.168.1.1 -u admin --key ~/.ssh/id_rsa
+    python interface_errors.py -d 192.168.1.1 -u admin -p secret --threshold 10
+    python interface_errors.py -d 192.168.1.1 -u admin -p secret --all --json
 """
 
 import argparse
 import getpass
+import json
 import logging
 import re
 import sys
-import time
-from collections import defaultdict
-from datetime import datetime
 
 import paramiko
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Matches: "GigabitEthernet0/1 is up, line protocol is down"
-STATE_RE = re.compile(
-    r"^(\S+)\s+is\s+\S+,\s+line protocol is\s+(\w+)", re.MULTILINE
-)
 
-
-def _recv_all(chan, wait=2.0):
-    time.sleep(wait)
-    buf = ""
-    while chan.recv_ready():
-        buf += chan.recv(65535).decode("utf-8", errors="replace")
-    return buf
-
-
-def connect(host, port, username, password, key_path, timeout):
+def ssh_connect(host, username, password=None, key_file=None, port=22, timeout=15):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = dict(hostname=host, port=port, username=username, timeout=timeout)
-    if key_path:
-        kwargs["key_filename"] = key_path
-    else:
+    kwargs = {
+        "hostname": host,
+        "port": port,
+        "username": username,
+        "timeout": timeout,
+        "look_for_keys": bool(key_file),
+        "allow_agent": False,
+    }
+    if key_file:
+        kwargs["key_filename"] = key_file
+    elif password:
         kwargs["password"] = password
-        kwargs["look_for_keys"] = False
-        kwargs["allow_agent"] = False
-    client.connect(**kwargs)
-    return client
-
-
-def get_interface_states(chan):
-    chan.send("show interfaces | include ^[A-Z]|line protocol\n")
-    output = _recv_all(chan, wait=2.0)
-    states = {}
-    for m in STATE_RE.finditer(output):
-        states[m.group(1)] = m.group(2) == "up"
-    return states
-
-
-def monitor_flaps(chan, interval, duration):
-    flap_counts = defaultdict(int)
-    flap_log = defaultdict(list)
-
-    logger.info("Taking baseline snapshot...")
-    previous = get_interface_states(chan)
-    if not previous:
-        logger.warning("No interfaces parsed — verify device type and SSH output.")
-        return flap_counts, flap_log
-
-    logger.info(
-        "Monitoring %d interfaces for %ds (poll every %ds)...",
-        len(previous), duration, interval,
-    )
-
-    elapsed = 0
-    while elapsed < duration:
-        time.sleep(interval)
-        elapsed += interval
-        current = get_interface_states(chan)
-        ts = datetime.now().strftime("%H:%M:%S")
-        for iface, is_up in current.items():
-            if iface not in previous:
-                continue
-            if previous[iface] != is_up:
-                direction = "up" if is_up else "down"
-                flap_counts[iface] += 1
-                flap_log[iface].append(f"{ts}->{direction}")
-                logger.warning(
-                    "FLAP  %-32s  %s -> %s",
-                    iface,
-                    "up" if previous[iface] else "down",
-                    direction,
-                )
-        previous = current
-
-    return flap_counts, flap_log
-
-
-def format_report(host, flap_counts, flap_log, duration):
-    lines = [
-        f"Interface Flap Report — {host}",
-        f"Monitoring window : {duration}s",
-        f"Generated         : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        "-" * 70,
-    ]
-    if not flap_counts:
-        lines.append("No interface flaps detected during monitoring window.")
     else:
-        lines.append(f"{'Interface':<32} {'Flaps':>5}  Timestamps")
-        lines.append("-" * 70)
-        for iface in sorted(flap_counts, key=lambda x: -flap_counts[x]):
-            events = "  ".join(flap_log[iface])
-            lines.append(f"{iface:<32} {flap_counts[iface]:>5}  {events}")
-    return "\n".join(lines)
+        raise ValueError("Either --password or --key must be provided")
+
+    try:
+        client.connect(**kwargs)
+        return client
+    except paramiko.AuthenticationException:
+        logger.error("Authentication failed for %s@%s", username, host)
+        raise
+    except (paramiko.SSHException, OSError) as exc:
+        logger.error("Connection to %s failed: %s", host, exc)
+        raise
 
 
-def parse_args():
+def run_command(client, command, timeout=30):
+    _, stdout, stderr = client.exec_command(command, timeout=timeout)
+    out = stdout.read().decode("utf-8", errors="replace")
+    err = stderr.read().decode("utf-8", errors="replace")
+    if err.strip():
+        logger.debug("Device stderr: %s", err.strip())
+    return out
+
+
+def parse_interface_errors(output):
+    """Parse 'show interfaces' into a list of per-interface counter dicts."""
+    interfaces = []
+    current = None
+
+    for line in output.splitlines():
+        m = re.match(
+            r'^(\S+)\s+is\s+(administratively down|up|down).*line protocol is\s+(up|down)',
+            line,
+        )
+        if m:
+            if current:
+                interfaces.append(current)
+            current = {
+                "name": m.group(1),
+                "admin_status": "admin-down" if "administratively" in line else m.group(2),
+                "proto_status": m.group(3),
+                "input_errors": 0,
+                "crc": 0,
+                "input_drops": 0,
+                "output_drops": 0,
+                "output_errors": 0,
+                "resets": 0,
+            }
+            continue
+
+        if current is None:
+            continue
+
+        m = re.search(r'(\d+)\s+input errors,\s+(\d+)\s+CRC', line)
+        if m:
+            current["input_errors"] = int(m.group(1))
+            current["crc"] = int(m.group(2))
+
+        m = re.search(r'Input queue:\s+\d+/\d+/(\d+)/', line)
+        if m:
+            current["input_drops"] = int(m.group(1))
+
+        m = re.search(r'Total output drops:\s+(\d+)', line)
+        if m:
+            current["output_drops"] = int(m.group(1))
+
+        m = re.search(r'(\d+)\s+output errors.*?(\d+)\s+interface resets', line)
+        if m:
+            current["output_errors"] = int(m.group(1))
+            current["resets"] = int(m.group(2))
+
+    if current:
+        interfaces.append(current)
+
+    return interfaces
+
+
+def filter_by_threshold(interfaces, threshold):
+    counter_fields = ("input_errors", "crc", "input_drops", "output_drops", "output_errors", "resets")
+    return [i for i in interfaces if any(i.get(f, 0) > threshold for f in counter_fields)]
+
+
+def print_table(interfaces, device):
+    col = "{:<36} {:<12} {:>9} {:>9} {:>9} {:>9} {:>9}"
+    header = col.format("Interface", "Status", "InErr", "CRC", "InDrop", "OutDrop", "Resets")
+    print(f"\nInterface Error Report: {device}\n")
+    print(header)
+    print("-" * len(header))
+    for i in interfaces:
+        status = f"{i['admin_status']}/{i['proto_status']}"
+        print(col.format(
+            i["name"], status,
+            i["input_errors"], i["crc"],
+            i["input_drops"], i["output_drops"],
+            i["resets"],
+        ))
+
+
+def build_parser():
     p = argparse.ArgumentParser(
-        description="Detect interface state flaps on a network device.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Report interface error counters from a Cisco IOS/IOS-XE device"
     )
     p.add_argument("-d", "--device", required=True, help="Device hostname or IP")
     p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
-    p.add_argument("--key", default=None, metavar="PATH", help="SSH private key file")
-    p.add_argument("--port", type=int, default=22, help="SSH port")
-    p.add_argument("--interval", type=int, default=15, help="Poll interval in seconds")
-    p.add_argument("--duration", type=int, default=300, help="Total monitoring window in seconds")
-    p.add_argument("--output", default=None, metavar="FILE", help="Write report to file")
-    p.add_argument("--timeout", type=int, default=30, help="SSH connect timeout in seconds")
-    p.add_argument("--debug", action="store_true", help="Enable debug logging")
-    return p.parse_args()
+    p.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    p.add_argument("--key", dest="key_file", metavar="PATH", help="SSH private key file")
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument(
+        "--threshold", type=int, default=0,
+        help="Minimum counter value to flag an interface (default: 0)",
+    )
+    p.add_argument("--all", dest="show_all", action="store_true",
+                   help="Show all interfaces, not just those with errors")
+    p.add_argument("--json", dest="json_out", action="store_true", help="Output as JSON")
+    p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    return p
 
 
 if __name__ == "__main__":
-    args = parse_args()
+    args = build_parser().parse_args()
 
-    if args.debug:
+    if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-        logging.getLogger("paramiko").setLevel(logging.DEBUG)
 
-    if not args.key and args.password is None:
+    if not args.key_file and not args.password:
         args.password = getpass.getpass(f"Password for {args.username}@{args.device}: ")
 
-    client = None
     try:
-        logger.info("Connecting to %s:%d...", args.device, args.port)
-        client = connect(
-            args.device, args.port, args.username, args.password, args.key, args.timeout
+        client = ssh_connect(
+            args.device, args.username,
+            password=args.password,
+            key_file=args.key_file,
+            port=args.port,
         )
-        chan = client.invoke_shell()
-        _recv_all(chan, wait=1.5)
-        chan.send("terminal length 0\n")
-        _recv_all(chan, wait=1.0)
-
-        flap_counts, flap_log = monitor_flaps(chan, args.interval, args.duration)
-        report = format_report(args.device, flap_counts, flap_log, args.duration)
-
-        print("\n" + report)
-
-        if args.output:
-            with open(args.output, "w") as fh:
-                fh.write(report + "\n")
-            logger.info("Report written to %s", args.output)
-
-    except paramiko.AuthenticationException:
-        logger.error("Authentication failed for %s@%s", args.username, args.device)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
-    except paramiko.SSHException as exc:
-        logger.error("SSH error: %s", exc)
-        sys.exit(1)
-    except OSError as exc:
-        logger.error("Connection error: %s", exc)
-        sys.exit(1)
+
+    try:
+        raw = run_command(client, "show interfaces")
     finally:
-        if client:
-            client.close()
+        client.close()
+
+    interfaces = parse_interface_errors(raw)
+    if not interfaces:
+        print("No interfaces parsed — verify device output format.", file=sys.stderr)
+        sys.exit(1)
+
+    display = interfaces if args.show_all else filter_by_threshold(interfaces, args.threshold)
+
+    if args.json_out:
+        print(json.dumps(display, indent=2))
+    elif not display:
+        qualifier = "all" if args.show_all else f"above threshold {args.threshold}"
+        print(f"No interfaces with errors ({qualifier}) on {args.device}.")
+    else:
+        print_table(display, args.device)
+        print(f"\n{len(display)} of {len(interfaces)} interfaces reported.")
 ```
-
-**Script:** `interface_flap_detector.py` — 158 lines, distinct from the existing `interface_status.py`/`_v2.py` (those show current state; this monitors *changes* over time). Key design choices:
-
-- **Polling loop** with configurable `--interval` (default 15s) and `--duration` (default 300s), tracking state transitions
-- **Timestamped flap log** per interface, sorted by flap count in the report
-- **Key-based or password auth**, password prompted if neither is supplied
-- **`terminal length 0`** sent before polling to prevent IOS paginaton from truncating output
-- Error handling covers auth failure, SSH errors, and OS-level connection failures separately
