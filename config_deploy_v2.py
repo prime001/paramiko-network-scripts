@@ -1,32 +1,29 @@
-vlan_provisioner.py - Idempotently provision VLANs on Cisco IOS/NX-OS switches via SSH.
+```python
+"""
+verified_config_deploy.py - Deploy configuration with pre/post state capture and auto-rollback.
 
 Purpose:
-    Creates VLANs on a network switch, verifying each VLAN exists after
-    deployment. Supports bulk provisioning from CLI args or a CSV file.
-    Rolls back any VLANs added in the current run if post-deploy verification
-    fails, leaving the device in its original state.
+    Push configuration commands to a network device, optionally capture pre/post
+    state via show commands, and automatically roll back if the device becomes
+    unreachable or SSH connectivity is lost after the change.
 
 Usage:
-    # Single VLAN
-    python vlan_provisioner.py --host 10.0.0.1 --username admin --vlan 100:management
-
-    # Multiple VLANs
-    python vlan_provisioner.py --host 10.0.0.1 --username admin \
-        --vlan 100:management 200:servers 300:voice
-
-    # From file (one id:name per line, # comments supported)
-    python vlan_provisioner.py --host 10.0.0.1 --username admin --vlan-file vlans.txt
+    python verified_config_deploy.py -d 192.168.1.1 -u admin -p secret \\
+        -c commands.txt [-v verify_cmds.txt] [-r rollback_cmds.txt] \\
+        [--rollback-on-failure] [--save] [--state-output state.txt]
 
 Prerequisites:
     pip install paramiko
-    SSH must be enabled on the device. User requires privilege level 15 or
-    provide --enable-secret to elevate. Tested against Cisco IOS 15.x and
-    IOS-XE 16.x.
+
+File formats (all plain text, one entry per line, # lines ignored):
+    commands.txt      - IOS/NX-OS config commands to apply
+    verify_cmds.txt   - show commands run before and after (for comparison)
+    rollback_cmds.txt - config commands to revert the change on failure
 """
 
 import argparse
-import getpass
 import logging
+import socket
 import sys
 import time
 
@@ -35,195 +32,162 @@ import paramiko
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-def _recv_all(shell, wait=1.0):
-    time.sleep(wait)
-    buf = ""
-    while shell.recv_ready():
-        buf += shell.recv(4096).decode("utf-8", errors="replace")
-    return buf
-
-
-def send_command(shell, command, wait=1.0):
-    shell.send(command + "\n")
-    return _recv_all(shell, wait)
-
-
-def enter_enable(shell, enable_secret):
-    out = send_command(shell, "enable")
-    if "assword" in out:
-        out += send_command(shell, enable_secret)
-    if "#" not in out:
-        raise RuntimeError("Failed to reach enable mode — check enable secret")
-
-
-def get_existing_vlans(shell):
-    out = send_command(shell, "show vlan brief", wait=1.5)
-    vlans = set()
-    for line in out.splitlines():
-        parts = line.split()
-        if parts and parts[0].isdigit():
-            vlans.add(int(parts[0]))
-    return vlans
-
-
-def deploy_vlans(shell, vlans):
-    send_command(shell, "configure terminal")
-    for vlan_id, name in vlans:
-        log.info("  Configuring VLAN %d (%s)", vlan_id, name)
-        send_command(shell, f"vlan {vlan_id}")
-        send_command(shell, f"name {name}")
-    send_command(shell, "end")
-    send_command(shell, "write memory", wait=3.0)
-    return [vid for vid, _ in vlans]
-
-
-def rollback_vlans(shell, vlan_ids):
-    log.warning("Rolling back %d VLAN(s): %s", len(vlan_ids), vlan_ids)
-    send_command(shell, "configure terminal")
-    for vlan_id in vlan_ids:
-        send_command(shell, f"no vlan {vlan_id}")
-    send_command(shell, "end")
-    send_command(shell, "write memory", wait=3.0)
-
-
-def parse_vlan_spec(spec):
-    parts = spec.strip().split(":", 1)
-    try:
-        vlan_id = int(parts[0])
-    except ValueError:
-        raise ValueError(f"Invalid VLAN ID '{parts[0]}' in spec '{spec}'")
-    if not 1 <= vlan_id <= 4094:
-        raise ValueError(f"VLAN ID {vlan_id} out of range (1-4094)")
-    name = parts[1].strip() if len(parts) > 1 else f"VLAN{vlan_id:04d}"
-    return vlan_id, name
-
-
-def load_vlan_file(path):
-    vlans = []
-    with open(path) as fh:
-        for lineno, line in enumerate(fh, 1):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            try:
-                vlans.append(parse_vlan_spec(line))
-            except ValueError as exc:
-                raise ValueError(f"{path}:{lineno}: {exc}") from exc
-    return vlans
-
-
-def build_parser():
-    p = argparse.ArgumentParser(
-        description="Idempotently provision VLANs on a Cisco switch via SSH"
+def ssh_connect(host, username, password, port=22, timeout=30):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        host, port=port, username=username, password=password,
+        timeout=timeout, look_for_keys=False, allow_agent=False,
     )
-    p.add_argument("--host", required=True, help="Device hostname or IP")
-    p.add_argument("--port", type=int, default=22)
-    p.add_argument("--username", required=True)
-    p.add_argument("--password", help="SSH password (prompted if omitted)")
-    p.add_argument("--enable-secret", dest="enable_secret", default="",
-                   help="Enable secret (omit if already at privilege 15)")
-    p.add_argument("--vlan", nargs="+", metavar="ID:NAME",
-                   help="One or more VLANs as id:name  e.g. 100:mgmt 200:servers")
-    p.add_argument("--vlan-file", dest="vlan_file",
-                   help="Text file with one id:name entry per line")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Connect and report what would change without applying")
-    p.add_argument("--timeout", type=int, default=10, help="SSH connect timeout (s)")
-    return p
+    return client
+
+
+def run_commands(client, commands, inter_cmd_delay=1.0):
+    shell = client.invoke_shell(width=200, height=200)
+    time.sleep(inter_cmd_delay)
+    shell.recv(65535)
+
+    parts = []
+    for cmd in commands:
+        shell.send(cmd + "\n")
+        time.sleep(inter_cmd_delay)
+        chunk = b""
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if shell.recv_ready():
+                chunk += shell.recv(65535)
+            else:
+                break
+        parts.append(chunk.decode("utf-8", errors="replace"))
+
+    shell.close()
+    return "\n".join(parts)
+
+
+def is_reachable(host, port, timeout=10):
+    try:
+        with socket.create_connection((host, port), timeout):
+            return True
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return False
+
+
+def load_lines(path):
+    with open(path) as fh:
+        return [l.strip() for l in fh if l.strip() and not l.startswith("#")]
+
+
+def do_rollback(args):
+    rollback_cmds = load_lines(args.rollback_file)
+    logger.warning("Rolling back: pushing %d commands from %s", len(rollback_cmds), args.rollback_file)
+    try:
+        client = ssh_connect(args.device, args.username, args.password, args.port)
+        run_commands(client, rollback_cmds)
+        if args.save:
+            run_commands(client, ["write memory"])
+        client.close()
+        logger.info("Rollback complete")
+    except Exception as exc:
+        logger.error("Rollback also failed: %s", exc)
+
+
+def deploy(args):
+    config_cmds = load_lines(args.commands_file)
+    verify_cmds = load_lines(args.verify_file) if args.verify_file else []
+
+    logger.info("Connecting to %s:%d as %s", args.device, args.port, args.username)
+    try:
+        client = ssh_connect(args.device, args.username, args.password, args.port)
+    except Exception as exc:
+        logger.error("Pre-deploy connection failed: %s", exc)
+        sys.exit(1)
+
+    pre_state = ""
+    if verify_cmds:
+        logger.info("Collecting pre-deploy state (%d commands)", len(verify_cmds))
+        pre_state = run_commands(client, verify_cmds)
+
+    logger.info("Deploying %d configuration commands", len(config_cmds))
+    deploy_out = run_commands(client, config_cmds)
+    logger.debug("Deploy output:\n%s", deploy_out)
+
+    if args.save:
+        logger.info("Saving configuration")
+        run_commands(client, ["write memory"])
+
+    client.close()
+
+    logger.info("Waiting %ds before post-deploy verification", args.settle_time)
+    time.sleep(args.settle_time)
+
+    if not is_reachable(args.device, args.port):
+        logger.error("Device unreachable after deploy — connectivity lost")
+        if args.rollback_on_failure and args.rollback_file:
+            do_rollback(args)
+        sys.exit(2)
+
+    post_state = ""
+    if verify_cmds:
+        logger.info("Collecting post-deploy state")
+        try:
+            post_client = ssh_connect(args.device, args.username, args.password, args.port)
+            post_state = run_commands(post_client, verify_cmds)
+            post_client.close()
+        except Exception as exc:
+            logger.error("Post-deploy connection failed: %s", exc)
+            if args.rollback_on_failure and args.rollback_file:
+                do_rollback(args)
+            sys.exit(2)
+
+    if args.state_output and verify_cmds:
+        with open(args.state_output, "w") as fh:
+            fh.write("=== PRE-DEPLOY STATE ===\n")
+            fh.write(pre_state)
+            fh.write("\n=== POST-DEPLOY STATE ===\n")
+            fh.write(post_state)
+        logger.info("State comparison written to %s", args.state_output)
+
+    logger.info("Deployment verified successfully on %s", args.device)
 
 
 def main():
-    parser = build_parser()
+    parser = argparse.ArgumentParser(
+        description="Deploy network config with pre/post verification and optional rollback"
+    )
+    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("-c", "--commands-file", required=True,
+                        help="File containing config commands (one per line)")
+    parser.add_argument("-v", "--verify-file",
+                        help="File with show commands for pre/post state capture")
+    parser.add_argument("-r", "--rollback-file",
+                        help="File with rollback commands to push on failure")
+    parser.add_argument("--rollback-on-failure", action="store_true",
+                        help="Automatically push rollback commands if post-check fails")
+    parser.add_argument("--save", action="store_true",
+                        help="Run 'write memory' after deploying")
+    parser.add_argument("--settle-time", type=int, default=5,
+                        help="Seconds to wait before post-deploy check (default: 5)")
+    parser.add_argument("--state-output",
+                        help="File to write pre/post state comparison")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
-    if not args.vlan and not args.vlan_file:
-        parser.error("Specify at least one of --vlan or --vlan-file")
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    if args.password is None:
-        args.password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
+    if args.rollback_on_failure and not args.rollback_file:
+        parser.error("--rollback-on-failure requires --rollback-file")
 
-    vlans = []
-    for spec in args.vlan or []:
-        try:
-            vlans.append(parse_vlan_spec(spec))
-        except ValueError as exc:
-            parser.error(str(exc))
-    if args.vlan_file:
-        try:
-            vlans.extend(load_vlan_file(args.vlan_file))
-        except (OSError, ValueError) as exc:
-            parser.error(str(exc))
-
-    # Deduplicate; last definition wins for duplicate IDs
-    seen = {}
-    for vid, name in vlans:
-        seen[vid] = name
-    vlans = list(seen.items())
-
-    log.info("Connecting to %s:%d", args.host, args.port)
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(
-            args.host,
-            port=args.port,
-            username=args.username,
-            password=args.password,
-            timeout=args.timeout,
-            look_for_keys=False,
-            allow_agent=False,
-        )
-    except paramiko.AuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.host)
-        sys.exit(1)
-    except (paramiko.SSHException, OSError) as exc:
-        log.error("Connection error: %s", exc)
-        sys.exit(1)
-
-    shell = client.invoke_shell()
-    _recv_all(shell, wait=1.5)  # discard login banner
-
-    try:
-        if args.enable_secret:
-            enter_enable(shell, args.enable_secret)
-
-        existing = get_existing_vlans(shell)
-        skipped = [vid for vid, _ in vlans if vid in existing]
-        to_deploy = [(vid, name) for vid, name in vlans if vid not in existing]
-
-        if skipped:
-            log.info("Already present (skipping): %s", skipped)
-
-        if not to_deploy:
-            log.info("All requested VLANs already exist — nothing to do.")
-            return
-
-        if args.dry_run:
-            log.info("[dry-run] Would deploy %d VLAN(s): %s",
-                     len(to_deploy), [(v, n) for v, n in to_deploy])
-            return
-
-        deployed_ids = deploy_vlans(shell, to_deploy)
-
-        missing = [v for v in deployed_ids if v not in get_existing_vlans(shell)]
-        if missing:
-            log.error("Verification failed — not found after deploy: %s", missing)
-            rollback_vlans(shell, deployed_ids)
-            sys.exit(1)
-
-        log.info("Provisioned %d VLAN(s) successfully: %s", len(deployed_ids), deployed_ids)
-
-    except Exception as exc:
-        log.error("Unexpected error: %s", exc, exc_info=True)
-        sys.exit(1)
-    finally:
-        client.close()
+    deploy(args)
 
 
 if __name__ == "__main__":
     main()
+```
