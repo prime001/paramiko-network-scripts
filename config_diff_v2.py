@@ -1,31 +1,40 @@
-config_compliance_check.py - Network device compliance baseline checker
+```python
+"""
+config_compliance.py - Network Device Configuration Compliance Auditor
 
-Fetches the running configuration from a Cisco IOS/IOS-XE device via SSH and
-compares it against a local golden/baseline config file. Reports lines missing
-from the device (compliance gaps) and lines present on the device but absent
-from the baseline (configuration drift).
+Purpose:
+    Connects to a network device via SSH and validates the running configuration
+    against a set of required and forbidden patterns. Produces a scored compliance
+    report that identifies policy violations and missing controls.
+
+    Distinct from config_diff.py (which compares two config snapshots line-by-line).
+    This script validates a live config against declarative policy rules.
 
 Usage:
-    python config_compliance_check.py -d 192.168.1.1 -u admin -p secret \
-        -b ./baselines/core-switch-baseline.txt
-
-    # Read password from environment variable:
-    NET_PASSWORD=secret python config_compliance_check.py \
-        -d 192.168.1.1 -u admin -b ./baselines/core-switch-baseline.txt
-
-    # Only report compliance gaps (missing from device):
-    python config_compliance_check.py -d 192.168.1.1 -u admin \
-        -b baseline.txt --gaps-only
+    python config_compliance.py -H 192.168.1.1 -u admin -p secret
+    python config_compliance.py -H 10.0.0.1 -u admin -k ~/.ssh/id_rsa -r rules.json
+    python config_compliance.py -H 10.0.0.1 -u admin -p secret -o report.txt --strict
 
 Prerequisites:
     pip install paramiko
+
+Rules file format (JSON):
+    {
+        "required": [
+            {"pattern": "service password-encryption", "description": "Password encryption on"}
+        ],
+        "forbidden": [
+            {"pattern": "transport input telnet$", "description": "Telnet allowed on VTY"}
+        ]
+    }
 """
 
 import argparse
+import json
 import logging
-import os
+import re
 import sys
-import time
+from datetime import datetime
 
 import paramiko
 
@@ -34,170 +43,171 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-CONNECT_TIMEOUT = 15
-RECV_TIMEOUT = 30
-RECV_BUFFER = 65535
-PROMPT_WAIT = 2.0
+DEFAULT_RULES = {
+    "required": [
+        {"pattern": r"service password-encryption", "description": "Password encryption enabled"},
+        {"pattern": r"ntp server \S+", "description": "NTP server configured"},
+        {"pattern": r"logging \d+\.\d+\.\d+\.\d+", "description": "Remote syslog configured"},
+        {"pattern": r"no ip http server", "description": "HTTP server disabled"},
+        {"pattern": r"banner (motd|login)", "description": "Login banner configured"},
+        {"pattern": r"ip ssh version 2", "description": "SSHv2 enforced"},
+    ],
+    "forbidden": [
+        {"pattern": r"^enable password\b", "description": "Weak enable password (not secret)"},
+        {"pattern": r"transport input telnet$", "description": "Telnet allowed on VTY line"},
+        {"pattern": r"no service password-encryption", "description": "Password encryption disabled"},
+        {"pattern": r"^ip http server$", "description": "Unencrypted HTTP server enabled"},
+        {"pattern": r"snmp-server community \S+ RW", "description": "SNMP read-write community"},
+    ],
+}
 
 
-def fetch_running_config(host, port, username, password):
-    """SSH into device and return the full running-config output."""
+def load_rules(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def fetch_running_config(host, username, password=None, key_file=None, port=22, timeout=30):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    kwargs = {
+        "hostname": host,
+        "port": port,
+        "username": username,
+        "timeout": timeout,
+        "look_for_keys": bool(key_file),
+        "allow_agent": False,
+    }
+    if key_file:
+        kwargs["key_filename"] = key_file
+    elif password:
+        kwargs["password"] = password
+    else:
+        raise ValueError("Either --password or --key-file is required")
+
+    client.connect(**kwargs)
+    logger.info("Connected to %s:%d", host, port)
     try:
-        log.info("Connecting to %s:%d", host, port)
-        client.connect(
-            host,
-            port=port,
-            username=username,
-            password=password,
-            timeout=CONNECT_TIMEOUT,
-            look_for_keys=False,
-            allow_agent=False,
-        )
-        shell = client.invoke_shell(width=200)
-        time.sleep(PROMPT_WAIT)
-        shell.recv(RECV_BUFFER)
-
-        shell.send("terminal length 0\n")
-        time.sleep(0.5)
-        shell.recv(RECV_BUFFER)
-
-        shell.send("show running-config\n")
-        time.sleep(PROMPT_WAIT)
-
-        output = b""
-        deadline = time.time() + RECV_TIMEOUT
-        while time.time() < deadline:
-            if shell.recv_ready():
-                chunk = shell.recv(RECV_BUFFER)
-                output += chunk
-                if b"#" in chunk[-20:]:
-                    break
-            else:
-                time.sleep(0.3)
-
-        return output.decode("utf-8", errors="replace")
+        _, stdout, stderr = client.exec_command("show running-config", timeout=60)
+        config = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace").strip()
+        if err:
+            logger.warning("Device stderr: %s", err)
+        return config
     finally:
         client.close()
 
 
-def normalize_lines(text):
-    """Return non-empty, stripped lines from config text, excluding banners/noise."""
-    skip_prefixes = ("!", "Building configuration", "Current configuration", "end")
-    result = set()
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if any(stripped.startswith(p) for p in skip_prefixes):
-            continue
-        result.add(stripped)
-    return result
+def audit_config(config, rules):
+    lines = config.splitlines()
+    findings = {"required": [], "forbidden": [], "passed": 0, "failed": 0}
+
+    for rule in rules.get("required", []):
+        matched = any(re.search(rule["pattern"], line) for line in lines)
+        findings["required"].append({
+            "description": rule["description"],
+            "pattern": rule["pattern"],
+            "status": "PASS" if matched else "FAIL",
+        })
+        findings["passed" if matched else "failed"] += 1
+
+    for rule in rules.get("forbidden", []):
+        hits = [line.strip() for line in lines if re.search(rule["pattern"], line)]
+        findings["forbidden"].append({
+            "description": rule["description"],
+            "pattern": rule["pattern"],
+            "status": "FAIL" if hits else "PASS",
+            "matches": hits,
+        })
+        findings["passed" if not hits else "failed"] += 1
+
+    total = findings["passed"] + findings["failed"]
+    findings["score"] = round(findings["passed"] / total * 100, 1) if total else 0.0
+    findings["total"] = total
+    return findings
 
 
-def load_baseline(path):
-    """Load and normalize the golden baseline config file."""
+def render_report(host, findings, timestamp):
+    score = findings["score"]
+    verdict = "COMPLIANT" if findings["failed"] == 0 else "NON-COMPLIANT"
+    lines = [
+        "Config Compliance Report",
+        "=" * 40,
+        f"Host      : {host}",
+        f"Timestamp : {timestamp}",
+        f"Score     : {score}% ({findings['passed']}/{findings['total']} checks passed)",
+        f"Verdict   : {verdict}",
+        "",
+        "Required Controls",
+        "-" * 40,
+    ]
+    for item in findings["required"]:
+        tag = "PASS" if item["status"] == "PASS" else "FAIL"
+        lines.append(f"  [{tag}] {item['description']}")
+        if item["status"] == "FAIL":
+            lines.append(f"         missing: {item['pattern']}")
+
+    lines += ["", "Forbidden Controls", "-" * 40]
+    for item in findings["forbidden"]:
+        tag = "PASS" if item["status"] == "PASS" else "FAIL"
+        lines.append(f"  [{tag}] {item['description']}")
+        for match in item.get("matches", []):
+            lines.append(f"         found: {match}")
+
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Audit device config against compliance rules")
+    parser.add_argument("-H", "--host", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", help="SSH password")
+    parser.add_argument("-k", "--key-file", dest="key_file", help="SSH private key path")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("-r", "--rules", help="JSON rules file (built-in defaults if omitted)")
+    parser.add_argument("-o", "--output", help="Write report to this file instead of stdout")
+    parser.add_argument(
+        "--strict", action="store_true", help="Exit 1 if device is non-compliant"
+    )
+    args = parser.parse_args()
+
+    if not args.password and not args.key_file:
+        import getpass
+        args.password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
+
+    rules = load_rules(args.rules) if args.rules else DEFAULT_RULES
+
     try:
-        with open(path, encoding="utf-8") as fh:
-            return normalize_lines(fh.read())
-    except OSError as exc:
-        log.error("Cannot read baseline file %s: %s", path, exc)
+        config = fetch_running_config(
+            host=args.host,
+            username=args.username,
+            password=args.password,
+            key_file=args.key_file,
+            port=args.port,
+        )
+    except paramiko.AuthenticationException:
+        logger.error("Authentication failed for %s@%s", args.username, args.host)
+        sys.exit(1)
+    except (paramiko.SSHException, OSError) as exc:
+        logger.error("Connection failed: %s", exc)
         sys.exit(1)
 
+    findings = audit_config(config, rules)
+    report = render_report(args.host, findings, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-def run_compliance_check(host, port, username, password, baseline_path, gaps_only):
-    """
-    Compare device running-config against baseline.
-    Returns exit code: 0=compliant, 1=drift found.
-    """
-    baseline = load_baseline(baseline_path)
-    log.info("Baseline loaded: %d unique config lines from %s", len(baseline), baseline_path)
-
-    raw = fetch_running_config(host, port, username, password)
-    running = normalize_lines(raw)
-    log.info("Device config fetched: %d unique config lines from %s", len(running), host)
-
-    missing = sorted(baseline - running)
-    extra = sorted(running - baseline)
-
-    print("\n" + "=" * 60)
-    print("Compliance Report: %s" % host)
-    print("Baseline: %s" % baseline_path)
-    print("=" * 60)
-
-    if missing:
-        print("\n[FAIL] Compliance gaps -- %d line(s) missing from device:" % len(missing))
-        for line in missing:
-            print("  - %s" % line)
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(report + "\n")
+        logger.info("Report written to %s", args.output)
     else:
-        print("\n[PASS] No compliance gaps -- all baseline lines present on device.")
+        print(report)
 
-    if not gaps_only:
-        if extra:
-            print("\n[WARN] Configuration drift -- %d line(s) on device not in baseline:" % len(extra))
-            for line in extra:
-                print("  + %s" % line)
-        else:
-            print("\n[PASS] No configuration drift -- device has no extra lines beyond baseline.")
-
-    print("\nSummary: %d gap(s), %d extra line(s)" % (len(missing), len(extra)))
-    print("=" * 60)
-
-    return 1 if missing or (not gaps_only and extra) else 0
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Compare device running-config against a compliance baseline.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument(
-        "-p", "--password",
-        default=os.environ.get("NET_PASSWORD"),
-        help="SSH password (or set NET_PASSWORD env var)",
-    )
-    parser.add_argument("-b", "--baseline", required=True, help="Path to golden baseline config file")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument(
-        "--gaps-only",
-        action="store_true",
-        help="Only report missing lines; ignore lines on device not in baseline",
-    )
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    return parser.parse_args()
+    if args.strict and findings["failed"] > 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    args = parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    if not args.password:
-        log.error("Password required: use -p or set NET_PASSWORD environment variable.")
-        sys.exit(1)
-
-    try:
-        exit_code = run_compliance_check(
-            host=args.device,
-            port=args.port,
-            username=args.username,
-            password=args.password,
-            baseline_path=args.baseline,
-            gaps_only=args.gaps_only,
-        )
-        sys.exit(exit_code)
-    except paramiko.AuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.device)
-        sys.exit(2)
-    except paramiko.SSHException as exc:
-        log.error("SSH error connecting to %s: %s", args.device, exc)
-        sys.exit(2)
-    except OSError as exc:
-        log.error("Network error connecting to %s: %s", args.device, exc)
-        sys.exit(2)
+    main()
+```
