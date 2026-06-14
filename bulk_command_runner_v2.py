@@ -1,177 +1,210 @@
-device_health_check.py - Network device health snapshot collector
+sftp_file_transfer.py - Transfer files to/from network devices via SFTP.
 
-Connects to one or more Cisco IOS/IOS-XE devices and collects CPU utilization,
-memory usage, uptime, and interface error counters. Results are printed as a
-formatted table and optionally written to JSON.
+Purpose:
+    Uses paramiko's SFTP subsystem to upload or download files on network
+    devices that expose an SFTP server (Cisco IOS-XE, NX-OS, EOS, Junos).
+    Useful for pushing configuration files, pulling crash logs, certificates,
+    or core dumps without relying on TFTP/SCP external servers.
 
 Usage:
-    python device_health_check.py -H 192.168.1.1 -u admin -p secret
-    python device_health_check.py --host-file hosts.txt -u admin --ask-pass
-    python device_health_check.py -H 10.0.0.1 -u admin -p secret --json out.json
+    # Upload a file to a device
+    python sftp_file_transfer.py --host 192.168.1.1 --user admin \
+        --password secret --upload local.cfg flash:/backup.cfg
+
+    # Download a file from a device
+    python sftp_file_transfer.py --host 192.168.1.1 --user admin \
+        --password secret --download flash:/running-config.txt ./pulled.cfg
+
+    # Use SSH key auth and custom port
+    python sftp_file_transfer.py --host 192.168.1.1 --user admin \
+        --key ~/.ssh/id_rsa --port 22 --download bootflash:/crashinfo ./crash.log
 
 Prerequisites:
     pip install paramiko
-    SSH access enabled on target devices (ip ssh version 2)
+    SFTP must be enabled on the target device:
+      Cisco IOS-XE: ip ssh server algorithm mac hmac-sha2-256
+      NX-OS:        feature sftp-server
+      EOS:          management ssh / sftp-server enable
 """
 
 import argparse
-import getpass
-import json
 import logging
-import re
+import os
 import sys
+from pathlib import Path
 
 import paramiko
 
 logging.basicConfig(
-    level=logging.WARNING,
-    format="%(levelname)s %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
 
-def ssh_exec(client, command, timeout=10):
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    out = stdout.read().decode(errors="replace")
-    err = stderr.read().decode(errors="replace")
-    if err.strip():
-        log.debug("stderr from '%s': %s", command, err.strip())
-    return out
-
-
-def connect(host, username, password, port=22, timeout=10):
+def build_ssh_client(host: str, port: int, username: str,
+                     password: str | None, key_path: str | None,
+                     timeout: int) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        host,
-        port=port,
-        username=username,
-        password=password,
-        timeout=timeout,
-        look_for_keys=False,
-        allow_agent=False,
-    )
+
+    connect_kwargs: dict = {
+        "hostname": host,
+        "port": port,
+        "username": username,
+        "timeout": timeout,
+        "allow_agent": False,
+        "look_for_keys": False,
+    }
+
+    if key_path:
+        connect_kwargs["key_filename"] = os.path.expanduser(key_path)
+        connect_kwargs["look_for_keys"] = False
+    elif password:
+        connect_kwargs["password"] = password
+    else:
+        log.error("Provide --password or --key")
+        sys.exit(1)
+
+    try:
+        client.connect(**connect_kwargs)
+        log.info("SSH connected to %s:%d", host, port)
+    except paramiko.AuthenticationException:
+        log.error("Authentication failed for %s@%s", username, host)
+        sys.exit(1)
+    except paramiko.SSHException as exc:
+        log.error("SSH negotiation failed: %s", exc)
+        sys.exit(1)
+    except OSError as exc:
+        log.error("Connection error: %s", exc)
+        sys.exit(1)
+
     return client
 
 
-def parse_cpu(output):
-    """Extract 5-second CPU % from 'show processes cpu'."""
-    match = re.search(r"CPU utilization.*?(\d+)%/", output)
-    return int(match.group(1)) if match else None
+def upload_file(sftp: paramiko.SFTPClient, local_path: str,
+                remote_path: str) -> None:
+    local = Path(local_path)
+    if not local.exists():
+        log.error("Local file not found: %s", local_path)
+        sys.exit(1)
 
+    size = local.stat().st_size
+    log.info("Uploading %s (%d bytes) -> %s", local_path, size, remote_path)
 
-def parse_memory(output):
-    """Return (used_kb, free_kb) from 'show memory statistics'."""
-    match = re.search(r"Processor\s+\S+\s+(\d+)\s+(\d+)", output)
-    if match:
-        used = int(match.group(1)) // 1024
-        free = int(match.group(2)) // 1024
-        return used, free
-    return None, None
+    transferred: list[int] = [0]
 
+    def _progress(sent: int, total: int) -> None:
+        pct = int(sent / total * 100)
+        if pct != transferred[0]:
+            log.debug("  %d%%  (%d / %d bytes)", pct, sent, total)
+            transferred[0] = pct
 
-def parse_uptime(output):
-    """Extract uptime string from 'show version'."""
-    match = re.search(r"uptime is (.+)", output)
-    return match.group(1).strip() if match else "unknown"
-
-
-def parse_interface_errors(output):
-    """Count interfaces with non-zero input errors."""
-    error_ifaces = []
-    current = None
-    for line in output.splitlines():
-        iface_match = re.match(r"^(\S+) is ", line)
-        if iface_match:
-            current = iface_match.group(1)
-        if current and re.search(r"\b[1-9]\d* input errors", line):
-            error_ifaces.append(current)
-    return error_ifaces
-
-
-def collect_health(host, username, password, port=22):
-    result = {"host": host, "error": None}
     try:
-        client = connect(host, username, password, port=port)
-        result["cpu_5s_pct"] = parse_cpu(ssh_exec(client, "show processes cpu"))
-        used, free = parse_memory(ssh_exec(client, "show memory statistics"))
-        result["mem_used_kb"] = used
-        result["mem_free_kb"] = free
-        result["uptime"] = parse_uptime(ssh_exec(client, "show version"))
-        result["error_interfaces"] = parse_interface_errors(
-            ssh_exec(client, "show interfaces")
-        )
-        client.close()
-    except paramiko.AuthenticationException:
-        result["error"] = "authentication failed"
-    except Exception as exc:
-        result["error"] = str(exc)
-    return result
+        sftp.put(local_path, remote_path, callback=_progress)
+        log.info("Upload complete: %s", remote_path)
+    except OSError as exc:
+        log.error("Upload failed: %s", exc)
+        sys.exit(1)
 
 
-def print_table(results):
-    header = f"{'Host':<20} {'CPU%':>5} {'Mem Used(KB)':>13} {'Mem Free(KB)':>13} {'Err Ifaces':>10}  Uptime"
-    print(header)
-    print("-" * len(header))
-    for r in results:
-        if r["error"]:
-            print(f"{r['host']:<20}  ERROR: {r['error']}")
-            continue
-        cpu = f"{r['cpu_5s_pct']:>4}%" if r["cpu_5s_pct"] is not None else "   n/a"
-        mem_used = f"{r['mem_used_kb']:>13,}" if r["mem_used_kb"] is not None else "          n/a"
-        mem_free = f"{r['mem_free_kb']:>13,}" if r["mem_free_kb"] is not None else "          n/a"
-        err_count = len(r.get("error_interfaces", []))
-        uptime = r.get("uptime", "unknown")
-        print(f"{r['host']:<20} {cpu} {mem_used} {mem_free} {err_count:>10}  {uptime}")
+def download_file(sftp: paramiko.SFTPClient, remote_path: str,
+                  local_path: str) -> None:
+    log.info("Downloading %s -> %s", remote_path, local_path)
+
+    try:
+        remote_stat = sftp.stat(remote_path)
+        size = remote_stat.st_size
+        log.info("Remote file size: %d bytes", size)
+    except OSError as exc:
+        log.error("Cannot stat remote path %s: %s", remote_path, exc)
+        sys.exit(1)
+
+    transferred: list[int] = [0]
+
+    def _progress(sent: int, total: int) -> None:
+        pct = int(sent / total * 100)
+        if pct != transferred[0]:
+            log.debug("  %d%%  (%d / %d bytes)", pct, sent, total)
+            transferred[0] = pct
+
+    try:
+        sftp.get(remote_path, local_path, callback=_progress)
+        actual = Path(local_path).stat().st_size
+        log.info("Download complete: %s (%d bytes)", local_path, actual)
+    except OSError as exc:
+        log.error("Download failed: %s", exc)
+        sys.exit(1)
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Collect CPU, memory, and error stats from Cisco IOS devices."
+        description="Transfer files to/from network devices via SFTP"
     )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("-H", "--host", help="Single device IP or hostname")
-    group.add_argument("--host-file", help="File with one host per line")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", help="SSH password (omit to prompt)")
-    parser.add_argument("--ask-pass", action="store_true", help="Prompt for password")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--json", metavar="FILE", help="Write results to JSON file")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument("--host", required=True, help="Device hostname or IP")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default 22)")
+    parser.add_argument("--user", required=True, help="SSH username")
+
+    auth = parser.add_mutually_exclusive_group()
+    auth.add_argument("--password", help="SSH password")
+    auth.add_argument("--key", metavar="KEY_FILE", help="Path to SSH private key")
+
+    direction = parser.add_mutually_exclusive_group(required=True)
+    direction.add_argument(
+        "--upload",
+        nargs=2,
+        metavar=("LOCAL", "REMOTE"),
+        help="Upload LOCAL file to REMOTE path on device",
+    )
+    direction.add_argument(
+        "--download",
+        nargs=2,
+        metavar=("REMOTE", "LOCAL"),
+        help="Download REMOTE path from device to LOCAL file",
+    )
+
+    parser.add_argument(
+        "--timeout", type=int, default=30, help="Connection timeout in seconds"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    if args.verbose:
+    if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger("paramiko").setLevel(logging.DEBUG)
 
-    if args.ask_pass or not args.password:
-        password = getpass.getpass("SSH password: ")
-    else:
-        password = args.password
+    client = build_ssh_client(
+        host=args.host,
+        port=args.port,
+        username=args.user,
+        password=args.password,
+        key_path=args.key,
+        timeout=args.timeout,
+    )
 
-    if args.host:
-        hosts = [args.host]
-    else:
+    try:
+        sftp = client.open_sftp()
+        log.info("SFTP session opened")
+
+        if args.upload:
+            local_src, remote_dst = args.upload
+            upload_file(sftp, local_src, remote_dst)
+        else:
+            remote_src, local_dst = args.download
+            download_file(sftp, remote_src, local_dst)
+
+    except paramiko.SSHException as exc:
+        log.error("SFTP session error: %s", exc)
+        sys.exit(1)
+    finally:
         try:
-            with open(args.host_file) as f:
-                hosts = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-        except OSError as e:
-            sys.exit(f"Cannot read host file: {e}")
-
-    results = []
-    for host in hosts:
-        log.debug("Connecting to %s", host)
-        results.append(collect_health(host, args.username, password, port=args.port))
-
-    print_table(results)
-
-    if args.json:
-        try:
-            with open(args.json, "w") as f:
-                json.dump(results, f, indent=2)
-            print(f"\nResults written to {args.json}")
-        except OSError as e:
-            sys.exit(f"Cannot write JSON: {e}")
+            sftp.close()
+        except Exception:
+            pass
+        client.close()
+        log.info("Connection closed")
