@@ -1,39 +1,35 @@
 ```python
 """
-config_backup_v3.py - Incremental network device config backup with change detection.
+vlan_backup.py - Network VLAN Database Backup Tool
 
 Purpose:
-    Connects to network devices via SSH and saves their running configuration,
-    but only writes a new backup file when the configuration has actually changed
-    (detected via SHA-256 hash comparison against the most recent backup).
-    Maintains a configurable number of timestamped backups per device with
-    automatic rotation of oldest files.
+    Connects to Cisco IOS/IOS-XE network devices via SSH and extracts VLAN
+    configuration and status data, saving it to structured JSON files.
+    Unlike full running-config backup, this targets the VLAN database only,
+    making VLAN audits, diffs, and restores faster and more focused.
 
 Usage:
-    # Single device, prompt for password
-    python config_backup_v3.py -d 192.168.1.1 -u admin
-
-    # Single device with inline password
-    python config_backup_v3.py -d 192.168.1.1 -u admin -p secret
-
-    # Multiple devices from file (one IP/hostname per line, # comments allowed)
-    python config_backup_v3.py -D devices.txt -u admin --password-env NET_PASS
-
-    # Custom output dir, keep last 10 backups per device
-    python config_backup_v3.py -d 192.168.1.1 -u admin -p secret \
-        -o /var/backups/network --keep 10
+    python vlan_backup.py -H 192.168.1.1 -u admin -p secret
+    python vlan_backup.py -H 192.168.1.1 -u admin --key ~/.ssh/id_rsa
+    python vlan_backup.py --hosts-file devices.txt -u admin -p secret --csv
 
 Prerequisites:
     pip install paramiko
-    SSH access with a user able to run 'show running-config' (or OS equivalent).
+    SSH must be enabled on target devices (read-only access sufficient).
+    Tested against Cisco IOS 15.x and IOS-XE 16.x/17.x.
+
+Output:
+    JSON per device : {output_dir}/{host}_{timestamp}_vlans.json
+    Optional CSV    : {output_dir}/vlan_summary_{timestamp}.csv
 """
 
 import argparse
-import getpass
-import hashlib
+import csv
+import json
 import logging
-import os
+import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -44,198 +40,223 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger(__name__)
-
-SHOW_CONFIG_CMD = {
-    "ios": "show running-config",
-    "nxos": "show running-config",
-    "eos": "show running-config",
-    "junos": "show configuration",
-    "default": "show running-config",
-}
+log = logging.getLogger(__name__)
 
 
-def connect(host, username, password, port, timeout):
+def ssh_connect(host, username, password=None, key_file=None, port=22, timeout=15):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=host,
-        port=port,
-        username=username,
-        password=password,
-        timeout=timeout,
-        look_for_keys=False,
-        allow_agent=False,
-    )
+    kwargs = {
+        "hostname": host,
+        "port": port,
+        "username": username,
+        "timeout": timeout,
+        "look_for_keys": bool(key_file),
+        "allow_agent": False,
+    }
+    if key_file:
+        kwargs["key_filename"] = key_file
+    elif password:
+        kwargs["password"] = password
+    else:
+        raise ValueError("Provide --password or --key")
+    client.connect(**kwargs)
     return client
 
 
-def fetch_config(client, command, timeout):
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    output = stdout.read().decode("utf-8", errors="replace")
-    err = stderr.read().decode("utf-8", errors="replace").strip()
-    if err:
-        logger.debug("stderr from device: %s", err)
+def run_command_shell(client, command, wait=1.5, buffer=4096):
+    """Use an interactive shell channel so IOS pipe (|) works correctly."""
+    chan = client.invoke_shell()
+    chan.settimeout(10)
+    time.sleep(0.5)
+    chan.recv(buffer)  # discard banner/prompt
+
+    chan.send("terminal length 0\n")
+    time.sleep(0.4)
+    chan.recv(buffer)
+
+    chan.send(command + "\n")
+    time.sleep(wait)
+
+    output = ""
+    while chan.recv_ready():
+        output += chan.recv(buffer).decode("utf-8", errors="replace")
+        time.sleep(0.1)
+
+    chan.close()
     return output
 
 
-def sha256(text):
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def parse_vlan_brief(output):
+    vlans = []
+    past_header = False
+    for line in output.splitlines():
+        if re.match(r"^-{4,}", line):
+            past_header = True
+            continue
+        if not past_header:
+            continue
+        # "10   management   active    Gi1/0/1, Gi1/0/2"
+        m = re.match(
+            r"^(\d{1,4})\s+(\S+)\s+(active|act/lshut|act/ishut|suspend|unsup)\s*(.*)?$",
+            line.strip(),
+        )
+        if m:
+            vlan_id, name, status, ports_raw = m.groups()
+            ports = [p.strip() for p in ports_raw.split(",") if p.strip()]
+            vlans.append({"id": int(vlan_id), "name": name, "status": status, "ports": ports})
+        elif vlans and line.strip() and not re.match(r"^\d", line.strip()):
+            # Continuation: additional ports wrapped to next line
+            extra = [p.strip() for p in line.split(",") if p.strip()]
+            vlans[-1]["ports"].extend(extra)
+    return vlans
 
 
-def latest_backup(backup_dir, host):
-    """Return (path, hash) of the most recent backup for host, or (None, None)."""
-    files = sorted(backup_dir.glob(f"{host}_*.cfg"))
-    if not files:
-        return None, None
-    content = files[-1].read_text(encoding="utf-8", errors="replace")
-    return files[-1], sha256(content)
+def parse_vlan_detail(output):
+    """Pull MTU values from verbose 'show vlan' output."""
+    detail = {}
+    current = None
+    for line in output.splitlines():
+        m = re.match(r"^VLAN\s+(\d+)", line)
+        if m:
+            current = int(m.group(1))
+            detail[current] = {}
+        if current:
+            mtu = re.search(r"MTU\s+(\d+)", line)
+            if mtu:
+                detail[current]["mtu"] = int(mtu.group(1))
+    return detail
 
 
-def rotate(backup_dir, host, keep):
-    files = sorted(backup_dir.glob(f"{host}_*.cfg"))
-    for old in files[: max(0, len(files) - keep)]:
-        old.unlink()
-        logger.debug("Removed old backup: %s", old.name)
+def extract_hostname(output):
+    m = re.search(r"hostname\s+(\S+)", output, re.IGNORECASE)
+    return m.group(1) if m else None
 
 
-def backup_device(host, username, password, backup_dir, port, keep, os_type, timeout):
-    command = SHOW_CONFIG_CMD.get(os_type, SHOW_CONFIG_CMD["default"])
-    logger.info("[%s] Connecting...", host)
-
+def backup_device_vlans(host, username, password=None, key_file=None, port=22):
+    log.info("Connecting to %s:%d", host, port)
     try:
-        client = connect(host, username, password, port, timeout)
+        client = ssh_connect(host, username, password, key_file, port)
     except paramiko.AuthenticationException:
-        logger.error("[%s] Authentication failed", host)
-        return False
-    except (paramiko.SSHException, OSError) as exc:
-        logger.error("[%s] Connection error: %s", host, exc)
-        return False
+        log.error("Authentication failed for %s", host)
+        return None
+    except Exception as exc:
+        log.error("Connection failed for %s: %s", host, exc)
+        return None
 
     try:
-        config = fetch_config(client, command, timeout)
-    except Exception as exc:
-        logger.error("[%s] Failed to retrieve config: %s", host, exc)
-        return False
+        brief_out = run_command_shell(client, "show vlan brief")
+        detail_out = run_command_shell(client, "show vlan")
+        hostname_out = run_command_shell(client, "show running-config | include ^hostname")
     finally:
         client.close()
 
-    if not config.strip():
-        logger.warning("[%s] Empty config returned — skipping", host)
-        return False
+    vlans = parse_vlan_brief(brief_out)
+    if not vlans:
+        log.warning("%s: no VLAN data parsed — device may not support 'show vlan brief'", host)
 
-    new_hash = sha256(config)
-    _latest_path, latest_hash = latest_backup(backup_dir, host)
+    detail = parse_vlan_detail(detail_out)
+    for vlan in vlans:
+        if vlan["id"] in detail:
+            vlan.update(detail[vlan["id"]])
 
-    if latest_hash == new_hash:
-        logger.info("[%s] No change detected — skipping write", host)
-        return True
+    hostname = extract_hostname(hostname_out) or host
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = backup_dir / f"{host}_{timestamp}.cfg"
-    out_path.write_text(config, encoding="utf-8")
-    logger.info("[%s] Saved %s", host, out_path.name)
-
-    rotate(backup_dir, host, keep)
-    return True
+    return {
+        "device": host,
+        "hostname": hostname,
+        "collected_at": datetime.utcnow().isoformat() + "Z",
+        "vlan_count": len(vlans),
+        "vlans": vlans,
+    }
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Incremental config backup — only writes when config has changed."
-    )
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("-d", "--device", help="Single device IP or hostname")
-    target.add_argument("-D", "--device-file", help="File listing one device per line")
+def write_json(data, output_dir, host):
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    safe = re.sub(r"[^\w.-]", "_", host)
+    path = output_dir / f"{safe}_{ts}_vlans.json"
+    path.write_text(json.dumps(data, indent=2))
+    log.info("Saved %d VLANs → %s", data["vlan_count"], path)
+    return path
 
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", help="SSH password (omit to prompt)")
-    parser.add_argument(
-        "--password-env",
-        metavar="VAR",
-        help="Read password from this environment variable",
-    )
-    parser.add_argument("-P", "--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument(
-        "-o", "--output-dir",
-        default="./backups",
-        help="Backup directory (default: ./backups)",
-    )
-    parser.add_argument(
-        "--keep",
-        type=int,
-        default=5,
-        help="Max backups to retain per device (default: 5)",
-    )
-    parser.add_argument(
-        "--os-type",
-        choices=list(SHOW_CONFIG_CMD.keys()),
-        default="default",
-        help="Device OS — controls which show command is used",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=30,
-        help="SSH connection/command timeout in seconds (default: 30)",
-    )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    return parser.parse_args()
+
+def write_csv_summary(all_data, output_dir):
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    path = output_dir / f"vlan_summary_{ts}.csv"
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["device", "hostname", "vlan_id", "name", "status", "port_count"])
+        for data in all_data:
+            for vlan in data["vlans"]:
+                writer.writerow([
+                    data["device"], data["hostname"],
+                    vlan["id"], vlan["name"], vlan["status"], len(vlan["ports"]),
+                ])
+    log.info("CSV summary → %s", path)
 
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(
+        description="Backup VLAN database from Cisco IOS/IOS-XE devices"
+    )
+    host_group = parser.add_mutually_exclusive_group(required=True)
+    host_group.add_argument("-H", "--host", help="Device IP or hostname")
+    host_group.add_argument("--hosts-file", help="File with one device per line")
+
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password")
+    parser.add_argument("--key", dest="key_file", help="SSH private key path")
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument(
+        "-o", "--output-dir", default="./vlan_backups",
+        help="Directory for output files (default: ./vlan_backups)",
+    )
+    parser.add_argument("--csv", action="store_true", help="Write a CSV summary across all devices")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    if args.password_env:
-        password = os.environ.get(args.password_env)
-        if not password:
-            logger.error("Environment variable '%s' is not set or empty", args.password_env)
+    if not args.password and not args.key_file:
+        parser.error("Provide --password or --key")
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.hosts_file:
+        try:
+            hosts = [
+                ln.strip()
+                for ln in Path(args.hosts_file).read_text().splitlines()
+                if ln.strip() and not ln.startswith("#")
+            ]
+        except FileNotFoundError:
+            log.error("Hosts file not found: %s", args.hosts_file)
             sys.exit(1)
-    elif args.password:
-        password = args.password
     else:
-        password = getpass.getpass(f"Password for {args.username}: ")
+        hosts = [args.host]
 
-    backup_dir = Path(args.output_dir)
-    backup_dir.mkdir(parents=True, exist_ok=True)
-
-    if args.device:
-        devices = [args.device.strip()]
-    else:
-        device_path = Path(args.device_file)
-        if not device_path.exists():
-            logger.error("Device file not found: %s", args.device_file)
-            sys.exit(1)
-        devices = [
-            line.strip()
-            for line in device_path.read_text().splitlines()
-            if line.strip() and not line.startswith("#")
-        ]
-
-    if not devices:
-        logger.error("No devices to process")
-        sys.exit(1)
-
-    succeeded = sum(
-        backup_device(
-            host=h,
-            username=args.username,
-            password=password,
-            backup_dir=backup_dir,
+    results, failed = [], []
+    for host in hosts:
+        data = backup_device_vlans(
+            host, args.username,
+            password=args.password,
+            key_file=args.key_file,
             port=args.port,
-            keep=args.keep,
-            os_type=args.os_type,
-            timeout=args.timeout,
         )
-        for h in devices
-    )
-    failed = len(devices) - succeeded
-    logger.info("Complete: %d/%d devices succeeded", succeeded, len(devices))
+        if data:
+            write_json(data, output_dir, host)
+            results.append(data)
+        else:
+            failed.append(host)
 
+    if args.csv and results:
+        write_csv_summary(results, output_dir)
+
+    log.info("Done: %d succeeded, %d failed", len(results), len(failed))
     if failed:
+        log.warning("Failed: %s", ", ".join(failed))
         sys.exit(1)
 
 
