@@ -1,213 +1,219 @@
 ```python
 """
-config_compliance.py - Network Device Configuration Compliance Auditor
+config_audit.py - Network device configuration compliance auditor.
 
-Purpose:
-    Connects to a network device via SSH and validates the running configuration
-    against a set of required and forbidden patterns. Produces a scored compliance
-    report that identifies policy violations and missing controls.
-
-    Distinct from config_diff.py (which compares two config snapshots line-by-line).
-    This script validates a live config against declarative policy rules.
-
-Usage:
-    python config_compliance.py -H 192.168.1.1 -u admin -p secret
-    python config_compliance.py -H 10.0.0.1 -u admin -k ~/.ssh/id_rsa -r rules.json
-    python config_compliance.py -H 10.0.0.1 -u admin -p secret -o report.txt --strict
+Connects to a Cisco IOS/IOS-XE device via SSH and validates the running
+configuration against user-defined compliance rules: patterns that must be
+present (required) and patterns that must be absent (forbidden). Useful for
+enforcing security baselines and verifying change-management policies.
 
 Prerequisites:
     pip install paramiko
 
-Rules file format (JSON):
-    {
-        "required": [
-            {"pattern": "service password-encryption", "description": "Password encryption on"}
-        ],
-        "forbidden": [
-            {"pattern": "transport input telnet$", "description": "Telnet allowed on VTY"}
-        ]
-    }
+Usage:
+    # Inline rules
+    python config_audit.py --host 192.168.1.1 --user admin --password secret \\
+        --require "service password-encryption" \\
+        --require "logging 10.0.0.1" \\
+        --forbid "enable password "
+
+    # Load rules from JSON file
+    python config_audit.py --host 192.168.1.1 --user admin --password secret \\
+        --rules baseline.json
+
+    # baseline.json format:
+    # {"required": ["service password-encryption"], "forbidden": ["enable password"]}
+
+    # Save retrieved config alongside the audit
+    python config_audit.py --host 192.168.1.1 --user admin --password secret \\
+        --rules baseline.json --save-config running.txt
+
+Exit codes:
+    0  All rules passed
+    1  One or more rules failed or a runtime error occurred
 """
 
 import argparse
 import json
 import logging
-import re
 import sys
-from datetime import datetime
+import time
 
 import paramiko
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger(__name__)
-
-DEFAULT_RULES = {
-    "required": [
-        {"pattern": r"service password-encryption", "description": "Password encryption enabled"},
-        {"pattern": r"ntp server \S+", "description": "NTP server configured"},
-        {"pattern": r"logging \d+\.\d+\.\d+\.\d+", "description": "Remote syslog configured"},
-        {"pattern": r"no ip http server", "description": "HTTP server disabled"},
-        {"pattern": r"banner (motd|login)", "description": "Login banner configured"},
-        {"pattern": r"ip ssh version 2", "description": "SSHv2 enforced"},
-    ],
-    "forbidden": [
-        {"pattern": r"^enable password\b", "description": "Weak enable password (not secret)"},
-        {"pattern": r"transport input telnet$", "description": "Telnet allowed on VTY line"},
-        {"pattern": r"no service password-encryption", "description": "Password encryption disabled"},
-        {"pattern": r"^ip http server$", "description": "Unencrypted HTTP server enabled"},
-        {"pattern": r"snmp-server community \S+ RW", "description": "SNMP read-write community"},
-    ],
-}
+log = logging.getLogger(__name__)
 
 
-def load_rules(path):
-    with open(path) as f:
-        return json.load(f)
-
-
-def fetch_running_config(host, username, password=None, key_file=None, port=22, timeout=30):
+def ssh_connect(host, port, username, password, timeout):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = {
-        "hostname": host,
-        "port": port,
-        "username": username,
-        "timeout": timeout,
-        "look_for_keys": bool(key_file),
-        "allow_agent": False,
-    }
-    if key_file:
-        kwargs["key_filename"] = key_file
-    elif password:
-        kwargs["password"] = password
-    else:
-        raise ValueError("Either --password or --key-file is required")
-
-    client.connect(**kwargs)
-    logger.info("Connected to %s:%d", host, port)
-    try:
-        _, stdout, stderr = client.exec_command("show running-config", timeout=60)
-        config = stdout.read().decode("utf-8", errors="replace")
-        err = stderr.read().decode("utf-8", errors="replace").strip()
-        if err:
-            logger.warning("Device stderr: %s", err)
-        return config
-    finally:
-        client.close()
-
-
-def audit_config(config, rules):
-    lines = config.splitlines()
-    findings = {"required": [], "forbidden": [], "passed": 0, "failed": 0}
-
-    for rule in rules.get("required", []):
-        matched = any(re.search(rule["pattern"], line) for line in lines)
-        findings["required"].append({
-            "description": rule["description"],
-            "pattern": rule["pattern"],
-            "status": "PASS" if matched else "FAIL",
-        })
-        findings["passed" if matched else "failed"] += 1
-
-    for rule in rules.get("forbidden", []):
-        hits = [line.strip() for line in lines if re.search(rule["pattern"], line)]
-        findings["forbidden"].append({
-            "description": rule["description"],
-            "pattern": rule["pattern"],
-            "status": "FAIL" if hits else "PASS",
-            "matches": hits,
-        })
-        findings["passed" if not hits else "failed"] += 1
-
-    total = findings["passed"] + findings["failed"]
-    findings["score"] = round(findings["passed"] / total * 100, 1) if total else 0.0
-    findings["total"] = total
-    return findings
-
-
-def render_report(host, findings, timestamp):
-    score = findings["score"]
-    verdict = "COMPLIANT" if findings["failed"] == 0 else "NON-COMPLIANT"
-    lines = [
-        "Config Compliance Report",
-        "=" * 40,
-        f"Host      : {host}",
-        f"Timestamp : {timestamp}",
-        f"Score     : {score}% ({findings['passed']}/{findings['total']} checks passed)",
-        f"Verdict   : {verdict}",
-        "",
-        "Required Controls",
-        "-" * 40,
-    ]
-    for item in findings["required"]:
-        tag = "PASS" if item["status"] == "PASS" else "FAIL"
-        lines.append(f"  [{tag}] {item['description']}")
-        if item["status"] == "FAIL":
-            lines.append(f"         missing: {item['pattern']}")
-
-    lines += ["", "Forbidden Controls", "-" * 40]
-    for item in findings["forbidden"]:
-        tag = "PASS" if item["status"] == "PASS" else "FAIL"
-        lines.append(f"  [{tag}] {item['description']}")
-        for match in item.get("matches", []):
-            lines.append(f"         found: {match}")
-
-    return "\n".join(lines)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Audit device config against compliance rules")
-    parser.add_argument("-H", "--host", required=True, help="Device IP or hostname")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", help="SSH password")
-    parser.add_argument("-k", "--key-file", dest="key_file", help="SSH private key path")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("-r", "--rules", help="JSON rules file (built-in defaults if omitted)")
-    parser.add_argument("-o", "--output", help="Write report to this file instead of stdout")
-    parser.add_argument(
-        "--strict", action="store_true", help="Exit 1 if device is non-compliant"
+    client.connect(
+        hostname=host,
+        port=port,
+        username=username,
+        password=password,
+        timeout=timeout,
+        look_for_keys=False,
+        allow_agent=False,
     )
-    args = parser.parse_args()
+    return client
 
-    if not args.password and not args.key_file:
-        import getpass
-        args.password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
 
-    rules = load_rules(args.rules) if args.rules else DEFAULT_RULES
+def get_running_config(client):
+    chan = client.invoke_shell()
+    chan.settimeout(30)
+    time.sleep(1)
+    chan.recv(65535)
 
-    try:
-        config = fetch_running_config(
-            host=args.host,
-            username=args.username,
-            password=args.password,
-            key_file=args.key_file,
-            port=args.port,
-        )
-    except paramiko.AuthenticationException:
-        logger.error("Authentication failed for %s@%s", args.username, args.host)
-        sys.exit(1)
-    except (paramiko.SSHException, OSError) as exc:
-        logger.error("Connection failed: %s", exc)
-        sys.exit(1)
+    for cmd in ("terminal length 0\n", "show running-config\n"):
+        chan.send(cmd)
+        time.sleep(0.5 if "terminal" in cmd else 4)
+        if "terminal" in cmd:
+            chan.recv(65535)
 
-    findings = audit_config(config, rules)
-    report = render_report(args.host, findings, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    output = b""
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if chan.recv_ready():
+            chunk = chan.recv(65535)
+            output += chunk
+            if b"end" in chunk.lower().splitlines()[-3:]:
+                break
+        else:
+            time.sleep(0.3)
 
-    if args.output:
-        with open(args.output, "w") as f:
-            f.write(report + "\n")
-        logger.info("Report written to %s", args.output)
-    else:
-        print(report)
+    chan.close()
+    return output.decode("utf-8", errors="replace")
 
-    if args.strict and findings["failed"] > 0:
-        sys.exit(1)
+
+def audit_config(config_text, required_patterns, forbidden_patterns):
+    text_lower = config_text.lower()
+    results = []
+
+    for pattern in required_patterns:
+        found = pattern.lower() in text_lower
+        results.append({
+            "rule_type": "required",
+            "pattern": pattern,
+            "passed": found,
+            "detail": "FOUND" if found else "MISSING",
+        })
+
+    for pattern in forbidden_patterns:
+        found = pattern.lower() in text_lower
+        results.append({
+            "rule_type": "forbidden",
+            "pattern": pattern,
+            "passed": not found,
+            "detail": "ABSENT" if not found else "FOUND — violation",
+        })
+
+    return results
+
+
+def print_report(host, results):
+    passed = sum(1 for r in results if r["passed"])
+    total = len(results)
+    width = 60
+    print(f"\n{'=' * width}")
+    print(f"Audit report: {host}   ({passed}/{total} rules passed)")
+    print(f"{'=' * width}")
+    for r in results:
+        status = "PASS" if r["passed"] else "FAIL"
+        tag = "REQ" if r["rule_type"] == "required" else "FBD"
+        print(f"  [{status}][{tag}] {r['pattern']!r:<40} {r['detail']}")
+    print()
+    return passed == total
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Audit running config against required/forbidden pattern rules."
+    )
+    p.add_argument("--host", required=True, help="Device IP or hostname")
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("--user", required=True, help="SSH username")
+    p.add_argument("--password", required=True, help="SSH password")
+    p.add_argument("--timeout", type=int, default=30, help="SSH connect timeout (s)")
+    p.add_argument(
+        "--require",
+        metavar="PATTERN",
+        action="append",
+        default=[],
+        help="Pattern that must appear in config (repeatable)",
+    )
+    p.add_argument(
+        "--forbid",
+        metavar="PATTERN",
+        action="append",
+        default=[],
+        help="Pattern that must not appear in config (repeatable)",
+    )
+    p.add_argument(
+        "--rules",
+        metavar="FILE",
+        help='JSON file: {"required": [...], "forbidden": [...]}',
+    )
+    p.add_argument(
+        "--save-config",
+        metavar="FILE",
+        help="Write retrieved running config to FILE",
+    )
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+
+    required = list(args.require)
+    forbidden = list(args.forbid)
+
+    if args.rules:
+        try:
+            with open(args.rules) as fh:
+                rule_data = json.load(fh)
+            required += rule_data.get("required", [])
+            forbidden += rule_data.get("forbidden", [])
+        except (OSError, json.JSONDecodeError) as exc:
+            log.error("Failed to load rules file: %s", exc)
+            sys.exit(1)
+
+    if not required and not forbidden:
+        log.error("No rules provided. Use --require, --forbid, or --rules.")
+        sys.exit(1)
+
+    log.info("Connecting to %s:%d as %s", args.host, args.port, args.user)
+    try:
+        client = ssh_connect(args.host, args.port, args.user, args.password, args.timeout)
+    except paramiko.AuthenticationException:
+        log.error("Authentication failed for %s@%s", args.user, args.host)
+        sys.exit(1)
+    except (paramiko.SSHException, OSError) as exc:
+        log.error("Connection error: %s", exc)
+        sys.exit(1)
+
+    try:
+        log.info("Retrieving running configuration")
+        config_text = get_running_config(client)
+    except Exception as exc:
+        log.error("Failed to retrieve config: %s", exc)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    if args.save_config:
+        try:
+            with open(args.save_config, "w") as fh:
+                fh.write(config_text)
+            log.info("Config saved to %s", args.save_config)
+        except OSError as exc:
+            log.warning("Could not save config: %s", exc)
+
+    results = audit_config(config_text, required, forbidden)
+    all_passed = print_report(args.host, results)
+    sys.exit(0 if all_passed else 1)
 ```
