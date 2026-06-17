@@ -1,221 +1,201 @@
 ```python
 """
-ssh_key_rotator.py - SSH key rotation manager for network devices
+ssh_key_deployer.py - Deploy and audit SSH public keys on network devices.
 
 Purpose:
-    Automates RSA key pair rotation across network devices. Generates new key pairs,
-    deploys public keys via password-authenticated Paramiko SSH, verifies key auth
-    succeeds, and tracks rotation history with staleness auditing.
+    Push authorized SSH public keys to network devices, optionally rotating
+    out an old key fingerprint. Also supports audit mode to report what keys
+    are currently installed without making changes.
 
 Usage:
-    # Rotate keys on a single device
-    python ssh_key_rotator.py rotate --host 192.168.1.1 --user admin --password secret
+    # Deploy a key to a single device
+    python ssh_key_deployer.py -d 192.168.1.1 -u admin -p secret \
+        --pubkey ~/.ssh/id_ed25519.pub
 
-    # Rotate all hosts listed in a file
-    python ssh_key_rotator.py rotate --host-file hosts.txt --user admin --password secret
+    # Audit keys on multiple devices from a file
+    python ssh_key_deployer.py --hosts hosts.txt -u admin -p secret --audit
 
-    # Audit key age across all tracked devices
-    python ssh_key_rotator.py audit --max-age 90
+    # Rotate: add new key and remove old key by fingerprint
+    python ssh_key_deployer.py -d 192.168.1.1 -u admin -p secret \
+        --pubkey ~/.ssh/id_ed25519.pub --remove-fingerprint "SHA256:abc123..."
 
 Prerequisites:
     pip install paramiko
-    Write access to key store directory (default: ~/.ssh/net_keys/)
-    Devices must support authorized_keys-based SSH key injection
+    Target devices must permit password SSH login initially (to deploy the key).
+    The deploying user must have write access to ~/.ssh/authorized_keys on target.
 """
 
 import argparse
-import json
+import hashlib
 import logging
-import os
+import socket
 import sys
-from datetime import datetime, timedelta
+import base64
 from pathlib import Path
 
 import paramiko
 
-KEY_STORE = Path.home() / ".ssh" / "net_keys"
-ROTATION_LOG = KEY_STORE / "rotation_log.json"
-KEY_BITS = 2048
-
-logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
 log = logging.getLogger(__name__)
 
 
-def _ensure_store():
-    KEY_STORE.mkdir(parents=True, exist_ok=True)
-    if not ROTATION_LOG.exists() or ROTATION_LOG.stat().st_size == 0:
-        ROTATION_LOG.write_text("{}")
-
-
-def _load_log():
-    _ensure_store()
-    return json.loads(ROTATION_LOG.read_text())
-
-
-def _save_log(data):
-    ROTATION_LOG.write_text(json.dumps(data, indent=2))
-
-
-def generate_key_pair(host):
-    key = paramiko.RSAKey.generate(KEY_BITS)
-    private_path = KEY_STORE / f"{host}.pem"
-    public_path = KEY_STORE / f"{host}.pub"
-
-    key.write_private_key_file(str(private_path))
-    os.chmod(private_path, 0o600)
-
-    pub_key_str = f"ssh-rsa {key.get_base64()} net_rotation@{host}"
-    public_path.write_text(pub_key_str + "\n")
-
-    log.info("Generated %d-bit RSA key pair for %s", KEY_BITS, host)
-    return str(private_path), pub_key_str
-
-
-def deploy_public_key(host, port, username, password, pub_key):
+def _ssh_client(host: str, username: str, password: str, port: int = 22) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(host, port=port, username=username, password=password, timeout=10)
+    return client
+
+
+def _run(client: paramiko.SSHClient, cmd: str) -> tuple[str, str, int]:
+    _, stdout, stderr = client.exec_command(cmd)
+    exit_code = stdout.channel.recv_exit_status()
+    return stdout.read().decode().strip(), stderr.read().decode().strip(), exit_code
+
+
+def _pubkey_fingerprint(pubkey_line: str) -> str:
+    """Return SHA256 fingerprint matching ssh-keygen -lf output."""
+    parts = pubkey_line.strip().split()
+    if len(parts) < 2:
+        return ""
+    raw = base64.b64decode(parts[1])
+    digest = hashlib.sha256(raw).digest()
+    return "SHA256:" + base64.b64encode(digest).rstrip(b"=").decode()
+
+
+def audit_keys(host: str, username: str, password: str, port: int = 22) -> list[dict]:
+    """Return list of dicts describing each authorized key on the device."""
+    results = []
     try:
-        client.connect(host, port=port, username=username, password=password, timeout=15)
-        commands = [
-            "mkdir -p ~/.ssh && chmod 700 ~/.ssh",
-            f'echo "{pub_key}" >> ~/.ssh/authorized_keys',
-            "chmod 600 ~/.ssh/authorized_keys",
-        ]
-        for cmd in commands:
-            _, stdout, stderr = client.exec_command(cmd)
-            exit_code = stdout.channel.recv_exit_status()
-            if exit_code != 0:
-                log.error("Command failed on %s (exit %d): %s", host, exit_code,
-                          stderr.read().decode().strip())
+        client = _ssh_client(host, username, password, port)
+        out, err, rc = _run(client, "cat ~/.ssh/authorized_keys 2>/dev/null")
+        client.close()
+        if rc != 0 or not out:
+            log.warning("%s: no authorized_keys found or read error", host)
+            return results
+        for line in out.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            results.append({
+                "host": host,
+                "type": parts[0] if parts else "",
+                "comment": parts[2] if len(parts) > 2 else "",
+                "fingerprint": _pubkey_fingerprint(line),
+            })
+    except (paramiko.AuthenticationException, paramiko.SSHException, socket.error) as exc:
+        log.error("%s: connection failed — %s", host, exc)
+    return results
+
+
+def deploy_key(
+    host: str,
+    username: str,
+    password: str,
+    pubkey_text: str,
+    remove_fingerprint: str | None,
+    port: int = 22,
+) -> bool:
+    """Add pubkey_text to authorized_keys; optionally remove a key by fingerprint."""
+    try:
+        client = _ssh_client(host, username, password, port)
+
+        _run(client, "mkdir -p ~/.ssh && chmod 700 ~/.ssh")
+        _run(client, "touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys")
+
+        out, _, _ = _run(client, "cat ~/.ssh/authorized_keys")
+        fingerprint_new = _pubkey_fingerprint(pubkey_text)
+        existing_prints = {_pubkey_fingerprint(ln) for ln in out.splitlines() if ln.strip()}
+
+        if fingerprint_new in existing_prints:
+            log.info("%s: key already present (%s), skipping add", host, fingerprint_new[:20])
+        else:
+            safe = pubkey_text.replace("'", "'\\''")
+            _, err, rc = _run(client, f"echo '{safe}' >> ~/.ssh/authorized_keys")
+            if rc != 0:
+                log.error("%s: failed to append key — %s", host, err)
+                client.close()
                 return False
-        log.info("Deployed public key to %s@%s", username, host)
-        return True
-    except paramiko.AuthenticationException:
-        log.error("Authentication failed for %s@%s", username, host)
-        return False
-    except (paramiko.SSHException, OSError) as exc:
-        log.error("Connection error for %s: %s", host, exc)
-        return False
-    finally:
+            log.info("%s: deployed key %s", host, fingerprint_new[:20])
+
+        if remove_fingerprint:
+            lines_before = out.splitlines()
+            lines_after = [
+                ln for ln in lines_before
+                if _pubkey_fingerprint(ln) != remove_fingerprint
+            ]
+            if len(lines_after) < len(lines_before):
+                new_content = "\n".join(lines_after) + ("\n" if lines_after else "")
+                safe_content = new_content.replace("'", "'\\''")
+                _run(client, f"printf '%s' '{safe_content}' > ~/.ssh/authorized_keys")
+                log.info("%s: removed key %s", host, remove_fingerprint[:20])
+            else:
+                log.warning("%s: fingerprint %s not found, nothing removed", host, remove_fingerprint[:20])
+
         client.close()
-
-
-def verify_key_auth(host, port, username, private_key_path):
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        pkey = paramiko.RSAKey.from_private_key_file(private_key_path)
-        client.connect(host, port=port, username=username, pkey=pkey, timeout=10)
-        client.exec_command("echo ok")
-        log.info("Key auth verified for %s@%s", username, host)
         return True
-    except paramiko.AuthenticationException:
-        log.warning("Key auth verification FAILED for %s@%s", username, host)
+    except (paramiko.AuthenticationException, paramiko.SSHException, socket.error) as exc:
+        log.error("%s: %s", host, exc)
         return False
-    except (paramiko.SSHException, OSError) as exc:
-        log.warning("Verification connect error for %s: %s", host, exc)
-        return False
-    finally:
-        client.close()
-
-
-def rotate_host(host, port, username, password):
-    private_path, pub_key = generate_key_pair(host)
-    if not deploy_public_key(host, port, username, password, pub_key):
-        return False
-
-    verified = verify_key_auth(host, port, username, private_path)
-    data = _load_log()
-    data[host] = {
-        "host": host,
-        "username": username,
-        "private_key": private_path,
-        "rotated_at": datetime.utcnow().isoformat(),
-        "verified": verified,
-    }
-    _save_log(data)
-
-    if verified:
-        log.info("Rotation complete for %s — key auth confirmed", host)
-    else:
-        log.warning("Rotation complete for %s — key auth unverified (password still active)", host)
-    return True
-
-
-def audit_keys(max_age_days):
-    data = _load_log()
-    if not data:
-        print("No rotation records found.")
-        return
-
-    cutoff = datetime.utcnow() - timedelta(days=max_age_days)
-    rows = []
-    for record in data.values():
-        rotated = datetime.fromisoformat(record["rotated_at"])
-        age = (datetime.utcnow() - rotated).days
-        rows.append({**record, "age_days": age, "stale": rotated < cutoff})
-
-    rows.sort(key=lambda r: r["age_days"], reverse=True)
-    print(f"\n{'Host':<22} {'User':<15} {'Age':>8}  {'Verified':<9} Status")
-    print("-" * 65)
-    for r in rows:
-        status = "STALE" if r["stale"] else "OK"
-        verified = "yes" if r.get("verified") else "no"
-        print(f"{r['host']:<22} {r['username']:<15} {r['age_days']:>7}d  {verified:<9} {status}")
-
-    stale_count = sum(1 for r in rows if r["stale"])
-    print(f"\nTotal: {len(rows)}  |  Stale (>{max_age_days}d): {stale_count}  |  Current: {len(rows) - stale_count}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SSH key rotation manager for network devices")
-    parser.add_argument("action", choices=["rotate", "audit"])
-    parser.add_argument("--host", help="Target device hostname or IP")
-    parser.add_argument("--host-file", help="File with one host per line")
+    parser = argparse.ArgumentParser(
+        description="Deploy or audit SSH public keys on network devices via paramiko."
+    )
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("-d", "--device", help="Single device IP or hostname")
+    target.add_argument("--hosts", help="File with one host per line")
+
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", required=True)
     parser.add_argument("--port", type=int, default=22)
-    parser.add_argument("--user", help="SSH username")
-    parser.add_argument("--password", help="Current password for key deployment")
-    parser.add_argument("--max-age", type=int, default=90,
-                        help="Staleness threshold in days (audit mode, default: 90)")
-    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--pubkey", help="Path to public key file to deploy")
+    parser.add_argument("--remove-fingerprint", metavar="FP",
+                        help="SHA256 fingerprint of key to remove during rotation")
+    parser.add_argument("--audit", action="store_true",
+                        help="Audit mode: list installed keys without making changes")
+
     args = parser.parse_args()
 
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+    if not args.audit and not args.pubkey:
+        parser.error("--pubkey is required unless --audit is specified")
 
-    if args.action == "audit":
-        audit_keys(args.max_age)
-        return
+    hosts = [args.device] if args.device else Path(args.hosts).read_text().splitlines()
+    hosts = [h.strip() for h in hosts if h.strip() and not h.startswith("#")]
 
-    if not args.user or not args.password:
-        parser.error("--user and --password are required for rotate")
+    pubkey_text = ""
+    if args.pubkey:
+        pubkey_text = Path(args.pubkey).read_text().strip()
 
-    hosts = []
-    if args.host:
-        hosts.append(args.host)
-    if args.host_file:
-        try:
-            hosts.extend(
-                line.strip()
-                for line in Path(args.host_file).read_text().splitlines()
-                if line.strip() and not line.startswith("#")
-            )
-        except OSError as exc:
-            log.error("Cannot read host file: %s", exc)
-            sys.exit(1)
+    success = failed = 0
 
-    if not hosts:
-        parser.error("Provide --host or --host-file for rotate")
-
-    succeeded, failed = [], []
     for host in hosts:
-        log.info("--- Rotating %s ---", host)
-        (succeeded if rotate_host(host, args.port, args.user, args.password) else failed).append(host)
+        if args.audit:
+            keys = audit_keys(host, args.username, args.password, args.port)
+            if keys:
+                for k in keys:
+                    print(f"{host}  {k['type']}  {k['fingerprint']}  {k['comment']}")
+            else:
+                print(f"{host}  (no keys or unreachable)")
+        else:
+            ok = deploy_key(
+                host, args.username, args.password,
+                pubkey_text, args.remove_fingerprint, args.port,
+            )
+            if ok:
+                success += 1
+            else:
+                failed += 1
 
-    print(f"\nRotation summary: {len(succeeded)} succeeded, {len(failed)} failed")
-    if failed:
-        print("Failed:", ", ".join(failed))
-        sys.exit(1)
+    if not args.audit:
+        log.info("Done — %d succeeded, %d failed", success, failed)
+        if failed:
+            sys.exit(1)
 
 
 if __name__ == "__main__":
