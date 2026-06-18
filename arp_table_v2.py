@@ -1,251 +1,221 @@
-ARP Cross-Device Correlation and Anomaly Detector
+```python
+"""
+ARP Table Collector with MAC Vendor Resolution
 
-Collects ARP tables from multiple network devices and correlates entries
-across the fleet to surface duplicate IPs (potential conflicts or ARP spoofing),
-MAC addresses roaming across subnets, and per-vendor fleet breakdowns.
+Purpose:
+    SSH into a network device, retrieve the ARP table, normalize MAC addresses,
+    optionally resolve OUI prefixes to vendor names via the macvendors.com API,
+    and flag duplicate IPs (potential ARP spoofing or misconfig).
 
 Usage:
-    python arp_table_v3.py -d 10.0.0.1 10.0.0.2 -u admin -p secret
-    python arp_table_v3.py -d 10.0.0.1 -u admin --key ~/.ssh/id_rsa --oui
-    python arp_table_v3.py -d 10.0.0.1 10.0.0.2 -u admin -p secret --anomalies-only
+    python arp_table_v3.py -d 192.168.1.1 -u admin
+    python arp_table_v3.py -d 192.168.1.1 -u admin -p secret --vendor-lookup
+    python arp_table_v3.py -d 192.168.1.1 -u admin --key ~/.ssh/id_rsa --output arp.json
+    python arp_table_v3.py -d 192.168.1.1 -u admin --command "show ip arp vrf MGMT"
 
 Prerequisites:
     pip install paramiko
-    Devices must support 'show arp' (Cisco IOS/IOS-XE/NX-OS).
+    pip install requests   # optional, required for --vendor-lookup
 """
 
 import argparse
-import getpass
-import ipaddress
+import json
 import logging
 import re
 import sys
-from collections import defaultdict
-from typing import Optional
+from getpass import getpass
 
 import paramiko
 
+try:
+    import requests as _requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+
 logging.basicConfig(
-    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-ARP_RE = re.compile(
-    r"(?:Internet|ARPA)\s+"
-    r"(\d{1,3}(?:\.\d{1,3}){3})\s+"
-    r"\d+\s+"
-    r"([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}|[0-9a-fA-F:]{17}|-)\s+"
-    r"\S+\s+"
-    r"(\S+)"
+# Matches Cisco IOS dotted-quad MAC (aabb.ccdd.eeff) and standard colon/dash forms
+_ARP_RE = re.compile(
+    r"(?P<ip>\d{1,3}(?:\.\d{1,3}){3})"
+    r"\s+(?P<age>\d+|-+)\s+"
+    r"(?P<mac>"
+    r"[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}"  # IOS dotted
+    r"|[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}"             # colon
+    r"|[0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5}"             # dash
+    r")"
+    r"\s+(?P<iface>\S+)"
 )
 
-OUI_CACHE: dict = {}
 
-
-def normalize_mac(mac: str) -> str:
-    digits = re.sub(r"[^0-9a-fA-F]", "", mac)
+def normalize_mac(raw: str) -> str:
+    digits = re.sub(r"[^0-9a-fA-F]", "", raw)
     if len(digits) != 12:
-        return mac.lower()
-    return ":".join(digits[i : i + 2] for i in range(0, 12, 2)).lower()
+        return raw.upper()
+    return ":".join(digits[i:i + 2].upper() for i in range(0, 12, 2))
 
 
-def oui_vendor(mac: str) -> str:
-    oui = normalize_mac(mac).replace(":", "")[:6].upper()
-    if oui in OUI_CACHE:
-        return OUI_CACHE[oui]
+def vendor_for_mac(mac: str) -> str:
+    if not HAS_REQUESTS:
+        return ""
     try:
-        import urllib.request
-
-        url = f"https://api.macvendors.com/{oui}"
-        with urllib.request.urlopen(url, timeout=3) as resp:
-            vendor = resp.read().decode().strip()
-    except Exception:
-        vendor = "Unknown"
-    OUI_CACHE[oui] = vendor
-    return vendor
+        resp = _requests.get(
+            f"https://api.macvendors.com/{mac}", timeout=3
+        )
+        return resp.text.strip() if resp.status_code == 200 else ""
+    except _requests.RequestException:
+        return ""
 
 
-def run_command(client: paramiko.SSHClient, cmd: str, timeout: int = 30) -> str:
+def parse_arp(raw: str) -> list:
+    entries = []
+    for line in raw.splitlines():
+        m = _ARP_RE.search(line)
+        if m:
+            entries.append({
+                "ip": m.group("ip"),
+                "mac": normalize_mac(m.group("mac")),
+                "age": m.group("age"),
+                "interface": m.group("iface"),
+                "vendor": "",
+            })
+    return entries
+
+
+def find_duplicate_ips(entries: list) -> dict:
+    seen: dict = {}
+    for e in entries:
+        seen.setdefault(e["ip"], set()).add(e["mac"])
+    return {ip: sorted(macs) for ip, macs in seen.items() if len(macs) > 1}
+
+
+def ssh_command(client: paramiko.SSHClient, cmd: str, timeout: int) -> str:
     _, stdout, stderr = client.exec_command(cmd, timeout=timeout)
     out = stdout.read().decode(errors="replace")
     err = stderr.read().decode(errors="replace").strip()
     if err:
-        log.debug("stderr from device: %s", err)
+        log.debug("stderr: %s", err)
     return out
 
 
-def connect(
-    host: str,
-    username: str,
-    password: Optional[str],
-    key_path: Optional[str],
-    port: int,
-    timeout: int,
-) -> paramiko.SSHClient:
+def collect(args: argparse.Namespace) -> list:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    connect_kwargs = dict(
-        hostname=host,
-        port=port,
-        username=username,
-        timeout=timeout,
-        look_for_keys=key_path is None,
-        allow_agent=True,
-    )
-    if key_path:
-        connect_kwargs["key_filename"] = key_path
-    elif password:
-        connect_kwargs["password"] = password
-        connect_kwargs["look_for_keys"] = False
-        connect_kwargs["allow_agent"] = False
-    client.connect(**connect_kwargs)
-    return client
 
+    kwargs = {
+        "hostname": args.device,
+        "port": args.port,
+        "username": args.username,
+        "timeout": args.timeout,
+    }
+    if args.key:
+        kwargs["key_filename"] = args.key
+    else:
+        kwargs["password"] = args.password
 
-def fetch_arp(
-    host: str,
-    username: str,
-    password: Optional[str],
-    key_path: Optional[str],
-    port: int,
-    timeout: int,
-) -> list:
-    entries = []
+    log.info("Connecting to %s:%d as %s", args.device, args.port, args.username)
     try:
-        client = connect(host, username, password, key_path, port, timeout)
-    except Exception as exc:
-        log.error("Cannot connect to %s: %s", host, exc)
-        return entries
+        client.connect(**kwargs)
+    except paramiko.AuthenticationException:
+        log.error("Authentication failed")
+        sys.exit(1)
+    except (paramiko.SSHException, OSError) as exc:
+        log.error("Connection error: %s", exc)
+        sys.exit(1)
 
     try:
-        output = run_command(client, "show arp")
-        for line in output.splitlines():
-            m = ARP_RE.search(line)
-            if not m:
-                continue
-            ip, mac, iface = m.group(1), m.group(2), m.group(3)
-            if mac == "-":
-                continue
-            entries.append(
-                {
-                    "device": host,
-                    "ip": ip,
-                    "mac": normalize_mac(mac),
-                    "interface": iface,
-                }
-            )
-    except Exception as exc:
-        log.error("Error collecting ARP from %s: %s", host, exc)
+        raw = ssh_command(client, args.command, args.timeout)
     finally:
         client.close()
 
-    log.info("Collected %d ARP entries from %s", len(entries), host)
+    entries = parse_arp(raw)
+    log.info("Parsed %d ARP entries", len(entries))
+
+    if args.vendor_lookup:
+        if not HAS_REQUESTS:
+            log.warning("--vendor-lookup requires 'requests'; skipping")
+        else:
+            log.info("Resolving OUI vendors...")
+            oui_cache: dict = {}
+            for entry in entries:
+                oui = entry["mac"].replace(":", "")[:6]
+                if oui not in oui_cache:
+                    oui_cache[oui] = vendor_for_mac(entry["mac"])
+                entry["vendor"] = oui_cache[oui]
+
     return entries
 
 
-def detect_anomalies(all_entries: list) -> tuple:
-    ip_to_macs = defaultdict(list)
-    mac_to_ips = defaultdict(list)
-
-    for e in all_entries:
-        ip_to_macs[e["ip"]].append(e)
-        mac_to_ips[e["mac"]].append(e)
-
-    dup_ips = {
-        ip: entries
-        for ip, entries in ip_to_macs.items()
-        if len(set(x["mac"] for x in entries)) > 1
-    }
-    roaming_macs = {
-        mac: entries
-        for mac, entries in mac_to_ips.items()
-        if len(set(x["ip"] for x in entries)) > 1
-    }
-    return dup_ips, roaming_macs
-
-
-def print_table(entries: list, oui: bool) -> None:
-    col = "{:<18} {:<20} {:<20} {:<16} {}"
-    header = col.format("Device", "IP Address", "MAC Address", "Interface", "Vendor" if oui else "")
-    print(header)
-    print("-" * max(len(header), 60))
-    for e in sorted(entries, key=lambda x: (x["device"], ipaddress.ip_address(x["ip"]))):
-        vendor = oui_vendor(e["mac"]) if oui else ""
-        print(col.format(e["device"], e["ip"], e["mac"], e["interface"], vendor))
-
-
-def print_anomalies(dup_ips: dict, roaming_macs: dict) -> None:
-    if dup_ips:
-        print("\n[!] Duplicate IP addresses (same IP -> multiple MACs):")
-        for ip, entries in sorted(dup_ips.items()):
-            macs = ", ".join(set(e["mac"] for e in entries))
-            devices = ", ".join(set(e["device"] for e in entries))
-            print(f"    {ip}  MACs={macs}  seen_on={devices}")
-    else:
-        print("\n[+] No duplicate IP addresses detected.")
-
-    if roaming_macs:
-        print("\n[!] Roaming MACs (same MAC -> multiple IPs):")
-        for mac, entries in sorted(roaming_macs.items()):
-            ips = ", ".join(sorted(set(e["ip"] for e in entries)))
-            devices = ", ".join(set(e["device"] for e in entries))
-            print(f"    {mac}  IPs={ips}  seen_on={devices}")
-    else:
-        print("\n[+] No roaming MACs detected.")
+def print_table(entries: list, dupes: dict) -> None:
+    col = {"ip": 18, "mac": 20, "age": 5, "iface": 20}
+    hdr = (f"{'IP Address':<{col['ip']}} {'MAC Address':<{col['mac']}} "
+           f"{'Age':>{col['age']}}  {'Interface':<{col['iface']}} Vendor")
+    print(hdr)
+    print("-" * len(hdr))
+    for e in entries:
+        flag = " *** DUPLICATE IP ***" if e["ip"] in dupes else ""
+        print(
+            f"{e['ip']:<{col['ip']}} {e['mac']:<{col['mac']}} "
+            f"{e['age']:>{col['age']}}  {e['interface']:<{col['iface']}} "
+            f"{e['vendor']}{flag}"
+        )
+    if dupes:
+        print(f"\n[!] {len(dupes)} duplicate IP address(es) detected:")
+        for ip, macs in dupes.items():
+            print(f"    {ip} -> {', '.join(macs)}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Collect and cross-correlate ARP tables across multiple devices."
+        description="ARP table collector with MAC vendor resolution and duplicate detection"
     )
-    parser.add_argument("-d", "--devices", nargs="+", required=True, metavar="HOST")
-    parser.add_argument("-u", "--username", required=True)
-    parser.add_argument("-p", "--password", default=None)
-    parser.add_argument("--key", dest="key_path", default=None, metavar="PATH")
-    parser.add_argument("--port", type=int, default=22)
-    parser.add_argument("--timeout", type=int, default=30)
-    parser.add_argument("--oui", action="store_true", help="Resolve MAC OUI vendor names via API")
+    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", default=None, help="SSH password")
+    parser.add_argument("-k", "--key", default=None, help="SSH private key path")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default 22)")
+    parser.add_argument("--timeout", type=int, default=15, help="SSH timeout seconds")
     parser.add_argument(
-        "--anomalies-only",
-        action="store_true",
-        help="Print only anomaly report, skip full table",
+        "--command", default="show ip arp",
+        help="ARP command to run (default: 'show ip arp')"
     )
-    parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--vendor-lookup", action="store_true",
+        help="Resolve MAC OUI to vendor name via macvendors.com"
+    )
+    parser.add_argument(
+        "--output", metavar="FILE",
+        help="Write results to JSON file"
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     args = parser.parse_args()
 
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+    log.setLevel(logging.DEBUG if args.verbose else logging.INFO)
 
-    password = args.password
-    if not password and not args.key_path:
-        password = getpass.getpass(f"Password for {args.username}: ")
+    if not args.key and args.password is None:
+        args.password = getpass(f"Password for {args.username}@{args.device}: ")
 
-    all_entries = []
-    for host in args.devices:
-        entries = fetch_arp(
-            host, args.username, password, args.key_path, args.port, args.timeout
-        )
-        all_entries.extend(entries)
+    entries = collect(args)
+    dupes = find_duplicate_ips(entries)
+    print_table(entries, dupes)
 
-    if not all_entries:
-        log.error("No ARP entries collected from any device.")
-        sys.exit(1)
-
-    if not args.anomalies_only:
-        print(
-            f"\nConsolidated ARP Table "
-            f"({len(all_entries)} entries across {len(args.devices)} device(s)):\n"
-        )
-        print_table(all_entries, args.oui)
-
-    dup_ips, roaming_macs = detect_anomalies(all_entries)
-    print_anomalies(dup_ips, roaming_macs)
-
-    if dup_ips or roaming_macs:
-        sys.exit(2)
+    if args.output:
+        payload = {
+            "device": args.device,
+            "command": args.command,
+            "entry_count": len(entries),
+            "duplicate_ips": dupes,
+            "entries": entries,
+        }
+        with open(args.output, "w") as fh:
+            json.dump(payload, fh, indent=2)
+        log.info("Results saved to %s", args.output)
 
 
 if __name__ == "__main__":
     main()
+```
