@@ -1,227 +1,237 @@
+Here's the script — `bgp_neighbor_monitor.py`. It's distinct from `routing_table.py`/`routing_table_v2.py` (which dump the FIB) by focusing on BGP control-plane peer state: neighbor IP, remote AS, session state (Established/Idle/Active/etc.), uptime, and received prefix count.
+
 ```python
 """
-vrf_routing_table.py - Multi-VRF Routing Table Collector
+BGP Neighbor State Monitor
 
-Connects to a Cisco IOS/IOS-XE device via SSH and retrieves the IP routing
-table for one or more VRFs, outputting structured data as a human-readable
-table, JSON, or CSV.
+Purpose:
+    Connect to a Cisco IOS/IOS-XE router via SSH and retrieve BGP neighbor
+    summary data. Parses peer state, uptime, and received prefix counts.
+    Useful for health checks, alerting on non-Established peers, and
+    exporting peer state snapshots to JSON for comparison over time.
 
 Usage:
-    python vrf_routing_table.py -H 192.168.1.1 -u admin -p secret
-    python vrf_routing_table.py -H 192.168.1.1 -u admin --key ~/.ssh/id_rsa \
-        --vrf MGMT --vrf PROD --format json -o routes.json
-    python vrf_routing_table.py -H 192.168.1.1 -u admin -p secret --all-vrfs
+    python bgp_neighbor_monitor.py -d 192.168.1.1 -u admin -p secret
+    python bgp_neighbor_monitor.py -d 10.0.0.1 -u admin --key ~/.ssh/id_rsa
+    python bgp_neighbor_monitor.py -d 10.0.0.1 -u admin -p secret --vrf MGMT --filter-state
+    python bgp_neighbor_monitor.py -d 10.0.0.1 -u admin -p secret --json peers.json
 
 Prerequisites:
     pip install paramiko
-    SSH must be enabled on the device; user needs at minimum privilege level 1.
-    Tested against IOS 15.x and IOS-XE 16.x/17.x.
+    SSH enabled on target device; BGP configured.
 """
 
 import argparse
-import csv
-import getpass
 import json
 import logging
 import re
 import sys
+import time
+from getpass import getpass
 
 import paramiko
 
-LOG = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+COMMAND_DELAY = 1.5
+RECV_TIMEOUT = 15
 
 
-def ssh_exec(client: paramiko.SSHClient, command: str, timeout: int = 30) -> str:
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    output = stdout.read().decode("utf-8", errors="replace")
-    err = stderr.read().decode("utf-8", errors="replace").strip()
-    if err:
-        LOG.debug("stderr for %r: %s", command, err)
+def ssh_connect(host, port, username, password=None, key_path=None, timeout=10):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    kwargs = {
+        "hostname": host,
+        "port": port,
+        "username": username,
+        "timeout": timeout,
+        "look_for_keys": bool(key_path),
+        "allow_agent": False,
+    }
+    if key_path:
+        kwargs["key_filename"] = key_path
+    elif password:
+        kwargs["password"] = password
+    client.connect(**kwargs)
+    return client
+
+
+def run_command(shell, command, timeout=RECV_TIMEOUT):
+    shell.send(command + "\n")
+    time.sleep(COMMAND_DELAY)
+    output = ""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if shell.recv_ready():
+            output += shell.recv(65535).decode("utf-8", errors="replace")
+            if re.search(r"[#>]\s*$", output.rstrip()):
+                break
+        time.sleep(0.1)
     return output
 
 
-def parse_routing_table(raw: str, vrf: str = "default") -> list[dict]:
-    routes = []
-    last_prefix = None
-    last_code = None
-
-    for line in raw.splitlines():
-        # Primary route line: protocol code + prefix + "is directly connected" or "[AD/metric] via"
-        m = re.match(
-            r"^([A-Z][A-Z* ]{0,5})\s+([\d.]+/\d+)\s+"
-            r"(?:is directly connected,\s*(\S+)"
-            r"|\[\d+/\d+\]\s+via\s+([\d.]+)(?:,\s*\S+)?,\s*(\S+))",
-            line,
-        )
-        if m:
-            code, prefix, iface_dc, nexthop, iface = m.groups()
-            last_prefix = prefix
-            last_code = code.strip()
-            routes.append({
-                "vrf": vrf,
-                "code": last_code,
-                "prefix": prefix,
-                "nexthop": nexthop or "directly connected",
-                "interface": iface_dc or iface or "",
-            })
+def parse_bgp_summary(output):
+    """
+    Parse IOS/IOS-XE 'show ip bgp summary' output.
+    Returns list of peer dicts. Last column is either a prefix count
+    (Established) or a state string (Idle, Active, Connect, etc.).
+    """
+    peers = []
+    peer_re = re.compile(
+        r"^(\d+\.\d+\.\d+\.\d+)\s+"
+        r"\d+\s+"          # BGP version
+        r"(\d+)\s+"        # remote AS
+        r"\d+\s+"          # MsgRcvd
+        r"\d+\s+"          # MsgSent
+        r"\d+\s+"          # TblVer
+        r"\d+\s+"          # InQ
+        r"(\S+)\s+"        # uptime
+        r"(\S+)"           # prefix count or state word
+    )
+    for line in output.splitlines():
+        m = peer_re.match(line.strip())
+        if not m:
             continue
-
-        # ECMP continuation line (indented with "[AD/metric] via ...")
-        if last_prefix:
-            m2 = re.match(
-                r"^\s+\[\d+/\d+\]\s+via\s+([\d.]+)(?:,\s*\S+)?,\s*(\S+)",
-                line,
-            )
-            if m2:
-                nexthop2, iface2 = m2.groups()
-                routes.append({
-                    "vrf": vrf,
-                    "code": last_code or "",
-                    "prefix": last_prefix,
-                    "nexthop": nexthop2,
-                    "interface": iface2 or "",
-                })
-
-    return routes
+        neighbor, remote_as, uptime, pfx_or_state = m.groups()
+        if pfx_or_state.isdigit():
+            state = "Established"
+            pfx_received = int(pfx_or_state)
+        else:
+            state = pfx_or_state
+            pfx_received = 0
+        peers.append({
+            "neighbor": neighbor,
+            "remote_as": int(remote_as),
+            "uptime": uptime,
+            "state": state,
+            "prefixes_received": pfx_received,
+        })
+    return peers
 
 
-def discover_vrfs(client: paramiko.SSHClient) -> list[str]:
-    raw = ssh_exec(client, "show vrf brief")
-    vrfs = []
-    for line in raw.splitlines():
-        m = re.match(r"^\s+(\S+)\s+\d+", line)
-        if m and m.group(1).upper() not in ("NAME", "VRF"):
-            vrfs.append(m.group(1))
-    return vrfs
+def extract_local_as(output):
+    m = re.search(r"local AS number (\d+)", output, re.IGNORECASE)
+    return int(m.group(1)) if m else None
 
 
-def collect_routes(client: paramiko.SSHClient, vrfs: list[str]) -> list[dict]:
-    all_routes = []
-    for vrf in vrfs:
-        cmd = "show ip route" if vrf.lower() == "default" else f"show ip route vrf {vrf}"
-        LOG.info("Running: %s", cmd)
-        raw = ssh_exec(client, cmd)
-        routes = parse_routing_table(raw, vrf=vrf)
-        LOG.info("VRF %s: %d routes parsed", vrf, len(routes))
-        all_routes.extend(routes)
-    return all_routes
+def print_peers(peers, local_as, filter_state):
+    col = "{:<18} {:<12} {:<14} {:<12} {:>10}"
+    header = col.format("Neighbor", "Remote AS", "State", "Uptime", "Pfx Rcvd")
+    sep = "-" * len(header)
+    print(f"\nLocal AS: {local_as or 'unknown'}")
+    print(sep)
+    print(header)
+    print(sep)
+    shown = 0
+    for p in peers:
+        if filter_state and p["state"] == "Established":
+            continue
+        pfx = str(p["prefixes_received"]) if p["state"] == "Established" else "-"
+        print(col.format(p["neighbor"], p["remote_as"], p["state"], p["uptime"], pfx))
+        shown += 1
+    print(sep)
+    total = len(peers)
+    established = sum(1 for p in peers if p["state"] == "Established")
+    print(
+        f"Total: {total}  Established: {established}"
+        f"  Non-established: {total - established}"
+    )
+    if filter_state and shown == 0:
+        print("(all peers are Established)")
 
 
-def write_table(routes: list[dict], dest) -> None:
-    if not routes:
-        dest.write("No routes found.\n")
-        return
-    dest.write(f"{'VRF':<18} {'Code':<6} {'Prefix':<20} {'Next-Hop':<18} Interface\n")
-    dest.write("-" * 76 + "\n")
-    for r in routes:
-        dest.write(
-            f"{r['vrf']:<18} {r['code']:<6} {r['prefix']:<20} "
-            f"{r['nexthop']:<18} {r['interface']}\n"
+def main():
+    parser = argparse.ArgumentParser(
+        description="Monitor BGP neighbor states on a Cisco IOS/IOS-XE device."
+    )
+    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", default=None, help="SSH password")
+    parser.add_argument("--key", dest="key_path", metavar="FILE", help="SSH private key path")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--vrf", default=None, help="VRF name for VPNv4 summary")
+    parser.add_argument(
+        "--filter-state", action="store_true",
+        help="Display only non-Established peers"
+    )
+    parser.add_argument(
+        "--json", dest="json_output", metavar="FILE",
+        help="Write peer data to JSON file"
+    )
+    parser.add_argument("--timeout", type=int, default=10, help="SSH connect timeout (seconds)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    password = args.password
+    if not password and not args.key_path:
+        password = getpass(f"Password for {args.username}@{args.device}: ")
+
+    log.info("Connecting to %s:%d", args.device, args.port)
+    try:
+        client = ssh_connect(
+            args.device, args.port, args.username,
+            password=password, key_path=args.key_path, timeout=args.timeout,
         )
-
-
-def write_json(routes: list[dict], dest) -> None:
-    dest.write(json.dumps(routes, indent=2))
-    dest.write("\n")
-
-
-def write_csv(routes: list[dict], dest) -> None:
-    fields = ["vrf", "code", "prefix", "nexthop", "interface"]
-    writer = csv.DictWriter(dest, fieldnames=fields)
-    writer.writeheader()
-    writer.writerows(routes)
-
-
-WRITERS = {"table": write_table, "json": write_json, "csv": write_csv}
-
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Collect multi-VRF IP routing tables from Cisco IOS/IOS-XE devices."
-    )
-    p.add_argument("-H", "--host", required=True, help="Device hostname or IP")
-    p.add_argument("-u", "--username", required=True)
-    p.add_argument("-p", "--password", default=None)
-    p.add_argument("--key", metavar="PATH", help="SSH private key file")
-    p.add_argument("--port", type=int, default=22)
-    p.add_argument(
-        "--vrf",
-        action="append",
-        dest="vrfs",
-        default=[],
-        metavar="NAME",
-        help="VRF to query (repeatable); defaults to global table only",
-    )
-    p.add_argument(
-        "--all-vrfs",
-        action="store_true",
-        help="Auto-discover all VRFs via 'show vrf brief' and query each",
-    )
-    p.add_argument("--format", choices=["table", "json", "csv"], default="table")
-    p.add_argument("-o", "--output", metavar="FILE", help="Output file (default: stdout)")
-    p.add_argument("-v", "--verbose", action="store_true")
-    return p
-
-
-def main() -> int:
-    args = build_parser().parse_args()
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING,
-        format="%(levelname)s %(message)s",
-    )
-
-    if not args.password and not args.key:
-        args.password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
-
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    except paramiko.AuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.device)
+        sys.exit(1)
+    except Exception as exc:
+        log.error("Connection error: %s", exc)
+        sys.exit(1)
 
     try:
-        client.connect(
-            hostname=args.host,
-            port=args.port,
-            username=args.username,
-            password=args.password,
-            key_filename=args.key,
-            timeout=15,
-            look_for_keys=False,
-            allow_agent=False,
-        )
-        LOG.info("Connected to %s", args.host)
+        shell = client.invoke_shell(width=200, height=200)
+        time.sleep(1)
+        shell.recv(65535)  # flush login banner
 
-        vrfs = list(args.vrfs) or ["default"]
-        if args.all_vrfs:
-            discovered = discover_vrfs(client)
-            seen = set(vrfs)
-            vrfs.extend(v for v in discovered if v not in seen)
-            LOG.info("Querying VRFs: %s", vrfs)
+        run_command(shell, "terminal length 0")
 
-        routes = collect_routes(client, vrfs)
+        cmd = "show ip bgp summary"
+        if args.vrf:
+            cmd = f"show ip bgp vpnv4 vrf {args.vrf} summary"
 
-    except paramiko.AuthenticationException:
-        print(f"ERROR: authentication failed for {args.username}@{args.host}", file=sys.stderr)
-        return 1
-    except paramiko.SSHException as exc:
-        print(f"ERROR: SSH error: {exc}", file=sys.stderr)
-        return 1
-    except OSError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+        log.debug("Running: %s", cmd)
+        output = run_command(shell, cmd)
+
+        peers = parse_bgp_summary(output)
+        local_as = extract_local_as(output)
+
+        if not peers:
+            log.warning("No BGP peers parsed — BGP may not be configured, or try --vrf")
+            sys.exit(0)
+
+        print_peers(peers, local_as, args.filter_state)
+
+        if args.json_output:
+            payload = {
+                "device": args.device,
+                "local_as": local_as,
+                "vrf": args.vrf or "default",
+                "peers": peers,
+            }
+            with open(args.json_output, "w") as fh:
+                json.dump(payload, fh, indent=2)
+            log.info("Peer data written to %s", args.json_output)
+
     finally:
         client.close()
 
-    writer = WRITERS[args.format]
-    if args.output:
-        open_kwargs = {"newline": ""} if args.format == "csv" else {}
-        with open(args.output, "w", **open_kwargs) as fh:
-            writer(routes, fh)
-        print(f"Output written to {args.output}", file=sys.stderr)
-    else:
-        writer(routes, sys.stdout)
-
-    return 0
-
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
 ```
+
+**Key design choices:**
+- Targets `show ip bgp summary` (IOS/IOS-XE) — distinct from the routing table scripts which read the FIB
+- `--filter-state` flag is useful in monitoring pipelines: pipe output through alerting when any peer is non-Established
+- `--vrf` switches to `show ip bgp vpnv4 vrf <name> summary` for MPLS VPN environments
+- `--json` enables snapshot exports for before/after change comparisons
+- Regex handles both Established (numeric prefix count) and non-Established (state word) in the last column, which is the standard IOS output format
