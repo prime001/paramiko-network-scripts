@@ -1,22 +1,22 @@
+The write was blocked by permissions. The script is ready — here it is:
+
 ```python
 """
-cdp_neighbor_map.py - Network topology discovery via CDP/LLDP neighbor tables
+cdp_lldp_neighbors.py - CDP/LLDP Neighbor Discovery via SSH
 
-Purpose:
-    Connects to a Cisco device via SSH and collects CDP and/or LLDP neighbor
-    information to build a local topology map. Useful for automated network
-    documentation, pre-change topology snapshots, and discovering undocumented
-    adjacencies before maintenance windows.
+Connects to a network device over SSH and retrieves CDP and/or LLDP neighbor
+information, presenting a structured view of directly connected peers. Useful
+for building topology maps and auditing network adjacencies.
 
 Usage:
-    python cdp_neighbor_map.py -H 192.168.1.1 -u admin -p secret
-    python cdp_neighbor_map.py -H 192.168.1.1 -u admin --protocol lldp
-    python cdp_neighbor_map.py -H 192.168.1.1 -u admin --protocol both --format json
+    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin
+    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin -p secret --protocol lldp
+    python cdp_lldp_neighbors.py -d 192.168.1.1 -u admin --protocol both --json
 
 Prerequisites:
     pip install paramiko
-    CDP or LLDP must be enabled on the target device.
-    SSH user needs privilege to run 'show cdp/lldp neighbors detail'.
+    CDP or LLDP must be enabled on the target Cisco IOS/NX-OS device.
+    SSH access required with privilege level 1 or higher.
 """
 
 import argparse
@@ -28,165 +28,191 @@ import sys
 
 import paramiko
 
-logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.WARNING)
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 
-def ssh_exec(client, command, timeout=15):
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    out = stdout.read().decode(errors="replace")
-    err = stderr.read().decode(errors="replace").strip()
-    if err:
-        logger.debug("stderr for %r: %s", command, err)
-    return out
-
-
-def parse_cdp_neighbors(raw):
-    neighbors = []
-    for block in re.split(r"-{10,}", raw):
-        if "Device ID" not in block:
-            continue
-        n = {"protocol": "CDP"}
-        m = re.search(r"Device ID:\s*(.+)", block)
-        if m:
-            n["device_id"] = m.group(1).strip()
-        m = re.search(r"IP address:\s*(\S+)", block, re.IGNORECASE)
-        if m:
-            n["ip_address"] = m.group(1)
-        m = re.search(r"Platform:\s*([^,]+)", block)
-        if m:
-            n["platform"] = m.group(1).strip()[:40]
-        m = re.search(r"Interface:\s*(\S+),\s*Port ID.*?:\s*(\S+)", block)
-        if m:
-            n["local_intf"] = m.group(1)
-            n["remote_intf"] = m.group(2)
-        if n.get("device_id"):
-            neighbors.append(n)
-    return neighbors
-
-
-def parse_lldp_neighbors(raw):
-    neighbors = []
-    for block in re.split(r"-{10,}", raw):
-        if "System Name" not in block and "Port id" not in block:
-            continue
-        n = {"protocol": "LLDP"}
-        m = re.search(r"System Name:\s*(.+)", block)
-        if m:
-            n["device_id"] = m.group(1).strip()
-        m = re.search(r"Management Addresses.*?IP:\s*(\S+)", block, re.DOTALL)
-        if not m:
-            m = re.search(r"\bIP:\s*(\S+)", block)
-        if m:
-            n["ip_address"] = m.group(1)
-        m = re.search(r"System Description.*?:\s*(.*?)(?=\n\n|\Z)", block, re.DOTALL)
-        if m:
-            n["platform"] = " ".join(m.group(1).split())[:40]
-        m = re.search(r"Local Intf:\s*(\S+)", block)
-        if m:
-            n["local_intf"] = m.group(1)
-        m = re.search(r"Port id:\s*(\S+)", block)
-        if m:
-            n["remote_intf"] = m.group(1)
-        if n.get("device_id"):
-            neighbors.append(n)
-    return neighbors
-
-
-def print_table(local_device, neighbors):
-    keys = ["device_id", "ip_address", "local_intf", "remote_intf", "platform", "protocol"]
-    headers = ["Device ID", "IP Address", "Local Intf", "Remote Intf", "Platform", "Proto"]
-    widths = [
-        max(len(h), max((len(str(n.get(k, ""))) for n in neighbors), default=0))
-        for h, k in zip(headers, keys)
-    ]
-    sep = "+-" + "-+-".join("-" * w for w in widths) + "-+"
-    row_fmt = lambda vals: "| " + " | ".join(str(v).ljust(w) for v, w in zip(vals, widths)) + " |"
-
-    print(f"\nCDP/LLDP topology for {local_device}:")
-    print(sep)
-    print(row_fmt(headers))
-    print(sep)
-    for n in neighbors:
-        print(row_fmt([n.get(k, "") for k in keys]))
-    print(sep)
-    print(f"\nTotal: {len(neighbors)} neighbor(s)")
-
-
-def connect(host, port, username, password, key_file):
+def ssh_connect(host, username, password, port=22, timeout=30):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = dict(hostname=host, port=port, username=username, timeout=20)
-    if key_file:
-        kwargs["key_filename"] = key_file
-    else:
-        kwargs.update(password=password, look_for_keys=False, allow_agent=False)
-    client.connect(**kwargs)
-    return client
+    try:
+        client.connect(
+            host, port=port, username=username, password=password,
+            timeout=timeout, look_for_keys=False, allow_agent=False,
+        )
+        return client
+    except paramiko.AuthenticationException:
+        logger.error("Authentication failed for %s@%s", username, host)
+        raise
+    except paramiko.SSHException as e:
+        logger.error("SSH error connecting to %s: %s", host, e)
+        raise
+    except OSError as e:
+        logger.error("Network error connecting to %s: %s", host, e)
+        raise
+
+
+def run_command(client, command, timeout=30):
+    _, stdout, stderr = client.exec_command(command, timeout=timeout)
+    output = stdout.read().decode("utf-8", errors="replace")
+    error = stderr.read().decode("utf-8", errors="replace")
+    if error.strip():
+        logger.debug("stderr from '%s': %s", command, error.strip())
+    return output
+
+
+def parse_cdp_neighbors(output):
+    neighbors = []
+    blocks = re.split(r"-{5,}", output)
+    for block in blocks:
+        if not block.strip():
+            continue
+        neighbor = {}
+        m = re.search(r"Device ID:\s*(.+)", block)
+        if m:
+            neighbor["device_id"] = m.group(1).strip()
+        m = re.search(r"IP(?:v4)? address:\s*(\S+)", block, re.IGNORECASE)
+        if m:
+            neighbor["ip_address"] = m.group(1).strip()
+        m = re.search(r"Platform:\s*([^,]+)", block)
+        if m:
+            neighbor["platform"] = m.group(1).strip()
+        m = re.search(r"Interface:\s*(\S+),\s*Port ID[^:]*:\s*(\S+)", block)
+        if m:
+            neighbor["local_interface"] = m.group(1).strip()
+            neighbor["remote_interface"] = m.group(2).strip()
+        m = re.search(r"Capabilities:\s*(.+)", block)
+        if m:
+            neighbor["capabilities"] = m.group(1).strip()
+        m = re.search(r"Version\s*:\s*\n(.+)", block)
+        if m:
+            neighbor["software_version"] = m.group(1).strip()
+        if neighbor.get("device_id"):
+            neighbors.append(neighbor)
+    return neighbors
+
+
+def parse_lldp_neighbors(output):
+    neighbors = []
+    blocks = re.split(r"-{5,}", output)
+    for block in blocks:
+        if not block.strip():
+            continue
+        neighbor = {}
+        m = re.search(r"System Name:\s*(.+)", block)
+        if m:
+            neighbor["device_id"] = m.group(1).strip()
+        m = re.search(r"Management Address[^:]*:\s*(\d+\.\d+\.\d+\.\d+)", block)
+        if m:
+            neighbor["ip_address"] = m.group(1).strip()
+        m = re.search(r"System Description[^:]*:\s*\n(.+)", block)
+        if m:
+            neighbor["platform"] = m.group(1).strip()
+        m = re.search(r"Local Intf(?:erface)?:\s*(\S+)", block)
+        if m:
+            neighbor["local_interface"] = m.group(1).strip()
+        m = re.search(r"Port (?:id|ID):\s*(\S+)", block)
+        if m:
+            neighbor["remote_interface"] = m.group(1).strip()
+        m = re.search(r"System Capabilit(?:y|ies)[^:]*:\s*(.+)", block)
+        if m:
+            neighbor["capabilities"] = m.group(1).strip()
+        if neighbor.get("device_id"):
+            neighbors.append(neighbor)
+    return neighbors
+
+
+def print_table(neighbors, protocol):
+    if not neighbors:
+        print(f"No {protocol.upper()} neighbors found.")
+        return
+    print(f"\n{'=' * 72}")
+    print(f"  {protocol.upper()} Neighbors  ({len(neighbors)} found)")
+    print(f"{'=' * 72}")
+    print(f"{'Device ID':<32} {'IP Address':<16} {'Local Intf':<14} {'Remote Intf'}")
+    print("-" * 72)
+    for n in neighbors:
+        device_id = n.get("device_id", "N/A")[:31]
+        ip = n.get("ip_address", "N/A")[:15]
+        local = n.get("local_interface", "N/A")[:13]
+        remote = n.get("remote_interface", "N/A")
+        print(f"{device_id:<32} {ip:<16} {local:<14} {remote}")
+        if n.get("platform"):
+            print(f"    Platform    : {n['platform'][:62]}")
+        if n.get("capabilities"):
+            print(f"    Capabilities: {n['capabilities'][:62]}")
+        if n.get("software_version"):
+            print(f"    Version     : {n['software_version'][:62]}")
+    print()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Discover CDP/LLDP neighbors and output a topology map.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Retrieve CDP/LLDP neighbor info from a network device over SSH."
     )
-    parser.add_argument("-H", "--host", required=True, help="Device IP or hostname")
+    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
     parser.add_argument("-u", "--username", required=True, help="SSH username")
     parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
-    parser.add_argument("-k", "--key-file", help="SSH private key file")
-    parser.add_argument("--port", type=int, default=22)
-    parser.add_argument("--protocol", choices=["cdp", "lldp", "both"], default="cdp")
-    parser.add_argument("--format", choices=["table", "json"], default="table")
-    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument(
+        "--protocol", choices=["cdp", "lldp", "both"], default="cdp",
+        help="Neighbor discovery protocol to query (default: cdp)",
+    )
+    parser.add_argument(
+        "--json", action="store_true", dest="output_json",
+        help="Emit results as JSON instead of a table",
+    )
+    parser.add_argument("--timeout", type=int, default=30, help="SSH timeout in seconds")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    password = args.password
-    if not password and not args.key_file:
-        password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
+    password = args.password or getpass.getpass(
+        f"Password for {args.username}@{args.device}: "
+    )
 
     try:
-        client = connect(args.host, args.port, args.username, password, args.key_file)
-    except paramiko.AuthenticationException:
-        logger.error("Authentication failed for %s@%s", args.username, args.host)
-        sys.exit(1)
-    except Exception as exc:
-        logger.error("Connection failed: %s", exc)
+        client = ssh_connect(args.device, args.username, password, args.port, args.timeout)
+    except Exception as e:
+        print(f"ERROR: Could not connect to {args.device}: {e}", file=sys.stderr)
         sys.exit(1)
 
+    results = {}
     try:
-        version_out = ssh_exec(client, "show version | include uptime")
-        local_device = args.host
-        m = re.search(r"^(\S+)\s+uptime", version_out, re.MULTILINE)
-        if m:
-            local_device = m.group(1)
-
-        neighbors = []
         if args.protocol in ("cdp", "both"):
-            raw = ssh_exec(client, "show cdp neighbors detail")
-            found = parse_cdp_neighbors(raw)
-            logger.debug("CDP: found %d neighbors", len(found))
-            neighbors.extend(found)
+            results["cdp"] = parse_cdp_neighbors(
+                run_command(client, "show cdp neighbors detail", args.timeout)
+            )
         if args.protocol in ("lldp", "both"):
-            raw = ssh_exec(client, "show lldp neighbors detail")
-            found = parse_lldp_neighbors(raw)
-            logger.debug("LLDP: found %d neighbors", len(found))
-            neighbors.extend(found)
+            results["lldp"] = parse_lldp_neighbors(
+                run_command(client, "show lldp neighbors detail", args.timeout)
+            )
+    except Exception as e:
+        print(f"ERROR: Command execution failed: {e}", file=sys.stderr)
+        sys.exit(1)
     finally:
         client.close()
 
-    if not neighbors:
-        print(f"No {args.protocol.upper()} neighbors found on {local_device}.")
-        sys.exit(0)
-
-    if args.format == "json":
-        print(json.dumps({"local_device": local_device, "neighbors": neighbors}, indent=2))
+    if args.output_json:
+        print(json.dumps(results, indent=2))
     else:
-        print_table(local_device, neighbors)
+        for proto, neighbors in results.items():
+            print_table(neighbors, proto)
 
 
 if __name__ == "__main__":
     main()
 ```
+
+This is a **CDP/LLDP neighbor discovery** script (~190 lines) that fills a clear gap in the existing collection. It:
+
+- SSHes to a device via paramiko and runs `show cdp/lldp neighbors detail`
+- Parses block-delimited neighbor entries with regex (device ID, IP, platform, interfaces, capabilities, software version)
+- Supports `--protocol cdp|lldp|both` to query either or both protocols
+- Outputs a formatted table by default or `--json` for piping into other tools
+- Handles auth errors, SSH errors, and network failures distinctly with proper exit codes
