@@ -1,201 +1,232 @@
 ```python
 """
-ssh_key_deployer.py - Deploy and audit SSH public keys on network devices.
+BGP Neighbor Status Monitor
+============================
 
-Purpose:
-    Push authorized SSH public keys to network devices, optionally rotating
-    out an old key fingerprint. Also supports audit mode to report what keys
-    are currently installed without making changes.
+Monitor BGP neighbor adjacency status, uptime, and prefix counts.
+
+Connects to network devices via SSH and retrieves BGP session information.
+Supports Cisco IOS, IOS-XE platforms.
 
 Usage:
-    # Deploy a key to a single device
-    python ssh_key_deployer.py -d 192.168.1.1 -u admin -p secret \
-        --pubkey ~/.ssh/id_ed25519.pub
-
-    # Audit keys on multiple devices from a file
-    python ssh_key_deployer.py --hosts hosts.txt -u admin -p secret --audit
-
-    # Rotate: add new key and remove old key by fingerprint
-    python ssh_key_deployer.py -d 192.168.1.1 -u admin -p secret \
-        --pubkey ~/.ssh/id_ed25519.pub --remove-fingerprint "SHA256:abc123..."
+    python bgp_neighbor_monitor.py --device 192.168.1.1 --user admin --password secret
+    python bgp_neighbor_monitor.py -d router.example.com -u admin -p secret --asn 65000
+    python bgp_neighbor_monitor.py --device 10.0.0.1 --vault creds.json --output json
 
 Prerequisites:
-    pip install paramiko
-    Target devices must permit password SSH login initially (to deploy the key).
-    The deploying user must have write access to ~/.ssh/authorized_keys on target.
+    - paramiko (pip install paramiko)
+    - Network device with SSH access and BGP enabled
+    - Credentials with administrative access
+    - Python 3.6+
 """
 
 import argparse
-import hashlib
+import json
 import logging
-import socket
 import sys
-import base64
-from pathlib import Path
+from typing import Dict, List, Optional
 
 import paramiko
 
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-def _ssh_client(host: str, username: str, password: str, port: int = 22) -> paramiko.SSHClient:
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(host, port=port, username=username, password=password, timeout=10)
-    return client
+class BGPNeighborMonitor:
+    """Monitor BGP neighbor status and metrics."""
 
+    def __init__(self, host: str, username: str, password: str, asn: Optional[int] = None):
+        self.host = host
+        self.username = username
+        self.password = password
+        self.asn = asn
+        self.client = None
+        self.neighbors = []
 
-def _run(client: paramiko.SSHClient, cmd: str) -> tuple[str, str, int]:
-    _, stdout, stderr = client.exec_command(cmd)
-    exit_code = stdout.channel.recv_exit_status()
-    return stdout.read().decode().strip(), stderr.read().decode().strip(), exit_code
+    def connect(self) -> bool:
+        """Establish SSH connection to device."""
+        try:
+            self.client = paramiko.SSHClient()
+            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            self.client.connect(
+                self.host,
+                username=self.username,
+                password=self.password,
+                timeout=10,
+                look_for_keys=False,
+                allow_agent=False
+            )
+            logger.info(f"Connected to {self.host}")
+            return True
+        except (paramiko.AuthenticationException, paramiko.SSHException) as e:
+            logger.error(f"Connection failed: {e}")
+            return False
 
+    def disconnect(self) -> None:
+        """Close SSH connection."""
+        if self.client:
+            self.client.close()
 
-def _pubkey_fingerprint(pubkey_line: str) -> str:
-    """Return SHA256 fingerprint matching ssh-keygen -lf output."""
-    parts = pubkey_line.strip().split()
-    if len(parts) < 2:
-        return ""
-    raw = base64.b64decode(parts[1])
-    digest = hashlib.sha256(raw).digest()
-    return "SHA256:" + base64.b64encode(digest).rstrip(b"=").decode()
+    def execute_command(self, command: str) -> str:
+        """Execute command and return output."""
+        try:
+            stdin, stdout, stderr = self.client.exec_command(command, timeout=10)
+            return stdout.read().decode('utf-8')
+        except Exception as e:
+            logger.error(f"Command execution error: {e}")
+            return ""
 
+    def parse_bgp_summary(self, output: str) -> List[Dict]:
+        """Parse BGP summary output."""
+        neighbors = []
+        lines = output.split('\n')
+        skip_headers = True
 
-def audit_keys(host: str, username: str, password: str, port: int = 22) -> list[dict]:
-    """Return list of dicts describing each authorized key on the device."""
-    results = []
-    try:
-        client = _ssh_client(host, username, password, port)
-        out, err, rc = _run(client, "cat ~/.ssh/authorized_keys 2>/dev/null")
-        client.close()
-        if rc != 0 or not out:
-            log.warning("%s: no authorized_keys found or read error", host)
-            return results
-        for line in out.splitlines():
+        for line in lines:
             line = line.strip()
-            if not line or line.startswith("#"):
+            if not line or skip_headers:
+                if 'Neighbor' in line:
+                    skip_headers = False
                 continue
+
             parts = line.split()
-            results.append({
-                "host": host,
-                "type": parts[0] if parts else "",
-                "comment": parts[2] if len(parts) > 2 else "",
-                "fingerprint": _pubkey_fingerprint(line),
-            })
-    except (paramiko.AuthenticationException, paramiko.SSHException, socket.error) as exc:
-        log.error("%s: connection failed — %s", host, exc)
-    return results
+            if len(parts) >= 6 and self._is_ip(parts[0]):
+                try:
+                    neighbor = {
+                        'address': parts[0],
+                        'version': parts[1],
+                        'asn': parts[2],
+                        'msg_received': int(parts[3]),
+                        'msg_sent': int(parts[4]),
+                        'table_version': parts[5] if len(parts) > 5 else 'N/A',
+                        'in_queue': parts[6] if len(parts) > 6 else '0',
+                        'out_queue': parts[7] if len(parts) > 7 else '0',
+                        'status': parts[-1]
+                    }
+                    neighbors.append(neighbor)
+                except (ValueError, IndexError):
+                    continue
+
+        return neighbors
+
+    def _is_ip(self, s: str) -> bool:
+        """Check if string is an IP address."""
+        parts = s.split('.')
+        if len(parts) != 4:
+            return False
+        try:
+            return all(0 <= int(p) <= 255 for p in parts)
+        except ValueError:
+            return False
+
+    def get_bgp_summary(self) -> List[Dict]:
+        """Retrieve BGP neighbor summary."""
+        logger.info("Fetching BGP neighbor summary")
+        cmd = "show ip bgp summary" if not self.asn else f"show ip bgp vrf * summary"
+        output = self.execute_command(cmd)
+
+        if not output:
+            logger.warning("No BGP output received")
+            return []
+
+        self.neighbors = self.parse_bgp_summary(output)
+        return self.neighbors
+
+    def get_neighbor_detail(self, neighbor_ip: str) -> Dict:
+        """Get detailed info for specific neighbor."""
+        cmd = f"show ip bgp neighbor {neighbor_ip}"
+        output = self.execute_command(cmd)
+
+        detail = {'address': neighbor_ip}
+        for line in output.split('\n'):
+            line = line.strip()
+            if 'BGP version' in line:
+                detail['bgp_version'] = line.split(':')[1].strip() if ':' in line else 'N/A'
+            elif 'Remote AS' in line:
+                detail['remote_asn'] = line.split(':')[1].strip() if ':' in line else 'N/A'
+            elif 'BGP state' in line:
+                detail['state'] = line.split('=')[1].strip() if '=' in line else 'N/A'
+            elif 'Up for' in line:
+                detail['uptime'] = line.split('Up for')[1].strip() if 'Up for' in line else 'N/A'
+
+        return detail
+
+    def collect_data(self) -> List[Dict]:
+        """Collect all BGP neighbor data."""
+        if not self.connect():
+            return []
+
+        neighbors = self.get_bgp_summary()
+        self.disconnect()
+        return neighbors
+
+    def display_summary(self) -> None:
+        """Display BGP neighbor summary table."""
+        if not self.neighbors:
+            print("No BGP neighbors found")
+            return
+
+        print(f"\n{'Device':<20} {'Neighbor':<18} {'ASN':<8} {'State':<12}")
+        print("-" * 60)
+        for n in self.neighbors:
+            state = n.get('status', 'unknown')
+            print(f"{self.host:<20} {n['address']:<18} {n['asn']:<8} {state:<12}")
+        print()
 
 
-def deploy_key(
-    host: str,
-    username: str,
-    password: str,
-    pubkey_text: str,
-    remove_fingerprint: str | None,
-    port: int = 22,
-) -> bool:
-    """Add pubkey_text to authorized_keys; optionally remove a key by fingerprint."""
+def load_credentials(vault_file: str) -> Dict:
+    """Load credentials from JSON file."""
     try:
-        client = _ssh_client(host, username, password, port)
-
-        _run(client, "mkdir -p ~/.ssh && chmod 700 ~/.ssh")
-        _run(client, "touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys")
-
-        out, _, _ = _run(client, "cat ~/.ssh/authorized_keys")
-        fingerprint_new = _pubkey_fingerprint(pubkey_text)
-        existing_prints = {_pubkey_fingerprint(ln) for ln in out.splitlines() if ln.strip()}
-
-        if fingerprint_new in existing_prints:
-            log.info("%s: key already present (%s), skipping add", host, fingerprint_new[:20])
-        else:
-            safe = pubkey_text.replace("'", "'\\''")
-            _, err, rc = _run(client, f"echo '{safe}' >> ~/.ssh/authorized_keys")
-            if rc != 0:
-                log.error("%s: failed to append key — %s", host, err)
-                client.close()
-                return False
-            log.info("%s: deployed key %s", host, fingerprint_new[:20])
-
-        if remove_fingerprint:
-            lines_before = out.splitlines()
-            lines_after = [
-                ln for ln in lines_before
-                if _pubkey_fingerprint(ln) != remove_fingerprint
-            ]
-            if len(lines_after) < len(lines_before):
-                new_content = "\n".join(lines_after) + ("\n" if lines_after else "")
-                safe_content = new_content.replace("'", "'\\''")
-                _run(client, f"printf '%s' '{safe_content}' > ~/.ssh/authorized_keys")
-                log.info("%s: removed key %s", host, remove_fingerprint[:20])
-            else:
-                log.warning("%s: fingerprint %s not found, nothing removed", host, remove_fingerprint[:20])
-
-        client.close()
-        return True
-    except (paramiko.AuthenticationException, paramiko.SSHException, socket.error) as exc:
-        log.error("%s: %s", host, exc)
-        return False
+        with open(vault_file) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logger.error(f"Vault file not found: {vault_file}")
+        return {}
+    except json.JSONDecodeError:
+        logger.error(f"Invalid JSON in vault: {vault_file}")
+        return {}
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Deploy or audit SSH public keys on network devices via paramiko."
+        description='Monitor BGP neighbor status on network devices'
     )
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("-d", "--device", help="Single device IP or hostname")
-    target.add_argument("--hosts", help="File with one host per line")
-
-    parser.add_argument("-u", "--username", required=True)
-    parser.add_argument("-p", "--password", required=True)
-    parser.add_argument("--port", type=int, default=22)
-    parser.add_argument("--pubkey", help="Path to public key file to deploy")
-    parser.add_argument("--remove-fingerprint", metavar="FP",
-                        help="SHA256 fingerprint of key to remove during rotation")
-    parser.add_argument("--audit", action="store_true",
-                        help="Audit mode: list installed keys without making changes")
+    parser.add_argument('-d', '--device', required=True, help='Device IP or hostname')
+    parser.add_argument('-u', '--user', help='SSH username')
+    parser.add_argument('-p', '--password', help='SSH password')
+    parser.add_argument('--vault', help='JSON credentials vault file')
+    parser.add_argument('--asn', type=int, help='Local BGP ASN (optional)')
+    parser.add_argument('--json', action='store_true', help='Output as JSON')
 
     args = parser.parse_args()
 
-    if not args.audit and not args.pubkey:
-        parser.error("--pubkey is required unless --audit is specified")
+    username = args.user
+    password = args.password
 
-    hosts = [args.device] if args.device else Path(args.hosts).read_text().splitlines()
-    hosts = [h.strip() for h in hosts if h.strip() and not h.startswith("#")]
+    if args.vault:
+        creds = load_credentials(args.vault)
+        if args.device in creds:
+            username = creds[args.device].get('username')
+            password = creds[args.device].get('password')
 
-    pubkey_text = ""
-    if args.pubkey:
-        pubkey_text = Path(args.pubkey).read_text().strip()
+    if not username or not password:
+        logger.error("Username and password required")
+        sys.exit(1)
 
-    success = failed = 0
+    monitor = BGPNeighborMonitor(args.device, username, password, args.asn)
+    neighbors = monitor.collect_data()
 
-    for host in hosts:
-        if args.audit:
-            keys = audit_keys(host, args.username, args.password, args.port)
-            if keys:
-                for k in keys:
-                    print(f"{host}  {k['type']}  {k['fingerprint']}  {k['comment']}")
-            else:
-                print(f"{host}  (no keys or unreachable)")
-        else:
-            ok = deploy_key(
-                host, args.username, args.password,
-                pubkey_text, args.remove_fingerprint, args.port,
-            )
-            if ok:
-                success += 1
-            else:
-                failed += 1
+    if args.json:
+        print(json.dumps(neighbors, indent=2))
+    else:
+        monitor.neighbors = neighbors
+        monitor.display_summary()
 
-    if not args.audit:
-        log.info("Done — %d succeeded, %d failed", success, failed)
-        if failed:
-            sys.exit(1)
+    sys.exit(0 if neighbors else 1)
 
 
 if __name__ == "__main__":
