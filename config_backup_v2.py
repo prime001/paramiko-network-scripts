@@ -1,207 +1,187 @@
-```python
-"""
-config_backup_rotate.py - Network device configuration backup with rotation and deduplication.
+mac_table_collector.py - Collect and export the Layer 2 MAC address table from
+Cisco IOS/IOS-XE network devices via SSH.
 
 Purpose:
-    Connects to a Cisco IOS/IOS-XE/NX-OS device via SSH, retrieves the running
-    configuration, and saves it to disk. Skips writing when the config is identical
-    to the most recent backup (SHA-256 deduplication). Automatically rotates old
-    backups, keeping only the N most recent files per device.
+    Retrieves 'show mac address-table' output, parses each entry (VLAN, MAC,
+    type, port), and exports results to CSV or formatted stdout. Useful for
+    security audits, rogue device detection, port-to-MAC documentation, and
+    correlating Layer-2 adjacency with ARP data.
 
 Usage:
-    python config_backup_rotate.py -H 192.168.1.1 -u admin -p secret
-    python config_backup_rotate.py -H 10.0.0.1 -u admin --ask-pass \\
-        --output-dir /backups/routers --keep 7 --device-type nxos --force
+    python mac_table_collector.py -H 192.168.1.1 -u admin
+    python mac_table_collector.py -H 192.168.1.1 -u admin -p secret --vlan 100
+    python mac_table_collector.py -H 192.168.1.1 -u admin --key ~/.ssh/id_rsa -o macs.csv
+    python mac_table_collector.py -H 192.168.1.1 -u admin --vlan 10 --type DYNAMIC
 
 Prerequisites:
     pip install paramiko
-    SSH access with privilege level 15 (or equivalent) to run 'show running-config'.
+    SSH access to device; privilege level 1 (show commands) is sufficient.
+    Tested against Cisco IOS 15.x and IOS-XE 16.x/17.x.
 """
 
 import argparse
+import csv
 import getpass
-import hashlib
 import logging
 import re
 import sys
 import time
-from datetime import datetime
-from pathlib import Path
-from typing import Optional
 
 import paramiko
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger(__name__)
 
-SHOW_RUN_CMD = {
-    "ios": "show running-config",
-    "nxos": "show running-config",
-    "eos": "show running-config",
-}
-
-_PROMPT = re.compile(r"[>#]\s*$", re.MULTILINE)
-
-
-def _sha256(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()
+# Matches Cisco IOS mac-address-table lines:
+#   100   aabb.cc00.0100   DYNAMIC   Gi0/1
+_MAC_LINE = re.compile(
+    r"^\s*(\d+)\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+(\w+)\s+([\w/\.:-]+)\s*$",
+    re.IGNORECASE,
+)
 
 
-def _recv_until_prompt(channel: paramiko.Channel, timeout: int) -> str:
-    channel.settimeout(timeout)
-    buf = ""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            chunk = channel.recv(4096).decode("utf-8", errors="replace")
-        except Exception:
-            break
-        if not chunk:
-            break
-        buf += chunk
-        if _PROMPT.search(buf):
-            break
-    return buf
-
-
-def connect(host: str, port: int, username: str, password: str) -> paramiko.SSHClient:
+def ssh_connect(host, port, username, password=None, key_path=None, timeout=30):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=host,
-        port=port,
-        username=username,
-        password=password,
-        look_for_keys=False,
-        allow_agent=False,
-        timeout=15,
-    )
+    kwargs = {
+        "hostname": host,
+        "port": port,
+        "username": username,
+        "timeout": timeout,
+        "look_for_keys": False,
+        "allow_agent": False,
+    }
+    if key_path:
+        kwargs["key_filename"] = key_path
+    else:
+        kwargs["password"] = password
+    client.connect(**kwargs)
     return client
 
 
-def fetch_running_config(
-    client: paramiko.SSHClient, device_type: str, timeout: int
-) -> str:
-    command = SHOW_RUN_CMD.get(device_type, "show running-config")
-    shell = client.invoke_shell(width=512, height=5000)
-    _recv_until_prompt(shell, timeout)
+def run_show_command(client, command, settle=2.5):
+    shell = client.invoke_shell(width=250, height=5000)
+    time.sleep(1.2)
+    shell.recv(65535)  # drain login banner
 
     shell.send("terminal length 0\n")
-    _recv_until_prompt(shell, timeout)
+    time.sleep(0.6)
+    shell.recv(65535)
 
-    shell.send(f"{command}\n")
-    raw = _recv_until_prompt(shell, timeout)
+    shell.send(command + "\n")
+    time.sleep(settle)
+
+    buf = b""
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if shell.recv_ready():
+            buf += shell.recv(65535)
+        elif buf:
+            break
+        time.sleep(0.2)
+
     shell.close()
-
-    lines = raw.splitlines()
-    start = next((i for i, ln in enumerate(lines) if command in ln), 0)
-    config_lines = lines[start + 1:]
-    while config_lines and _PROMPT.match(config_lines[-1].strip()):
-        config_lines.pop()
-    return "\n".join(config_lines).strip()
+    return buf.decode("utf-8", errors="replace")
 
 
-def last_backup_hash(output_dir: Path, host: str) -> Optional[str]:
-    backups = sorted(output_dir.glob(f"{host}_*.cfg"), reverse=True)
-    if not backups:
-        return None
-    try:
-        return _sha256(backups[0].read_text())
-    except OSError:
-        return None
+def parse_mac_table(raw, vlan_filter=None, type_filter=None):
+    entries = []
+    for line in raw.splitlines():
+        m = _MAC_LINE.match(line)
+        if not m:
+            continue
+        vlan, mac, entry_type, port = m.groups()
+        if vlan_filter and vlan != str(vlan_filter):
+            continue
+        if type_filter and entry_type.upper() != type_filter.upper():
+            continue
+        entries.append({"vlan": vlan, "mac": mac, "type": entry_type, "port": port})
+    return entries
 
 
-def rotate_backups(output_dir: Path, host: str, keep: int) -> None:
-    backups = sorted(output_dir.glob(f"{host}_*.cfg"), reverse=True)
-    for old in backups[keep:]:
-        old.unlink()
-        logger.debug("Removed old backup: %s", old.name)
+def print_table(entries):
+    if not entries:
+        print("No matching MAC address-table entries.")
+        return
+    print(f"{'VLAN':<6}  {'MAC Address':<17}  {'Type':<10}  Port")
+    print("-" * 52)
+    for e in entries:
+        print(f"{e['vlan']:<6}  {e['mac']:<17}  {e['type']:<10}  {e['port']}")
+    print(f"\n{len(entries)} entries.")
 
 
-def save_backup(output_dir: Path, host: str, config: str) -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = output_dir / f"{host}_{timestamp}.cfg"
-    path.write_text(config)
-    return path
+def write_csv(entries, filepath):
+    with open(filepath, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["vlan", "mac", "type", "port"])
+        writer.writeheader()
+        writer.writerows(entries)
+    log.info("Wrote %d entries to %s", len(entries), filepath)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Back up a network device running-config with deduplication and rotation.",
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Collect MAC address table from a Cisco IOS/IOS-XE device.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("-H", "--host", required=True, help="Device IP or hostname")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", default=None, help="SSH password")
-    parser.add_argument("--ask-pass", action="store_true", help="Prompt for password")
-    parser.add_argument("--port", type=int, default=22, help="SSH port")
-    parser.add_argument(
-        "--device-type",
-        choices=list(SHOW_RUN_CMD.keys()),
-        default="ios",
-        help="Device OS type",
+    p.add_argument("-H", "--host", required=True, help="Device hostname or IP")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    p.add_argument("--key", dest="key_path", metavar="PATH", help="SSH private key file")
+    p.add_argument("--port", type=int, default=22, help="SSH port")
+    p.add_argument("--timeout", type=int, default=30, help="Connection timeout (seconds)")
+    p.add_argument("--vlan", metavar="ID", help="Filter results to a single VLAN")
+    p.add_argument(
+        "--type",
+        dest="entry_type",
+        metavar="TYPE",
+        help="Filter by entry type, e.g. DYNAMIC or STATIC",
     )
-    parser.add_argument("--output-dir", default="./backups", help="Backup storage directory")
-    parser.add_argument("--keep", type=int, default=5, help="Backups to retain per device")
-    parser.add_argument("--timeout", type=int, default=30, help="Command timeout in seconds")
-    parser.add_argument(
-        "--force", action="store_true", help="Save even if config is unchanged"
-    )
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    return parser.parse_args()
-
-
-def main() -> int:
-    args = parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    password = args.password
-    if args.ask_pass or password is None:
-        password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info("Connecting to %s:%d", args.host, args.port)
-    try:
-        client = connect(args.host, args.port, args.username, password)
-    except paramiko.AuthenticationException:
-        logger.error("Authentication failed for %s@%s", args.username, args.host)
-        return 1
-    except Exception as exc:
-        logger.error("Connection error: %s", exc)
-        return 1
-
-    try:
-        logger.info("Fetching running-config (%s)", args.device_type)
-        config = fetch_running_config(client, args.device_type, args.timeout)
-    except Exception as exc:
-        logger.error("Failed to retrieve config: %s", exc)
-        return 1
-    finally:
-        client.close()
-
-    if not config:
-        logger.error("Received empty configuration — aborting")
-        return 1
-
-    current_hash = _sha256(config)
-    prior_hash = last_backup_hash(output_dir, args.host)
-
-    if prior_hash and prior_hash == current_hash and not args.force:
-        logger.info("Config unchanged since last backup — skipping (use --force to override)")
-        return 0
-
-    saved = save_backup(output_dir, args.host, config)
-    logger.info("Backup saved: %s (%d bytes)", saved.name, saved.stat().st_size)
-
-    rotate_backups(output_dir, args.host, args.keep)
-    logger.info("Rotation complete — keeping %d backup(s) for %s", args.keep, args.host)
-    return 0
+    p.add_argument("-o", "--output", metavar="FILE", help="Write results to CSV file")
+    p.add_argument("--debug", action="store_true", help="Enable verbose SSH debug output")
+    return p
 
 
 if __name__ == "__main__":
-    sys.exit(main())
-```
+    args = build_parser().parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger("paramiko").setLevel(logging.DEBUG)
+
+    if not args.key_path and not args.password:
+        args.password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
+
+    log.info("Connecting to %s:%d", args.host, args.port)
+    try:
+        client = ssh_connect(
+            host=args.host,
+            port=args.port,
+            username=args.username,
+            password=args.password,
+            key_path=args.key_path,
+            timeout=args.timeout,
+        )
+    except paramiko.AuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.host)
+        sys.exit(1)
+    except (paramiko.SSHException, OSError) as exc:
+        log.error("SSH connection error: %s", exc)
+        sys.exit(1)
+
+    try:
+        log.info("Retrieving MAC address table")
+        raw = run_show_command(client, "show mac address-table")
+        entries = parse_mac_table(raw, vlan_filter=args.vlan, type_filter=args.entry_type)
+        log.info("Parsed %d entries", len(entries))
+        if args.output:
+            write_csv(entries, args.output)
+        else:
+            print_table(entries)
+    except Exception as exc:
+        log.error("Command execution failed: %s", exc)
+        sys.exit(1)
+    finally:
+        client.close()
