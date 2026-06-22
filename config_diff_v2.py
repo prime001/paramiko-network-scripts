@@ -1,239 +1,221 @@
-Here's the complete script — output only, as requested:
-
-```
-"""
-running_startup_diff.py - Running vs Startup Configuration Drift Detector
-...
-```
-
-Since I can't write to `/opt/NetAutoCommitter` directly, here is the full script content:
-
----
-
 ```python
 """
-running_startup_diff.py - Running vs Startup Configuration Drift Detector
+config_compliance_audit.py - Network device configuration compliance auditor.
 
-Compares a Cisco IOS device's running-config against its startup-config to
-identify unsaved changes before maintenance windows or reboots. Unlike
-point-in-time config backups, this specifically surfaces in-memory drift that
-would be lost on device reload.
+Purpose:
+    Connects to a network device via SSH and checks the running configuration
+    against user-defined compliance rules (required and forbidden patterns).
+    Produces a structured pass/fail report for auditing and remediation workflows.
 
 Usage:
-    python running_startup_diff.py -H 192.168.1.1 -u admin -p secret
-    python running_startup_diff.py -H 10.0.0.1 -u admin -p secret --save
-    python running_startup_diff.py -H 10.0.0.1 -u admin --key ~/.ssh/id_rsa --context 5
-    python running_startup_diff.py -H 10.0.0.1 -u admin -p secret --output drift.txt
+    python config_compliance_audit.py -H 192.168.1.1 -u admin -p secret \\
+        --rules rules.json [--output report.txt] [--timeout 30]
 
 Prerequisites:
     pip install paramiko
-    Device must allow SSH and have 'show running-config' / 'show startup-config' access.
-    For --save, the user account needs privilege 15 or 'write' command access.
+
+Rules file format (rules.json):
+    {
+        "required": ["^service password-encryption", "^logging \\d+\\.\\d+\\.\\d+\\.\\d+"],
+        "forbidden": ["^enable password ", "no service password-encryption"]
+    }
 """
 
 import argparse
-import difflib
-import getpass
+import json
 import logging
 import re
 import sys
 import time
-from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List, Tuple
 
 import paramiko
 
-
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
     level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger(__name__)
-
-COMMAND_TIMEOUT = 60
-RECV_BUFFER = 65535
+logger = logging.getLogger(__name__)
 
 
-def ssh_connect(host, port, username, password, key_path, timeout):
+@dataclass
+class ComplianceResult:
+    rule: str
+    rule_type: str
+    passed: bool
+    matched_lines: List[str] = field(default_factory=list)
+
+
+def fetch_running_config(
+    host: str,
+    username: str,
+    password: str,
+    port: int = 22,
+    timeout: int = 30,
+    command: str = "show running-config",
+) -> str:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    connect_kwargs = {
-        "hostname": host,
-        "port": port,
-        "username": username,
-        "timeout": timeout,
-        "look_for_keys": False,
-        "allow_agent": False,
-    }
-    if key_path:
-        connect_kwargs["key_filename"] = str(key_path)
-        connect_kwargs["look_for_keys"] = True
-    else:
-        connect_kwargs["password"] = password
     try:
-        client.connect(**connect_kwargs)
-        log.info("Connected to %s:%d", host, port)
-        return client
-    except paramiko.AuthenticationException:
-        log.error("Authentication failed for %s@%s", username, host)
-        raise
-    except paramiko.SSHException as exc:
-        log.error("SSH negotiation failed: %s", exc)
-        raise
-    except OSError as exc:
-        log.error("Network error connecting to %s: %s", host, exc)
-        raise
-
-
-def run_command(shell, command, wait=2.0):
-    shell.send(command + "\n")
-    time.sleep(wait)
-    output = []
-    while shell.recv_ready():
-        chunk = shell.recv(RECV_BUFFER).decode("utf-8", errors="replace")
-        output.append(chunk)
-        time.sleep(0.2)
-    return "".join(output)
-
-
-def fetch_config(shell, command):
-    log.info("Fetching: %s", command)
-    output = run_command(shell, command, wait=3.0)
-    while "--More--" in output or "---- More ----" in output:
-        extra = run_command(shell, " ", wait=1.5)
-        output += extra
-    output = re.sub(r"\x1b\[[0-9;]*[mGKH]", "", output)
-    output = re.sub(r"--[Mm]ore--|---- More ----", "", output)
-    lines = output.splitlines()
-    config_lines = []
-    in_config = False
-    for line in lines:
-        if line.startswith("!") or in_config:
-            in_config = True
-            config_lines.append(line)
-        if "end" == line.strip().lower() and in_config:
-            break
-    return "\n".join(config_lines)
-
-
-def normalize_config(config_text):
-    lines = config_text.splitlines()
-    normalized = []
-    for line in lines:
-        stripped = line.rstrip()
-        if re.match(r"^!\s*(Last configuration change|NVRAM config last)", stripped):
-            continue
-        normalized.append(stripped)
-    return normalized
-
-
-def compute_diff(running_lines, startup_lines, context):
-    return list(difflib.unified_diff(
-        startup_lines,
-        running_lines,
-        fromfile="startup-config",
-        tofile="running-config",
-        lineterm="",
-        n=context,
-    ))
-
-
-def format_summary(diff_lines):
-    added = sum(1 for l in diff_lines if l.startswith("+") and not l.startswith("+++"))
-    removed = sum(1 for l in diff_lines if l.startswith("-") and not l.startswith("---"))
-    return added, removed
-
-
-def save_config(shell):
-    log.info("Saving configuration (write memory)...")
-    output = run_command(shell, "write memory", wait=5.0)
-    if "OK" in output or "ok" in output.lower() or "[OK]" in output:
-        log.info("Configuration saved successfully.")
-        return True
-    log.warning("Save may have failed. Raw output:\n%s", output)
-    return False
-
-
-def disable_paging(shell):
-    run_command(shell, "terminal length 0", wait=1.0)
-    run_command(shell, "terminal width 0", wait=0.5)
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Detect unsaved config drift between running and startup configs."
-    )
-    parser.add_argument("-H", "--host", required=True, help="Device hostname or IP")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
-    parser.add_argument("--key", type=Path, default=None, help="Path to SSH private key")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--timeout", type=int, default=30, help="Connection timeout in seconds")
-    parser.add_argument("--context", type=int, default=3, help="Diff context lines (default: 3)")
-    parser.add_argument("--save", action="store_true", help="Save running config if drift detected")
-    parser.add_argument("--output", type=Path, default=None, help="Write diff to file")
-    parser.add_argument("--quiet", action="store_true", help="Suppress INFO logging")
-    args = parser.parse_args()
-
-    if args.quiet:
-        logging.getLogger().setLevel(logging.WARNING)
-
-    if not args.key and args.password is None:
-        args.password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
-
-    try:
-        client = ssh_connect(
-            args.host, args.port, args.username, args.password, args.key, args.timeout
+        logger.info("Connecting to %s:%d", host, port)
+        client.connect(
+            host,
+            port=port,
+            username=username,
+            password=password,
+            timeout=timeout,
+            look_for_keys=False,
+            allow_agent=False,
         )
-    except Exception:
-        sys.exit(1)
+        chan = client.invoke_shell()
+        chan.settimeout(timeout)
+        time.sleep(1)
+        chan.recv(4096)
+        chan.send("terminal length 0\n")
+        time.sleep(1)
+        chan.recv(4096)
+        chan.send(f"{command}\n")
 
-    try:
-        shell = client.invoke_shell()
-        time.sleep(1.5)
-        shell.recv(RECV_BUFFER)
-        disable_paging(shell)
+        output = []
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if chan.recv_ready():
+                chunk = chan.recv(8192).decode("utf-8", errors="replace")
+                output.append(chunk)
+                if re.search(r"#\s*$", chunk.split("\n")[-1]):
+                    break
+            else:
+                time.sleep(0.2)
 
-        running = fetch_config(shell, "show running-config")
-        startup = fetch_config(shell, "show startup-config")
-
-        if not running:
-            log.error("Failed to retrieve running-config")
-            sys.exit(2)
-        if not startup:
-            log.error("Failed to retrieve startup-config")
-            sys.exit(2)
-
-        running_lines = normalize_config(running)
-        startup_lines = normalize_config(startup)
-
-        diff = compute_diff(running_lines, startup_lines, args.context)
-
-        if not diff:
-            print(f"[{args.host}] No drift detected — running-config matches startup-config.")
-            sys.exit(0)
-
-        added, removed = format_summary(diff)
-        print(f"[{args.host}] Drift detected: +{added} lines in running, -{removed} lines vs startup\n")
-        diff_text = "\n".join(diff)
-        print(diff_text)
-
-        if args.output:
-            args.output.write_text(diff_text + "\n")
-            log.info("Diff written to %s", args.output)
-
-        if args.save:
-            saved = save_config(shell)
-            if not saved:
-                sys.exit(3)
-
-        sys.exit(1)
-
+        return "".join(output)
     finally:
         client.close()
 
 
-if __name__ == "__main__":
-    main()
-```
+def load_rules(rules_path: str) -> Tuple[List[str], List[str]]:
+    with open(rules_path) as f:
+        data = json.load(f)
+    required = data.get("required", [])
+    forbidden = data.get("forbidden", [])
+    if not isinstance(required, list) or not isinstance(forbidden, list):
+        raise ValueError("Rules file must have 'required' and 'forbidden' as lists")
+    return required, forbidden
 
-This is `running_startup_diff.py` — a running-vs-startup config drift detector. It's distinct from the existing `config_diff*` scripts (which compare configs across devices or timestamps) by focusing specifically on unsaved in-memory changes on a single device. Key features: ANSI escape stripping, `--More--` pager handling, configurable diff context, optional `write memory` via `--save`, file output, and exit codes (`0`=clean, `1`=drift, `2`=fetch error, `3`=save failed) suitable for use in scripts/monitoring.
+
+def audit_config(
+    config: str,
+    required_patterns: List[str],
+    forbidden_patterns: List[str],
+) -> List[ComplianceResult]:
+    lines = config.splitlines()
+    results = []
+
+    for pattern in required_patterns:
+        matched = [ln for ln in lines if re.search(pattern, ln)]
+        results.append(ComplianceResult(
+            rule=pattern,
+            rule_type="required",
+            passed=bool(matched),
+            matched_lines=matched,
+        ))
+
+    for pattern in forbidden_patterns:
+        matched = [ln for ln in lines if re.search(pattern, ln)]
+        results.append(ComplianceResult(
+            rule=pattern,
+            rule_type="forbidden",
+            passed=not matched,
+            matched_lines=matched,
+        ))
+
+    return results
+
+
+def format_report(host: str, results: List[ComplianceResult]) -> str:
+    passed = sum(1 for r in results if r.passed)
+    failed = len(results) - passed
+    lines = [
+        f"Compliance Audit Report: {host}",
+        "=" * 60,
+        f"Total: {len(results)}  Passed: {passed}  Failed: {failed}",
+        "",
+    ]
+    for r in results:
+        status = "PASS" if r.passed else "FAIL"
+        lines.append(f"[{status}] [{r.rule_type.upper():8}] {r.rule}")
+        if not r.passed and r.matched_lines:
+            for ml in r.matched_lines[:3]:
+                lines.append(f"           matched: {ml.strip()}")
+    lines += ["", f"Result: {'COMPLIANT' if failed == 0 else 'NON-COMPLIANT'}"]
+    return "\n".join(lines)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Audit network device configuration against compliance rules."
+    )
+    parser.add_argument("-H", "--host", required=True, help="Device hostname or IP")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--rules", required=True, help="Path to JSON compliance rules file")
+    parser.add_argument("--output", help="Write report to file instead of stdout")
+    parser.add_argument("--timeout", type=int, default=30, help="SSH timeout seconds (default: 30)")
+    parser.add_argument(
+        "--command",
+        default="show running-config",
+        help="Command to retrieve configuration (default: 'show running-config')",
+    )
+    parser.add_argument(
+        "--fail-on-violations",
+        action="store_true",
+        help="Exit with code 1 if any rules fail (useful in CI pipelines)",
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    try:
+        required_patterns, forbidden_patterns = load_rules(args.rules)
+        logger.info(
+            "Loaded %d required and %d forbidden rules",
+            len(required_patterns),
+            len(forbidden_patterns),
+        )
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as e:
+        logger.error("Failed to load rules file: %s", e)
+        sys.exit(2)
+
+    try:
+        config = fetch_running_config(
+            host=args.host,
+            username=args.username,
+            password=args.password,
+            port=args.port,
+            timeout=args.timeout,
+            command=args.command,
+        )
+    except paramiko.AuthenticationException:
+        logger.error("Authentication failed for %s@%s", args.username, args.host)
+        sys.exit(1)
+    except (paramiko.SSHException, OSError) as e:
+        logger.error("Connection error: %s", e)
+        sys.exit(1)
+
+    results = audit_config(config, required_patterns, forbidden_patterns)
+    report = format_report(args.host, results)
+
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(report)
+        logger.info("Report written to %s", args.output)
+    else:
+        print(report)
+
+    failed_count = sum(1 for r in results if not r.passed)
+    if args.fail_on_violations and failed_count > 0:
+        sys.exit(1)
+```
