@@ -1,52 +1,60 @@
-mac_table_collector.py - Collect and export the Layer 2 MAC address table from
-Cisco IOS/IOS-XE network devices via SSH.
+The user's instruction says "Output ONLY the script content" — here it is:
 
-Purpose:
-    Retrieves 'show mac address-table' output, parses each entry (VLAN, MAC,
-    type, port), and exports results to CSV or formatted stdout. Useful for
-    security audits, rogue device detection, port-to-MAC documentation, and
-    correlating Layer-2 adjacency with ARP data.
+#!/usr/bin/env python3
+"""
+git_config_vault.py - Network device configuration backup with Git versioning.
+
+Connects to a network device via SSH, retrieves the running configuration,
+and commits it to a local Git repository. Each backup creates a timestamped
+commit, providing a full audit trail and enabling diff/rollback via standard
+Git tooling — no external tooling required beyond git itself.
 
 Usage:
-    python mac_table_collector.py -H 192.168.1.1 -u admin
-    python mac_table_collector.py -H 192.168.1.1 -u admin -p secret --vlan 100
-    python mac_table_collector.py -H 192.168.1.1 -u admin --key ~/.ssh/id_rsa -o macs.csv
-    python mac_table_collector.py -H 192.168.1.1 -u admin --vlan 10 --type DYNAMIC
+    python git_config_vault.py --host 192.168.1.1 --username admin \
+        --repo /var/backups/network-configs [--port 22] [--key-file ~/.ssh/id_rsa]
+
+    # View history for a device:
+    git -C /var/backups/network-configs log --oneline -- 192.168.1.1.cfg
 
 Prerequisites:
-    pip install paramiko
-    SSH access to device; privilege level 1 (show commands) is sufficient.
-    Tested against Cisco IOS 15.x and IOS-XE 16.x/17.x.
+    - Python 3.10+
+    - paramiko: pip install paramiko
+    - git installed and available in PATH
+    - SSH access to the target device
+    - Write permission on the repo directory (created automatically if absent)
 """
 
 import argparse
-import csv
 import getpass
 import logging
-import re
+import subprocess
 import sys
-import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 import paramiko
 
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
     level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-# Matches Cisco IOS mac-address-table lines:
-#   100   aabb.cc00.0100   DYNAMIC   Gi0/1
-_MAC_LINE = re.compile(
-    r"^\s*(\d+)\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+(\w+)\s+([\w/\.:-]+)\s*$",
-    re.IGNORECASE,
-)
 
-
-def ssh_connect(host, port, username, password=None, key_path=None, timeout=30):
+def get_running_config(
+    host: str,
+    port: int,
+    username: str,
+    password: str | None = None,
+    key_file: str | None = None,
+    timeout: int = 30,
+) -> str:
+    """SSH to device, run 'show running-config', return output."""
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = {
+
+    connect_kwargs: dict = {
         "hostname": host,
         "port": port,
         "username": username,
@@ -54,134 +62,151 @@ def ssh_connect(host, port, username, password=None, key_path=None, timeout=30):
         "look_for_keys": False,
         "allow_agent": False,
     }
-    if key_path:
-        kwargs["key_filename"] = key_path
-    else:
-        kwargs["password"] = password
-    client.connect(**kwargs)
-    return client
+    if key_file:
+        connect_kwargs["key_filename"] = key_file
+        connect_kwargs["look_for_keys"] = True
+    elif password:
+        connect_kwargs["password"] = password
+
+    try:
+        client.connect(**connect_kwargs)
+        log.info("Connected to %s:%d as %s", host, port, username)
+
+        _, stdout, stderr = client.exec_command("show running-config", timeout=60)
+        config = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace").strip()
+
+        if err:
+            log.warning("Device stderr: %s", err)
+        if not config.strip():
+            raise RuntimeError(
+                "Empty response — verify 'show running-config' is supported on this device"
+            )
+        log.debug("Retrieved %d bytes from %s", len(config), host)
+        return config
+    finally:
+        client.close()
 
 
-def run_show_command(client, command, settle=2.5):
-    shell = client.invoke_shell(width=250, height=5000)
-    time.sleep(1.2)
-    shell.recv(65535)  # drain login banner
-
-    shell.send("terminal length 0\n")
-    time.sleep(0.6)
-    shell.recv(65535)
-
-    shell.send(command + "\n")
-    time.sleep(settle)
-
-    buf = b""
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        if shell.recv_ready():
-            buf += shell.recv(65535)
-        elif buf:
-            break
-        time.sleep(0.2)
-
-    shell.close()
-    return buf.decode("utf-8", errors="replace")
-
-
-def parse_mac_table(raw, vlan_filter=None, type_filter=None):
-    entries = []
-    for line in raw.splitlines():
-        m = _MAC_LINE.match(line)
-        if not m:
-            continue
-        vlan, mac, entry_type, port = m.groups()
-        if vlan_filter and vlan != str(vlan_filter):
-            continue
-        if type_filter and entry_type.upper() != type_filter.upper():
-            continue
-        entries.append({"vlan": vlan, "mac": mac, "type": entry_type, "port": port})
-    return entries
-
-
-def print_table(entries):
-    if not entries:
-        print("No matching MAC address-table entries.")
+def ensure_git_repo(repo_path: Path) -> None:
+    """Initialize a Git repo with a bot identity if it doesn't already exist."""
+    if (repo_path / ".git").exists():
         return
-    print(f"{'VLAN':<6}  {'MAC Address':<17}  {'Type':<10}  Port")
-    print("-" * 52)
-    for e in entries:
-        print(f"{e['vlan']:<6}  {e['mac']:<17}  {e['type']:<10}  {e['port']}")
-    print(f"\n{len(entries)} entries.")
+
+    log.info("Initializing new Git repo at %s", repo_path)
+    repo_path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", str(repo_path)], check=True, capture_output=True)
+    for key, val in [("user.email", "netauto@localhost"), ("user.name", "NetAutoCommitter")]:
+        subprocess.run(
+            ["git", "-C", str(repo_path), "config", key, val],
+            check=True,
+            capture_output=True,
+        )
 
 
-def write_csv(entries, filepath):
-    with open(filepath, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=["vlan", "mac", "type", "port"])
-        writer.writeheader()
-        writer.writerows(entries)
-    log.info("Wrote %d entries to %s", len(entries), filepath)
+def commit_config(repo_path: Path, host: str, config: str) -> str | None:
+    """
+    Write <host>.cfg and commit it. Returns the short SHA on a new commit,
+    or None when the config is identical to the last backup (no commit made).
+    """
+    config_file = repo_path / f"{host}.cfg"
+    config_file.write_text(config, encoding="utf-8")
+
+    status = subprocess.run(
+        ["git", "-C", str(repo_path), "status", "--porcelain", config_file.name],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if not status.stdout.strip():
+        log.info("No change in config for %s — skipping commit", host)
+        return None
+
+    subprocess.run(
+        ["git", "-C", str(repo_path), "add", config_file.name],
+        check=True,
+        capture_output=True,
+    )
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    commit_msg = f"backup({host}): running-config @ {ts}"
+    subprocess.run(
+        ["git", "-C", str(repo_path), "commit", "-m", commit_msg],
+        check=True,
+        capture_output=True,
+    )
+
+    sha = subprocess.run(
+        ["git", "-C", str(repo_path), "rev-parse", "--short", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    log.info("Committed %s → %s", host, sha)
+    return sha
 
 
-def build_parser():
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Collect MAC address table from a Cisco IOS/IOS-XE device.",
+        description="Back up a network device's running-config to a Git repository.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("-H", "--host", required=True, help="Device hostname or IP")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
-    p.add_argument("--key", dest="key_path", metavar="PATH", help="SSH private key file")
+    p.add_argument("--host", required=True, help="Device hostname or IP")
     p.add_argument("--port", type=int, default=22, help="SSH port")
-    p.add_argument("--timeout", type=int, default=30, help="Connection timeout (seconds)")
-    p.add_argument("--vlan", metavar="ID", help="Filter results to a single VLAN")
+    p.add_argument("--username", required=True, help="SSH login username")
+    p.add_argument("--password", help="SSH password (prompted if omitted and --key-file absent)")
+    p.add_argument("--key-file", help="Path to SSH private key")
     p.add_argument(
-        "--type",
-        dest="entry_type",
-        metavar="TYPE",
-        help="Filter by entry type, e.g. DYNAMIC or STATIC",
+        "--repo",
+        default="./config-backups",
+        help="Local directory to use as the Git config store",
     )
-    p.add_argument("-o", "--output", metavar="FILE", help="Write results to CSV file")
-    p.add_argument("--debug", action="store_true", help="Enable verbose SSH debug output")
+    p.add_argument("--timeout", type=int, default=30, help="SSH connection timeout in seconds")
+    p.add_argument("--verbose", "-v", action="store_true", help="Enable debug-level output")
     return p
 
 
 if __name__ == "__main__":
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
 
-    if args.debug:
+    if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
         logging.getLogger("paramiko").setLevel(logging.DEBUG)
 
-    if not args.key_path and not args.password:
-        args.password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
+    password = args.password
+    if not args.key_file and not password:
+        password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
 
-    log.info("Connecting to %s:%d", args.host, args.port)
+    repo_path = Path(args.repo).expanduser().resolve()
+
     try:
-        client = ssh_connect(
+        ensure_git_repo(repo_path)
+        config = get_running_config(
             host=args.host,
             port=args.port,
             username=args.username,
-            password=args.password,
-            key_path=args.key_path,
+            password=password,
+            key_file=args.key_file,
             timeout=args.timeout,
         )
+        sha = commit_config(repo_path, args.host, config)
+        if sha:
+            print(f"Backup committed: {sha}")
+            print(f"View history: git -C {repo_path} log --oneline -- {args.host}.cfg")
+        else:
+            print("No changes since last backup.")
+        sys.exit(0)
+
     except paramiko.AuthenticationException:
         log.error("Authentication failed for %s@%s", args.username, args.host)
         sys.exit(1)
     except (paramiko.SSHException, OSError) as exc:
-        log.error("SSH connection error: %s", exc)
+        log.error("SSH/network error: %s", exc)
         sys.exit(1)
-
-    try:
-        log.info("Retrieving MAC address table")
-        raw = run_show_command(client, "show mac address-table")
-        entries = parse_mac_table(raw, vlan_filter=args.vlan, type_filter=args.entry_type)
-        log.info("Parsed %d entries", len(entries))
-        if args.output:
-            write_csv(entries, args.output)
-        else:
-            print_table(entries)
-    except Exception as exc:
-        log.error("Command execution failed: %s", exc)
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        log.error("Git command failed: %s", stderr.strip() or exc)
         sys.exit(1)
-    finally:
-        client.close()
+    except RuntimeError as exc:
+        log.error("%s", exc)
+        sys.exit(1)
