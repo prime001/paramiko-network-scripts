@@ -1,245 +1,209 @@
-ARP table change monitor for Cisco IOS/IOS-XE network devices.
+ARP Anomaly Detector — Multi-device ARP cross-correlation for spoofing detection.
 
-Polls the device ARP table at a configurable interval and reports additions,
-removals, and MAC address changes for existing IPs. A MAC change on a stable
-IP is flagged as a potential ARP spoofing event or IP conflict.
-
-Usage:
-    python arp_table_monitor.py -d 192.168.1.1 -u admin -p secret
-    python arp_table_monitor.py -d 192.168.1.1 -u admin -p secret --interval 30 --count 5
-    python arp_table_monitor.py -d 192.168.1.1 -u admin --key ~/.ssh/id_rsa --interval 60
+Collects ARP tables from multiple network devices via SSH (paramiko), aggregates
+entries across all devices, and flags anomalies:
+  - Same IP mapped to different MACs across devices (potential ARP spoofing)
+  - Single MAC appearing on more IPs than a configurable threshold
 
 Prerequisites:
     pip install paramiko
-    SSH access to the target device with privilege to run 'show ip arp'.
+
+Usage:
+    python arp_anomaly_detector.py -d 192.168.1.1 192.168.1.2 -u admin -p secret
+    python arp_anomaly_detector.py -d 10.0.0.1 -u admin --key ~/.ssh/id_rsa --json
+    python arp_anomaly_detector.py -d 10.0.0.1 10.0.0.2 -u admin --mac-threshold 3
+
+Tested against: Cisco IOS, IOS-XE ("show ip arp" output format).
+Exit code: 0 = clean, 1 = anomalies found or collection failure.
 """
 
 import argparse
 import getpass
+import json
 import logging
 import re
 import sys
-import time
-from datetime import datetime
+from collections import defaultdict
 
 import paramiko
 
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
     level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-
-def ssh_exec(client, command, timeout=15):
-    """Run a single command over an established SSH session."""
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    output = stdout.read().decode("utf-8", errors="replace")
-    err = stderr.read().decode("utf-8", errors="replace").strip()
-    if err:
-        log.debug("Device stderr: %s", err)
-    return output
+# Matches: Protocol  Address  Age  Hardware Addr  Type  Interface
+ARP_LINE_RE = re.compile(
+    r"^\S+\s+([\d.]+)\s+\S+\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+",
+    re.IGNORECASE,
+)
 
 
-def parse_arp_table(raw):
-    """
-    Parse 'show ip arp' output into a dict keyed by IP address.
+def _ssh_run(host, username, password, key_file, command, timeout):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        kwargs = {
+            "hostname": host,
+            "username": username,
+            "timeout": timeout,
+            "look_for_keys": bool(key_file),
+        }
+        if key_file:
+            kwargs["key_filename"] = key_file
+        else:
+            kwargs["password"] = password
+        client.connect(**kwargs)
+        _, stdout, stderr = client.exec_command(command, timeout=timeout)
+        output = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace").strip()
+        if err:
+            log.debug("%s stderr: %s", host, err)
+        return output
+    finally:
+        client.close()
 
-    Returns: {ip: {"mac": str, "iface": str, "age": str}}
-    Skips incomplete entries (mac == '-').
-    """
-    # Cisco IOS format:
-    # Protocol  Address         Age (min)  Hardware Addr   Type  Interface
-    # Internet  10.0.0.1              -    aabb.cc00.0100  ARPA  Gi0/0
-    pattern = re.compile(
-        r"^\S+\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+|-)\s+([\da-fA-F.]+|-)\s+\S+\s+(\S+)",
-        re.MULTILINE,
-    )
-    entries = {}
-    for m in pattern.finditer(raw):
-        ip, age, mac, iface = m.group(1), m.group(2), m.group(3), m.group(4)
-        if mac == "-":
-            continue
-        entries[ip] = {"mac": mac.lower(), "iface": iface, "age": age}
+
+def parse_arp_output(raw):
+    entries = []
+    for line in raw.splitlines():
+        m = ARP_LINE_RE.match(line.strip())
+        if m:
+            entries.append({"ip": m.group(1), "mac": m.group(2).lower()})
     return entries
 
 
-def diff_arp(previous, current):
-    """
-    Compare two ARP snapshots and return categorised change events.
-
-    Returns a list of (change_type, ip, detail) tuples where change_type
-    is one of: "ADDED", "REMOVED", "MAC_CHANGED".
-    """
-    changes = []
-    prev_ips = set(previous)
-    curr_ips = set(current)
-
-    for ip in sorted(curr_ips - prev_ips):
-        changes.append(("ADDED", ip, current[ip]))
-
-    for ip in sorted(prev_ips - curr_ips):
-        changes.append(("REMOVED", ip, previous[ip]))
-
-    for ip in sorted(prev_ips & curr_ips):
-        if previous[ip]["mac"] != current[ip]["mac"]:
-            changes.append((
-                "MAC_CHANGED",
-                ip,
-                {
-                    "old_mac": previous[ip]["mac"],
-                    "new_mac": current[ip]["mac"],
-                    "iface": current[ip]["iface"],
-                },
-            ))
-    return changes
+def collect_from_device(host, username, password, key_file, timeout):
+    try:
+        raw = _ssh_run(host, username, password, key_file, "show ip arp", timeout)
+        entries = parse_arp_output(raw)
+        log.info("%s: %d ARP entries", host, len(entries))
+        return entries
+    except paramiko.AuthenticationException:
+        log.error("%s: authentication failed", host)
+    except paramiko.SSHException as exc:
+        log.error("%s: SSH error — %s", host, exc)
+    except OSError as exc:
+        log.error("%s: connection error — %s", host, exc)
+    return []
 
 
-def report_changes(changes, host):
-    """Print change events to stdout with severity tags."""
-    for change_type, ip, detail in changes:
-        ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-        if change_type == "ADDED":
-            print(
-                f"[{ts}] {host} INFO  ADDED      "
-                f"{ip:<18} mac={detail['mac']}  iface={detail['iface']}"
-            )
-        elif change_type == "REMOVED":
-            print(
-                f"[{ts}] {host} INFO  REMOVED    "
-                f"{ip:<18} mac={detail['mac']}  iface={detail['iface']}"
-            )
-        elif change_type == "MAC_CHANGED":
-            print(
-                f"[{ts}] {host} WARN  MAC_CHANGED "
-                f"{ip:<18} {detail['old_mac']} -> {detail['new_mac']}"
-                f"  iface={detail['iface']}"
-            )
+def detect_anomalies(all_entries, mac_ip_threshold):
+    ip_to_macs = defaultdict(set)
+    mac_to_ips = defaultdict(set)
+
+    for entry in all_entries:
+        ip_to_macs[entry["ip"]].add(entry["mac"])
+        mac_to_ips[entry["mac"]].add(entry["ip"])
+
+    anomalies = []
+
+    for ip, macs in sorted(ip_to_macs.items()):
+        if len(macs) > 1:
+            anomalies.append({
+                "type": "IP_MAC_CONFLICT",
+                "severity": "HIGH",
+                "ip": ip,
+                "macs": sorted(macs),
+                "detail": f"IP {ip} maps to {len(macs)} distinct MACs — possible ARP spoofing",
+            })
+
+    for mac, ips in sorted(mac_to_ips.items()):
+        if len(ips) > mac_ip_threshold:
+            anomalies.append({
+                "type": "MAC_MULTI_IP",
+                "severity": "MEDIUM",
+                "mac": mac,
+                "ips": sorted(ips),
+                "detail": (
+                    f"MAC {mac} seen on {len(ips)} IPs "
+                    f"(threshold {mac_ip_threshold})"
+                ),
+            })
+
+    return anomalies
 
 
-def connect(host, port, username, password, key_file, timeout):
-    """Establish an SSH session and return the paramiko SSHClient."""
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = {
-        "hostname": host,
-        "port": port,
-        "username": username,
-        "timeout": timeout,
-        "look_for_keys": False,
-        "allow_agent": False,
-    }
-    if key_file:
-        kwargs["key_filename"] = key_file
-        kwargs["look_for_keys"] = True
+def print_report(all_entries, anomalies, devices, as_json):
+    if as_json:
+        print(json.dumps({"entries": all_entries, "anomalies": anomalies}, indent=2))
+        return
+
+    bar = "=" * 62
+    print(f"\n{bar}")
+    print(
+        f"ARP Anomaly Report  |  {len(devices)} device(s)  "
+        f"|  {len(all_entries)} total entries"
+    )
+    print(bar)
+
+    if not anomalies:
+        print("\n  [OK] No anomalies detected.\n")
     else:
-        kwargs["password"] = password
-    client.connect(**kwargs)
-    return client
-
-
-def monitor(client, host, interval, count):
-    """
-    Poll 'show ip arp' repeatedly, diff against the previous snapshot,
-    and report any changes.  Runs indefinitely when count == 0.
-    """
-    previous = {}
-    poll = 0
-
-    while count == 0 or poll < count:
-        raw = ssh_exec(client, "show ip arp")
-        current = parse_arp_table(raw)
-
-        if not current:
-            log.warning("Poll %d: no ARP entries parsed — verify device output", poll + 1)
-
-        if poll == 0:
-            log.info("Baseline established: %d ARP entries on %s", len(current), host)
-        else:
-            changes = diff_arp(previous, current)
-            if changes:
-                report_changes(changes, host)
+        print(f"\n  [!] {len(anomalies)} anomaly(ies):\n")
+        for a in anomalies:
+            print(f"  [{a['severity']}] {a['detail']}")
+            if a["type"] == "IP_MAC_CONFLICT":
+                for mac in a["macs"]:
+                    print(f"         MAC: {mac}")
             else:
-                log.debug("Poll %d: no changes (%d entries total)", poll + 1, len(current))
+                for ip in a["ips"]:
+                    print(f"          IP: {ip}")
+            print()
 
-        previous = current
-        poll += 1
-
-        if count == 0 or poll < count:
-            time.sleep(interval)
-
-    log.info("Done — completed %d poll(s)", poll)
+    print(f"{bar}\n")
 
 
 def build_parser():
     p = argparse.ArgumentParser(
-        description="Monitor a Cisco IOS ARP table for additions, removals, and MAC changes."
+        description="Cross-correlate ARP tables across devices and flag anomalies.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("-d", "--device", required=True, help="Device hostname or IP address")
+    p.add_argument("-d", "--devices", nargs="+", required=True, metavar="HOST",
+                   help="Device hostname(s) or IP address(es)")
     p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", help="SSH password (prompted if omitted and no key given)")
-    p.add_argument("--key", dest="key_file", metavar="PATH", help="SSH private key file")
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument(
-        "--interval",
-        type=int,
-        default=60,
-        metavar="SECONDS",
-        help="Polling interval in seconds (default: 60)",
-    )
-    p.add_argument(
-        "--count",
-        type=int,
-        default=0,
-        metavar="N",
-        help="Number of polls before exiting; 0 runs indefinitely (default: 0)",
-    )
-    p.add_argument(
-        "--timeout",
-        type=int,
-        default=30,
-        help="SSH connection timeout in seconds (default: 30)",
-    )
-    p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    p.add_argument("-p", "--password", default=None,
+                   help="SSH password (prompted if omitted and no --key)")
+    p.add_argument("--key", dest="key_file", metavar="PATH",
+                   help="SSH private key file")
+    p.add_argument("--timeout", type=int, default=30,
+                   help="SSH connect/command timeout in seconds")
+    p.add_argument("--mac-threshold", type=int, default=5, dest="mac_ip_threshold",
+                   metavar="N",
+                   help="Alert when a single MAC appears on more than N IPs")
+    p.add_argument("--json", dest="as_json", action="store_true",
+                   help="Emit JSON instead of human-readable output")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="Enable debug logging")
     return p
 
 
 if __name__ == "__main__":
-    parser = build_parser()
-    args = parser.parse_args()
+    args = build_parser().parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    if not args.key_file and not args.password:
-        args.password = getpass.getpass(f"Password for {args.username}@{args.device}: ")
+    password = args.password
+    if not password and not args.key_file:
+        password = getpass.getpass(f"SSH password for {args.username}@<devices>: ")
 
-    log.info("Connecting to %s:%d as %s", args.device, args.port, args.username)
-    try:
-        client = connect(
-            host=args.device,
-            port=args.port,
-            username=args.username,
-            password=args.password,
-            key_file=args.key_file,
-            timeout=args.timeout,
+    all_entries = []
+    for host in args.devices:
+        entries = collect_from_device(
+            host, args.username, password, args.key_file, args.timeout
         )
-    except paramiko.AuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.device)
-        sys.exit(1)
-    except (paramiko.SSHException, OSError) as exc:
-        log.error("Connection error: %s", exc)
+        for e in entries:
+            e["source"] = host
+        all_entries.extend(entries)
+
+    if not all_entries:
+        log.error("No ARP entries collected — check connectivity and credentials.")
         sys.exit(1)
 
-    log.info(
-        "Connected. Polling every %ds%s",
-        args.interval,
-        f", {args.count} time(s)" if args.count else " indefinitely",
-    )
-    try:
-        monitor(client, args.device, args.interval, args.count)
-    except KeyboardInterrupt:
-        log.info("Interrupted")
-    finally:
-        client.close()
+    anomalies = detect_anomalies(all_entries, args.mac_ip_threshold)
+    print_report(all_entries, anomalies, args.devices, args.as_json)
+
+    sys.exit(1 if anomalies else 0)
